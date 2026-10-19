@@ -73,6 +73,7 @@ struct RzA1lUsbState {
     char *audio_out;    /* WAV output path for the captured to-host stream */
     char *audio_in;     /* from-host source: "tone[:freq]" or an input WAV path */
     char *audio_in_capture; /* optional WAV sink: frames the firmware consumed */
+    bool audio_adaptive; /* from-host uses the adaptive alt setting (2), not implicit (1) */
 
     /* ---- Peripheral-mode USB-audio (only used when audio == true) -------- */
 

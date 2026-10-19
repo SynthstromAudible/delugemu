@@ -1,39 +1,42 @@
 # USB peripheral mode: audio (UAC1) + MIDI — emulator design
 
-> Status: **design / not yet implemented.** This document scopes making
+> Status: **implemented and verified** against the DelugeFirmware `feat/usb_audio`
+> branch (`src/deluge/drivers/usb/usb_audio.{h,cpp}`,
+> `.../userdef/r_usb_paudio_config.h`, `.../userdef/r_usb_pmidi_config.h`,
+> `src/deluge/io/midi/r_usb_pmidi_descriptor.c`). This document covers making
 > `qemu-system-arm -M deluge` act as the USB *host* for a Deluge running its USB
 > stack in **peripheral (function) mode**, serving both **USB Audio Class 1
-> (UAC1)** and **USB-MIDI** to the developer's machine — i.e. modelling the
-> Deluge the way it is almost always used: plugged into a computer. It is
-> written against the DelugeFirmware `feat/usb_audio` branch
-> (`src/deluge/drivers/usb/usb_audio.{h,cpp}`,
-> `.../userdef/r_usb_paudio_config.h`, `.../userdef/r_usb_pmidi_config.h`, and
-> `src/deluge/io/midi/r_usb_pmidi_descriptor.c`).
+> (UAC1)** and **USB-MIDI** to the developer's machine (the Deluge plugged into a
+> computer).
 
 Read [register-coverage.md](register-coverage.md) (*USB200 / USB201*) and
-[architecture.md](architecture.md) (*MIDI I/O*) first. This design **replaces**
-the existing host-mode USB-MIDI model as the primary USB behaviour.
+[architecture.md](architecture.md) (*USB and MIDI I/O*) first. Peripheral mode
+sits alongside the existing host-mode USB-MIDI model; the emulator supports both
+roles, selected per run (§1).
 
-## 1. Decision: the emulated Deluge is a USB *peripheral*
+## 1. Two USB roles: host and peripheral
 
-The RZ/A1L USB module is dual-role. The Deluge can be a **host** (you plug a
-controller into it) or a **peripheral** (you plug it into a computer). In
-practice the peripheral case dominates — MIDI to/from a DAW, and now UAC1 audio
-— so **the emulator will model peripheral mode as the primary role**, with the
-emulator itself playing the part of the host computer.
+The RZ/A1L USB module is dual-role, and the emulator supports both roles equally:
+
+- **Host** (`midi=on`): you plug a MIDI controller/keyboard *into* the Deluge.
+  The emulator fabricates an attached USB-MIDI device and the firmware enumerates
+  it (see `register-coverage.md` and §9).
+- **Peripheral** (`audio=on`): you plug the Deluge *into* a computer — MIDI
+  to/from a DAW, and UAC1 audio both directions. The emulator plays the part of
+  the host computer: it drives VBUS/bus-reset, enumerates the peripheral, and
+  moves data on its pipes. This document is mostly about the peripheral side,
+  which is the newer and larger piece of work.
 
 The firmware selects its role at init with a single global, `g_usb_usbmode`
 (`src/deluge/io/midi/midi_engine.cpp`: `potentiallyAHost = (g_usb_usbmode ==
-USB_HOST)`). `hw_usb_hmodule_init` tries host first; **finding no attached
-device, it falls back to peripheral mode.** That fall-back is exactly the
-emulator's current *disconnected-default* behaviour (SYSSTS0.LNST = SE0, no
-attach) — so peripheral mode is the natural path and needs no device fabricated
-on the bus. What the emulator must add is the **host side of the conversation**:
-drive VBUS/bus-reset, enumerate the peripheral, and move data on its pipes.
+USB_HOST)`). `hw_usb_hmodule_init` tries host first; finding no attached device,
+it falls back to peripheral mode — which is exactly the emulator's
+*disconnected-default* behaviour (SYSSTS0.LNST = SE0, no attach), so peripheral
+mode needs no device fabricated on the bus.
 
-Consequence: the existing host-mode MIDI bridge (`midi=on`, which fabricates an
-attached USB-MIDI *device* and keeps the firmware in host mode — see
-`register-coverage.md`) is **superseded**. See §9 for migration/coexistence.
+The two roles are mutually exclusive on a given run (the bus has one host), and
+the emulator picks between them by property: `midi=on` for host, `audio=on` for
+peripheral. §9 covers how both are wired in the model.
 
 ## 2. What the firmware exposes as a peripheral (the contract)
 
@@ -146,9 +149,9 @@ the pipe assignment and BRDY/BEMP roles change:
   hands packets out on CFIFO reads (`r_usb_plibusbip.c:624`), raises pipe-4
   **BRDY**. Mirrors today's pipe-2..5 RX.
 
-> **O1 — RESOLVED and verified in firmware.** MIDI moves to peripheral mode
-> alongside audio; the host-mode bridge is retired as the default (§9). Both
-> MIDI directions transit **CFIFO** (TX `r_usb_hdriver.c:1346`; RX
+> **O1 — RESOLVED and verified in firmware.** MIDI works in peripheral mode
+> alongside audio, and in host mode on its own; the one bridge serves both (§9).
+> Both MIDI directions transit **CFIFO** (TX `r_usb_hdriver.c:1346`; RX
 > `r_usb_plibusbip.c:624`), confirming the existing CFIFO framing code is
 > reusable; the D0/D1FIFO-DMA paths in the peripheral lib are used only by audio.
 
@@ -274,7 +277,7 @@ pipe range and keep audio-iso vs MIDI-bulk completion semantics distinct.
      `scripts/run.sh --usb-midi <chardev>` bridges the composite MIDI interface
      when combined with `--usb-audio`/`--usb-audio-in` (host-mode `midi=on` is
      not set in that case). Verified by a SysEx Identity round-trip
-     (`tests/usb-midi-peripheral.sh`).
+     (`tests/usb-peripheral.sh`).
    Two firmware-interaction bugs found and fixed during bring-up:
    - **Lost first SET_INTERFACE / control-write register race:** the firmware's
      decoder clears `CTRT` at the *start* of its interrupt, before
@@ -294,37 +297,48 @@ pipe range and keep audio-iso vs MIDI-bulk completion semantics distinct.
      empty receive pipe also had to be fixed to report *no* FRDY, or the
      firmware's drain loop spun on zero-length packets.
 3. **Full enumeration hardening. ✅ (covered.)** Enumeration drives the full
-   composite — SET_CONFIGURATION then `SET_INTERFACE(1,1)` (from-host) and
-   `SET_INTERFACE(2,1)` (to-host); MIDI needs no alt setting. `usbAudioStopAll`
-   on bus reset / reconfigure is honoured by the firmware; the model tears the
-   from-host stream down when `BRDYENB` bit 1 clears. (A distinct `peripheral`
-   property, separable from `audio`, remains a possible future refinement.)
+   composite — SET_CONFIGURATION then the streaming `SET_INTERFACE`s — and each
+   audio stream starts only when wanted: from-host (interface 1) when `audio-in`
+   is set, to-host (interface 2) when `audio-out` is set. With neither, the
+   device still enumerates and MIDI runs — a **MIDI-only peripheral**
+   (`--usb-peripheral`). From-host selects alt 1 (implicit feedback) or, with
+   `audio-in-adaptive` (`--usb-audio-adaptive`), alt 2 (adaptive). MIDI needs no
+   alt setting. `usbAudioStopAll` on bus reset / reconfigure is honoured by the
+   firmware; the model tears the from-host stream down when `BRDYENB` bit 1
+   clears. (A distinct `peripheral` property, separable from `audio`, remains a
+   possible future refinement.)
 4. **CoreAudio bridge + docs.** Live host-audio routing to a QEMU `audiodev`
-   remains optional/future; docs updated here. Host-mode MIDI is kept behind the
-   `midi=on` property as a legacy path (§9), not removed.
+   remains optional/future; docs updated here and in `register-coverage.md` /
+   `architecture.md`. Host-mode MIDI (`midi=on`) and peripheral mode (`audio=on`)
+   are both kept as equally supported roles (§9).
 
 ## 7. Testing
 
 All skip cleanly when no firmware is present, and are deterministic under
-`--icount`:
+`--icount`. Together they exercise every USB mode independently:
 
-- **`tests/usb-audio.sh`** — boots `feat/usb_audio` and streams *both*
-  directions at once. Asserts the to-host capture is a valid, real-time-length
-  44.1 kHz/stereo/32-bit WAV, and that the from-host test tone (injected via
-  `--usb-audio-in tone:440`) is carried intact — verified on the frames the
-  firmware consumes (`--usb-audio-in-capture`) with a Goertzel check, since the
-  firmware does not echo host audio onto the to-host stream.
-- **`tests/usb-midi-peripheral.sh`** — boots as a USB peripheral (`audio=on`)
-  with the composite MIDI interface bridged to a UNIX socket, and round-trips a
-  SysEx Identity Request (in on pipe 4) / Identity Reply (out on pipe 3).
-- **`tests/usb-midi-bridge.sh`** — the legacy host-mode (`midi=on`) MIDI bridge,
-  still green (the bridge code is shared, parameterised by pipe numbers).
+- **`tests/usb-peripheral.sh [midi-only|implicit|adaptive]`** — the peripheral
+  modes (default: all three). Each bridges the composite MIDI interface to a
+  UNIX socket and round-trips a SysEx Identity Request (in on pipe 4) / Reply
+  (out on pipe 3). `implicit` and `adaptive` additionally start both audio
+  streams and assert the to-host capture is a valid real-time WAV and the
+  injected from-host tone comes back intact on the consumed-frames capture — the
+  two differ only in the from-host alternate setting (implicit feedback vs.
+  adaptive). `midi-only` runs the composite with no audio streams.
+- **`tests/usb-audio.sh`** — the audio path on its own (no MIDI): both
+  directions, implicit feedback, with the same WAV/tone assertions. A focused
+  audio regression.
+- **`tests/usb-midi-bridge.sh`** — host-mode (`midi=on`) MIDI bridge: the Deluge
+  as USB *host* with an attached MIDI device. The bridge code is shared with
+  peripheral mode, parameterised by pipe numbers.
+- **`tests/usb-midi.sh`** — host-mode enumeration smoke (no data bridge).
 
 ## 8. Open questions / decisions
 
-- **O1 — RESOLVED (verified):** peripheral mode for both audio and MIDI;
-  host-mode bridge retired (§1, §9). MIDI confirmed to transit CFIFO on pipes
-  3 (Deluge→host) / 4 (host→Deluge); audio uses D0/D1FIFO DMA (§2.4).
+- **O1 — RESOLVED (verified):** peripheral mode carries both audio and MIDI,
+  and host mode carries MIDI; both are supported (§1, §9). MIDI confirmed to
+  transit CFIFO on pipes 3 (Deluge→host) / 4 (host→Deluge) in peripheral mode
+  (1 / 2–5 in host mode); audio uses D0/D1FIFO DMA (§2.4).
 - **O2 — RESOLVED (verified):** DMAC D0/D1FIFO endpoint hookup needs no DMAC
   changes. A register-mode one-shot transfer on `SETEN` honours `SAD`/`DAD`
   (fixed FIFO address) and pulses the per-channel DMAINT; `SWRST` preserves
@@ -337,19 +351,24 @@ All skip cleanly when no firmware is present, and are deterministic under
   deliberate ratio for servo testing (otherwise the servo simply sits at nominal
   — fine for a functional test).
 
-## 9. Migration from the host-mode MIDI bridge
+## 9. Host and peripheral MIDI share one bridge
 
-Today `midi=on` fabricates an attached USB-MIDI device and keeps the firmware in
-*host* mode. Under this design the Deluge is the *peripheral*, so that bridge no
-longer represents the common case. Plan:
+Both USB roles are supported and the MIDI data bridge serves both — the
+framing/deframing, receive queue and chardev wiring are identical; only the pipe
+numbers and which end is the host differ:
 
-- Keep the CFIFO framing/deframing code; re-target it from host-mode pipes
-  (1 TX, 2–5 RX) to peripheral pipes (**3 TX** Deluge→host, **4 RX** host→Deluge).
-- Retire `midi=on`'s host-mode enumeration as the default. If hosting a USB-MIDI
-  *controller* into the Deluge is still wanted for testing, keep it behind an
-  explicit legacy flag; otherwise remove it once peripheral MIDI is proven.
-- Update `register-coverage.md` and `architecture.md` to describe peripheral
-  mode as the primary USB behaviour.
+- **Host mode** (`midi=on`): the model fabricates an attached USB-MIDI *device*
+  and the firmware (as host) transmits on pipe 1, receives on pipes 2–5. For
+  plugging a controller/keyboard into the Deluge.
+- **Peripheral mode** (`audio=on`): the composite device's MIDI interface is
+  live; the firmware (as device) transmits on pipe 3 (`USB_CFG_PMIDI_BULK_OUT`,
+  Deluge→host), receives on pipe 4 (`USB_CFG_PMIDI_BULK_IN`, host→Deluge).
+
+The model resolves the pipe numbers once at realize (`mbridge`, `midi_tx_pipe`,
+`midi_rx_lo`/`_hi`) from whichever property is set, so a single code path covers
+both. The roles are mutually exclusive per run (one host on the bus), selected
+by `midi=on` vs `audio=on`. `register-coverage.md` and `architecture.md`
+describe both.
 
 ## 9a. Phase 1 implementation contract (verified against firmware)
 

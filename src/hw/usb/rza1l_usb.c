@@ -778,12 +778,18 @@ static void rza1l_usb_peri_post(RzA1lUsbState *s)
         USB_DBG("USB-audio enum: SET_CONFIGURATION");
         rza1l_usb_peri_control_write(s, 0x00, USB_REQ_SET_CONFIGURATION, 1, 0);
         break;
-    case PERI_SET_IFACE_OUT:
-        USB_DBG("USB-audio enum: SET_INTERFACE(%d, alt 1) [from-host]",
-                USB_PAUDIO_STREAM_OUT_IFACE);
-        rza1l_usb_peri_control_write(s, 0x01, USB_REQ_SET_INTERFACE, 1,
+    case PERI_SET_IFACE_OUT: {
+        /* Alt 1 = implicit feedback (follows our clock), alt 2 = adaptive
+         * (host clocks it). Both use pipe 1 and the same format; only the
+         * firmware's timing path differs. */
+        uint16_t alt = s->audio_adaptive ? 2 : 1;
+        USB_DBG("USB-audio enum: SET_INTERFACE(%d, alt %u) [from-host, %s]",
+                USB_PAUDIO_STREAM_OUT_IFACE, alt,
+                s->audio_adaptive ? "adaptive" : "implicit");
+        rza1l_usb_peri_control_write(s, 0x01, USB_REQ_SET_INTERFACE, alt,
                                      USB_PAUDIO_STREAM_OUT_IFACE);
         break;
+    }
     case PERI_SET_IFACE_IN:
         USB_DBG("USB-audio enum: SET_INTERFACE(%d, alt 1) [to-host]",
                 USB_PAUDIO_STREAM_IN_IFACE);
@@ -847,13 +853,28 @@ static void rza1l_usb_peri_advance(RzA1lUsbState *s)
         break;
     case PERI_SET_CONFIG:
         rza1l_usb_set_dvsq(s, USB_DS_CNFG);
-        /* Start the from-host (stream-out) interface only when a source is
-         * configured; otherwise go straight to the to-host interface. */
-        s->peri_step = (s->audio_in_kind != AUDIO_IN_NONE) ? PERI_SET_IFACE_OUT
-                                                           : PERI_SET_IFACE_IN;
+        /* Start each audio stream only when it is wanted: from-host when a
+         * source is configured (audio-in), to-host when a capture sink is
+         * (audio-out). With neither, the composite still enumerates and MIDI
+         * runs - a MIDI-only peripheral. */
+        if (s->audio_in_kind != AUDIO_IN_NONE) {
+            s->peri_step = PERI_SET_IFACE_OUT;
+        } else if (s->audio_out && s->audio_out[0]) {
+            s->peri_step = PERI_SET_IFACE_IN;
+        } else {
+            s->peri_step = PERI_STREAMING;
+            USB_DBG("USB-audio enum: configured, MIDI only (no audio streams)");
+            return;
+        }
         break;
     case PERI_SET_IFACE_OUT:
-        s->peri_step = PERI_SET_IFACE_IN;
+        if (s->audio_out && s->audio_out[0]) {
+            s->peri_step = PERI_SET_IFACE_IN;
+        } else {
+            s->peri_step = PERI_STREAMING;
+            USB_DBG("USB-audio enum: configured, streaming (from-host only)");
+            return;
+        }
         break;
     case PERI_SET_IFACE_IN:
         s->peri_step = PERI_STREAMING;
@@ -1837,6 +1858,7 @@ static const Property rza1l_usb_properties[] = {
     DEFINE_PROP_STRING("audio-out", RzA1lUsbState, audio_out),
     DEFINE_PROP_STRING("audio-in", RzA1lUsbState, audio_in),
     DEFINE_PROP_STRING("audio-in-capture", RzA1lUsbState, audio_in_capture),
+    DEFINE_PROP_BOOL("audio-in-adaptive", RzA1lUsbState, audio_adaptive, false),
 };
 
 static void rza1l_usb_class_init(ObjectClass *klass, const void *data)

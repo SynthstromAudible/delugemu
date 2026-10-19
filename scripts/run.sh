@@ -55,6 +55,12 @@
 #   --usb-audio-in-capture <wav>
 #                           Capture the from-host frames the firmware actually
 #                           consumes into <wav>, for verifying the input path.
+#   --usb-audio-adaptive    Use the from-host stream's adaptive alternate setting
+#                           (host-clocked, like Windows) instead of the default
+#                           implicit-feedback one. Only affects --usb-audio-in.
+#   --usb-peripheral        Run as a USB peripheral with no audio streams (a
+#                           MIDI-only composite device). Combine with --usb-midi
+#                           to bridge its MIDI interface. Implied by --usb-audio*.
 #   --audio <driver>        Select a non-default host audio backend for the
 #                           SSIF (I2S) output (-audiodev <driver>). Audio is on
 #                           by default using the OS default backend (coreaudio
@@ -422,6 +428,8 @@ USB_MIDI=""
 USB_AUDIO=""
 USB_AUDIO_IN=""
 USB_AUDIO_IN_CAPTURE=""
+USB_AUDIO_ADAPTIVE=0
+USB_PERIPHERAL=0
 AUDIO=""
 AUDIO_BUFFER=""
 # Render-head clamp. Defaults to 'auto' (overridable by flag or the Settings
@@ -509,6 +517,8 @@ while [ $# -gt 0 ]; do
             USB_AUDIO_IN_CAPTURE="$2"; shift 2
             ;;
         --usb-audio-in-capture=*) USB_AUDIO_IN_CAPTURE="${1#--usb-audio-in-capture=}"; shift ;;
+        --usb-audio-adaptive) USB_AUDIO_ADAPTIVE=1; shift ;;
+        --usb-peripheral) USB_PERIPHERAL=1; shift ;;
         --audio)
             [ -n "${2:-}" ] || die "--audio requires a driver name"
             AUDIO="$2"; shift 2
@@ -671,7 +681,7 @@ fi
 #   - host MIDI: otherwise the Deluge is the USB *host* and the model presents an
 #     attached MIDI device (rza1l-usb.midi=on).
 USB_MIDI_ARGS=()
-if [ -n "${USB_AUDIO}" ] || [ -n "${USB_AUDIO_IN}" ]; then
+if [ -n "${USB_AUDIO}" ] || [ -n "${USB_AUDIO_IN}" ] || [ "${USB_PERIPHERAL}" -eq 1 ]; then
     USB_PERIPHERAL_MIDI=1
 else
     USB_PERIPHERAL_MIDI=0
@@ -703,15 +713,23 @@ fi
 # input WAV, and the frames the firmware consumes can be captured for checking.
 # Deterministic captures pair well with --icount.
 USB_AUDIO_ARGS=()
-if [ -n "${USB_AUDIO}" ] || [ -n "${USB_AUDIO_IN}" ]; then
+if [ -n "${USB_AUDIO}" ] || [ -n "${USB_AUDIO_IN}" ] || [ "${USB_PERIPHERAL}" -eq 1 ]; then
     USB_AUDIO_ARGS=(-global "rza1l-usb.audio=on")
+    if [ "${USB_PERIPHERAL}" -eq 1 ] && [ -z "${USB_AUDIO}" ] && [ -z "${USB_AUDIO_IN}" ]; then
+        log "USB peripheral: MIDI only (no audio streams)"
+    fi
     if [ -n "${USB_AUDIO}" ]; then
         USB_AUDIO_ARGS+=(-global "rza1l-usb.audio-out=${USB_AUDIO}")
         log "Capturing USB-audio to-host stream to WAV: ${USB_AUDIO}"
     fi
     if [ -n "${USB_AUDIO_IN}" ]; then
         USB_AUDIO_ARGS+=(-global "rza1l-usb.audio-in=${USB_AUDIO_IN}")
-        log "Feeding USB-audio from-host stream from: ${USB_AUDIO_IN}"
+        if [ "${USB_AUDIO_ADAPTIVE}" -eq 1 ]; then
+            USB_AUDIO_ARGS+=(-global "rza1l-usb.audio-in-adaptive=on")
+            log "Feeding USB-audio from-host stream (adaptive) from: ${USB_AUDIO_IN}"
+        else
+            log "Feeding USB-audio from-host stream (implicit) from: ${USB_AUDIO_IN}"
+        fi
     fi
     if [ -n "${USB_AUDIO_IN_CAPTURE}" ]; then
         USB_AUDIO_ARGS+=(-global "rza1l-usb.audio-in-capture=${USB_AUDIO_IN_CAPTURE}")
