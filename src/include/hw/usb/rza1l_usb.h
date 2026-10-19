@@ -25,10 +25,15 @@
 
 #include "hw/core/sysbus.h"
 #include "chardev/char-fe.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
+#include <stdio.h>
 
 #define TYPE_RZA1L_USB "rza1l-usb"
 OBJECT_DECLARE_SIMPLE_TYPE(RzA1lUsbState, RZA1L_USB)
+
+/* Largest UAC1 isochronous packet (48 frames x 2ch x 4-byte subframe). */
+#define RZA1L_USB_AUDIO_PKT_MAX 384
 
 /* MMIO register window for one USB controller (covers SYSCFG0..PIPExCTR). */
 #define RZA1L_USB_MMIO_SIZE 0x200
@@ -54,6 +59,29 @@ struct RzA1lUsbState {
     /* Properties. */
     bool midi;          /* present an attached USB-MIDI device on the host port */
     CharFrontend chr;   /* host serial-MIDI chardev bridged to the bulk pipes */
+    bool audio;         /* present as a USB-audio peripheral (to-host stream) */
+    char *audio_out;    /* WAV output path for the captured to-host stream */
+
+    /* ---- Peripheral-mode USB-audio (only used when audio == true) -------- */
+
+    /* Enumeration driver: the model plays USB host against the firmware's
+     * peripheral stack, driving attach -> bus reset -> SET_ADDRESS ->
+     * SET_CONFIGURATION -> SET_INTERFACE(stream-in, alt 1) to start streaming. */
+    int      peri_step;     /* enumeration state-machine cursor */
+    bool     peri_kicked;   /* enumeration has been started (one-shot) */
+    uint16_t peri_wait;     /* INTSTS0 edge bit whose clear advances the SM */
+
+    /* To-host isochronous stream (pipe 2 / D0FIFO). The DMAC writes one packet
+     * here via repeated fixed-address stores; committed to the WAV sink on
+     * D0FIFOCTR.BVAL. */
+    uint8_t  tohost[RZA1L_USB_AUDIO_PKT_MAX];
+    uint32_t tohost_len;
+    QEMUTimer *sof_timer;   /* 1 ms Start-Of-Frame clock while streaming */
+    bool     sof_running;
+
+    /* WAV sink for the to-host stream. */
+    FILE    *wav;
+    uint64_t wav_data_bytes;
 
     /* 16-bit register file; status registers are synthesised on read. */
     uint16_t regs[RZA1L_USB_NUM_REGS];

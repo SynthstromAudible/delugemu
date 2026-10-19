@@ -39,6 +39,10 @@
 #                           --usb-midi pty. Pass 'coremidi' to expose it as a
 #                           real host MIDI in/out port named "DelugEmu USB"
 #                           (macOS). Routed to serial slot 1.
+#   --usb-audio <wav>       Present the Deluge as a USB-audio (UAC1) peripheral
+#                           and capture the audio it streams to the host into
+#                           <wav> (44.1 kHz, stereo, 32-bit PCM). Pair with
+#                           --icount for a deterministic, reproducible capture.
 #   --audio <driver>        Select a non-default host audio backend for the
 #                           SSIF (I2S) output (-audiodev <driver>). Audio is on
 #                           by default using the OS default backend (coreaudio
@@ -403,6 +407,7 @@ fi
 
 MIDI=""
 USB_MIDI=""
+USB_AUDIO=""
 AUDIO=""
 AUDIO_BUFFER=""
 # Render-head clamp. Defaults to 'auto' (overridable by flag or the Settings
@@ -475,6 +480,11 @@ while [ $# -gt 0 ]; do
             USB_MIDI="$2"; shift 2
             ;;
         --usb-midi=*) USB_MIDI="${1#--usb-midi=}"; shift ;;
+        --usb-audio)
+            [ -n "${2:-}" ] || die "--usb-audio requires an output WAV path"
+            USB_AUDIO="$2"; shift 2
+            ;;
+        --usb-audio=*) USB_AUDIO="${1#--usb-audio=}"; shift ;;
         --audio)
             [ -n "${2:-}" ] || die "--audio requires a driver name"
             AUDIO="$2"; shift 2
@@ -538,6 +548,15 @@ done
 # read-only snapshot is used). If neither exists and the terminal is
 # interactive, offer to download the Synthstrom factory card contents into
 # ./${SD_DIR} and use that.
+#
+# A prebuilt image (build/deluge_sd.img from mksd.sh, or DELUGEMU_SD_IMG) takes
+# precedence over the folders, so the card isn't rebuilt on every launch. The
+# guest writes to it directly; rerun mksd.sh to rebuild it from the folder.
+SD_IMG_DEFAULT="${DELUGEMU_SD_IMG:-${REPO_ROOT}/build/deluge_sd.img}"
+if [ ${#SD_ARGS[@]} -eq 0 ] && [ -f "${SD_IMG_DEFAULT}" ]; then
+    log "No --sd given; using prebuilt image ${SD_IMG_DEFAULT}"
+    sd_setup "${SD_IMG_DEFAULT}"
+fi
 if [ ${#SD_ARGS[@]} -eq 0 ]; then
     for default_sd in "${SD_DIR}_rw" "${SD_DIR}"; do
         # An empty folder is "no card yet", not a card — don't let a
@@ -631,6 +650,16 @@ if [ "${USB_MIDI}" = "coremidi" ]; then
 elif [ -n "${USB_MIDI}" ]; then
     USB_MIDI_ARGS=(-serial "${USB_MIDI}" -global "rza1l-usb.midi=on")
     log "Attaching host USB-MIDI device on chardev: ${USB_MIDI}"
+fi
+
+# USB-audio peripheral (to-host stream): present the Deluge as a UAC1 device and
+# capture the audio it sends to the host into a WAV file. Deterministic captures
+# pair well with --icount.
+USB_AUDIO_ARGS=()
+if [ -n "${USB_AUDIO}" ]; then
+    USB_AUDIO_ARGS=(-global "rza1l-usb.audio=on" \
+                    -global "rza1l-usb.audio-out=${USB_AUDIO}")
+    log "Capturing USB-audio to-host stream to WAV: ${USB_AUDIO}"
 fi
 
 # Display mode. On macOS the console window is left non-resizable so Cocoa sizes
@@ -916,6 +945,7 @@ QEMU_CMD=("${BIN}"
     -kernel "${FIRMWARE}"
     "${SERIAL_ARGS[@]}"
     "${USB_MIDI_ARGS[@]+"${USB_MIDI_ARGS[@]}"}"
+    "${USB_AUDIO_ARGS[@]+"${USB_AUDIO_ARGS[@]}"}"
     "${DISPLAY_ARGS[@]+"${DISPLAY_ARGS[@]}"}"
     "${SKIN_ARGS[@]+"${SKIN_ARGS[@]}"}"
     "${AUDIO_ARGS[@]+"${AUDIO_ARGS[@]}"}"

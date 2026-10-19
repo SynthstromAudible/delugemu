@@ -41,6 +41,8 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/main-loop.h"
+#include "qemu/timer.h"
+#include "qemu/error-report.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
@@ -54,8 +56,16 @@
 #define USB_SYSSTS0  0x04
 #define USB_DVSTCTR0 0x08
 #define USB_CFIFO    0x14
+#define USB_D0FIFO   0x18
+#define USB_D1FIFO   0x1c
 #define USB_CFIFOSEL 0x20
 #define USB_CFIFOCTR 0x22
+/* NB: a 4-byte reserved gap (iodefine dummy4[4]) sits between CFIFOCTR and
+ * D0FIFOSEL, so the data-FIFO select/control registers start at 0x28. */
+#define USB_D0FIFOSEL 0x28
+#define USB_D0FIFOCTR 0x2a
+#define USB_D1FIFOSEL 0x2c
+#define USB_D1FIFOCTR 0x2e
 #define USB_INTENB0  0x30
 #define USB_INTENB1  0x32
 #define USB_BRDYENB  0x36
@@ -81,6 +91,12 @@
 #define USB_PIPE1CTR 0x70   /* PIPEnCTR = PIPE1CTR + (n-1)*2, up to PIPE9CTR */
 
 /* ---- Bit definitions ---------------------------------------------------- */
+/* SYSCFG0 */
+#define USB_USBE     0x0001
+#define USB_DPRPU    0x0010   /* D+ pull-up (peripheral attach) */
+#define USB_DRPD     0x0020   /* D+/D- pull-down (host) */
+#define USB_DCFM     0x0040   /* function controller select (1 = host) */
+
 /* SYSSTS0 */
 #define USB_LNST     0x0003
 #define USB_FS_JSTS  0x0001
@@ -106,6 +122,28 @@
 #define USB_BRDY     0x0100
 #define USB_NRDY     0x0200
 #define USB_BEMP     0x0400
+#define USB_CTRT     0x0800   /* control transfer stage transition */
+#define USB_DVST     0x1000   /* device state transition */
+#define USB_SOFR     0x2000   /* SOF (frame) update */
+#define USB_VBINT    0x8000   /* VBUS interrupt */
+/* INTSTS0 status fields (peripheral mode). */
+#define USB_CTSQ     0x0007   /* control transfer stage */
+#define USB_VALID    0x0008   /* setup packet detect flag */
+#define USB_DVSQ     0x0070   /* device state (DVSQ) */
+#define USB_VBSTS    0x0080   /* VBUS input level */
+/* CTSQ (control transfer stage) values. */
+#define USB_CS_IDST  0x0000   /* idle / setup stage */
+#define USB_CS_WRND  0x0005   /* control write no-data status stage */
+/* DVSQ (device state) values. */
+#define USB_DS_DFLT  0x0010   /* default (after bus reset) */
+#define USB_DS_ADDS  0x0020   /* address */
+#define USB_DS_CNFG  0x0030   /* configured */
+
+/* INTENB0 SOF enable (same bit as INTSTS0.SOFR). */
+#define USB_SOFE     0x2000
+
+/* DnFIFOCTR / DnFIFOSEL (data-FIFO ports, used by the audio DMA). */
+#define USB_DREQE    0x1000   /* DnFIFOSEL: DMA request enable */
 
 /* INTSTS1 / INTENB1 */
 #define USB_SACK     0x0010
@@ -128,6 +166,10 @@
 #define USB_REQ_SET_ADDRESS       0x05
 #define USB_REQ_GET_DESCRIPTOR    0x06
 #define USB_REQ_SET_CONFIGURATION 0x09
+#define USB_REQ_SET_INTERFACE     0x0b
+
+/* UAC1 streaming-in interface (Deluge -> host); alt 1 starts the stream. */
+#define USB_PAUDIO_STREAM_IN_IFACE 2
 
 /* GET_DESCRIPTOR types (wValue high byte). */
 #define USB_DT_DEVICE        0x01
@@ -280,6 +322,284 @@ static void rza1l_usb_event(void *opaque)
 static void rza1l_usb_schedule_event(RzA1lUsbState *s)
 {
     qemu_bh_schedule(s->event_bh);
+}
+
+/* ---- Peripheral-mode USB-audio: WAV sink -------------------------------- */
+
+/* Patch a little-endian u32 at a fixed offset in the open WAV file. */
+static void rza1l_usb_wav_patch_u32(FILE *fp, long off, uint32_t v)
+{
+    uint8_t b[4] = { v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff,
+                     (v >> 24) & 0xff };
+    if (fseek(fp, off, SEEK_SET) == 0) {
+        fwrite(b, 1, 4, fp);
+    }
+}
+
+/*
+ * Open the to-host WAV sink and write a 44-byte canonical header for
+ * 44.1 kHz / 2-channel / 32-bit PCM. The RIFF and data sizes are placeholders,
+ * patched on close once the total byte count is known. The stream carries the
+ * Deluge's q31 samples (24-bit MSB-aligned in 32-bit subframes) verbatim.
+ */
+static void rza1l_usb_wav_open(RzA1lUsbState *s)
+{
+    static const uint32_t rate = 44100;
+    static const uint16_t channels = 2;
+    static const uint16_t bits = 32;
+    uint32_t byte_rate = rate * channels * (bits / 8);
+    uint16_t block_align = channels * (bits / 8);
+    uint8_t hdr[44] = {
+        'R','I','F','F', 0,0,0,0, 'W','A','V','E',
+        'f','m','t',' ', 16,0,0,0, 1,0, 0,0, 0,0,0,0, 0,0,0,0, 0,0, 0,0,
+        'd','a','t','a', 0,0,0,0,
+    };
+
+    if (!s->audio_out || s->audio_out[0] == '\0') {
+        return;
+    }
+    s->wav = fopen(s->audio_out, "wb");
+    if (!s->wav) {
+        warn_report("rza1l-usb: cannot open USB-audio WAV '%s'", s->audio_out);
+        return;
+    }
+    hdr[22] = channels & 0xff;    hdr[23] = channels >> 8;
+    hdr[24] = rate & 0xff;        hdr[25] = (rate >> 8) & 0xff;
+    hdr[26] = (rate >> 16) & 0xff; hdr[27] = (rate >> 24) & 0xff;
+    hdr[28] = byte_rate & 0xff;   hdr[29] = (byte_rate >> 8) & 0xff;
+    hdr[30] = (byte_rate >> 16) & 0xff; hdr[31] = (byte_rate >> 24) & 0xff;
+    hdr[32] = block_align & 0xff; hdr[33] = block_align >> 8;
+    hdr[34] = bits & 0xff;        hdr[35] = bits >> 8;
+    fwrite(hdr, 1, sizeof(hdr), s->wav);
+    s->wav_data_bytes = 0;
+    USB_DBG("USB-audio: WAV sink open '%s'", s->audio_out);
+}
+
+static void rza1l_usb_wav_write(RzA1lUsbState *s, const uint8_t *data,
+                                uint32_t len)
+{
+    if (!s->wav || len == 0) {
+        return;
+    }
+    fwrite(data, 1, len, s->wav);
+    s->wav_data_bytes += len;
+    /*
+     * Keep the RIFF/data sizes current after every packet so the file is a
+     * valid, playable WAV even if the emulator is killed (SIGTERM/SIGKILL)
+     * without a clean close - the common case for headless capture runs.
+     */
+    rza1l_usb_wav_patch_u32(s->wav, 4, 36 + (uint32_t)s->wav_data_bytes);
+    rza1l_usb_wav_patch_u32(s->wav, 40, (uint32_t)s->wav_data_bytes);
+    fseek(s->wav, 0, SEEK_END);
+}
+
+static void rza1l_usb_wav_close(RzA1lUsbState *s)
+{
+    if (!s->wav) {
+        return;
+    }
+    rza1l_usb_wav_patch_u32(s->wav, 4, 36 + (uint32_t)s->wav_data_bytes);
+    rza1l_usb_wav_patch_u32(s->wav, 40, (uint32_t)s->wav_data_bytes);
+    fclose(s->wav);
+    s->wav = NULL;
+    USB_DBG("USB-audio: WAV sink closed, %" PRIu64 " data bytes",
+            s->wav_data_bytes);
+}
+
+/* ---- Peripheral-mode USB-audio: 1 ms SOF clock -------------------------- */
+
+static void rza1l_usb_sof_tick(void *opaque)
+{
+    RzA1lUsbState *s = opaque;
+
+    if (!s->sof_running) {
+        return;
+    }
+    /* Raise the SOF interrupt; the firmware's handler pumps usbAudioHandleSof(),
+     * which stages a packet and kicks the to-host DMA. */
+    s->regs[USB_INTSTS0 >> 1] |= USB_SOFR;
+    rza1l_usb_update_irq(s);
+
+    timer_mod(s->sof_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + NANOSECONDS_PER_SECOND / 1000);
+}
+
+/* Start/stop the SOF clock to track INTENB0.SOFE (set by startToHost()). */
+static void rza1l_usb_sof_update(RzA1lUsbState *s)
+{
+    bool want = s->audio && (s->regs[USB_INTENB0 >> 1] & USB_SOFE);
+
+    if (want && !s->sof_running) {
+        s->sof_running = true;
+        timer_mod(s->sof_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      NANOSECONDS_PER_SECOND / 1000);
+        USB_DBG("USB-audio: SOF clock started");
+    } else if (!want && s->sof_running) {
+        s->sof_running = false;
+        timer_del(s->sof_timer);
+        USB_DBG("USB-audio: SOF clock stopped");
+    }
+}
+
+/* ---- Peripheral-mode USB-audio: enumeration driver ---------------------- */
+
+/*
+ * The model plays the USB host against the firmware's peripheral stack. It
+ * drives, in order: VBUS attach, bus reset, then the three no-data control
+ * writes (SET_ADDRESS / SET_CONFIGURATION / SET_INTERFACE(stream-in, alt 1))
+ * that bring the device to the configured, streaming state. Each step posts one
+ * INTSTS0 event and waits (peri_wait) for the firmware to acknowledge it by
+ * clearing that bit, then advances. See docs/usb-audio.md §9a.
+ */
+enum {
+    PERI_IDLE = 0,
+    PERI_ATTACH,     /* raise VBINT (VBUS present) */
+    PERI_RESET,      /* raise DVST, device state -> Default */
+    PERI_SET_ADDR,   /* SET_ADDRESS control write */
+    PERI_SET_CONFIG, /* SET_CONFIGURATION control write */
+    PERI_SET_IFACE,  /* SET_INTERFACE(stream-in, alt 1) control write */
+    PERI_STREAMING,  /* configured; to-host stream driven by SOF */
+};
+
+/* Set the INTSTS0 device-state (DVSQ) field without disturbing other bits. */
+static void rza1l_usb_set_dvsq(RzA1lUsbState *s, uint16_t dvsq)
+{
+    s->regs[USB_INTSTS0 >> 1] =
+        (s->regs[USB_INTSTS0 >> 1] & ~USB_DVSQ) | (dvsq & USB_DVSQ);
+}
+
+/* Latch an 8-byte control SETUP into the request registers (as the peripheral
+ * controller would from a bus SETUP packet) and present a no-data write at the
+ * status stage (CTSQ = WRND, VALID), raising CTRT. */
+static void rza1l_usb_peri_control_write(RzA1lUsbState *s, uint8_t bmreq,
+                                         uint8_t brequest, uint16_t wvalue,
+                                         uint16_t windex)
+{
+    s->regs[USB_USBREQ >> 1] = ((uint16_t)brequest << 8) | bmreq;
+    s->regs[USB_USBVAL >> 1] = wvalue;
+    s->regs[USB_USBINDX >> 1] = windex;
+    s->regs[USB_USBLENG >> 1] = 0;
+
+    s->regs[USB_INTSTS0 >> 1] =
+        (s->regs[USB_INTSTS0 >> 1] & ~USB_CTSQ) | USB_CS_WRND | USB_VALID;
+    s->peri_wait = USB_CTRT;
+    s->pending_ints0 |= USB_CTRT;
+    rza1l_usb_schedule_event(s);
+}
+
+/* Post the event for the current peri_step. */
+static void rza1l_usb_peri_post(RzA1lUsbState *s)
+{
+    switch (s->peri_step) {
+    case PERI_ATTACH:
+        s->regs[USB_INTSTS0 >> 1] |= USB_VBSTS;   /* VBUS now present */
+        s->peri_wait = USB_VBINT;
+        s->pending_ints0 |= USB_VBINT;
+        rza1l_usb_schedule_event(s);
+        USB_DBG("USB-audio enum: attach (VBINT)");
+        break;
+    case PERI_RESET:
+        rza1l_usb_set_dvsq(s, USB_DS_DFLT);
+        s->peri_wait = USB_DVST;
+        s->pending_ints0 |= USB_DVST;
+        rza1l_usb_schedule_event(s);
+        USB_DBG("USB-audio enum: bus reset (DVST, Default)");
+        break;
+    case PERI_SET_ADDR:
+        USB_DBG("USB-audio enum: SET_ADDRESS");
+        rza1l_usb_peri_control_write(s, 0x00, USB_REQ_SET_ADDRESS, 2, 0);
+        break;
+    case PERI_SET_CONFIG:
+        USB_DBG("USB-audio enum: SET_CONFIGURATION");
+        rza1l_usb_peri_control_write(s, 0x00, USB_REQ_SET_CONFIGURATION, 1, 0);
+        break;
+    case PERI_SET_IFACE:
+        USB_DBG("USB-audio enum: SET_INTERFACE(%d, alt 1)",
+                USB_PAUDIO_STREAM_IN_IFACE);
+        rza1l_usb_peri_control_write(s, 0x01, USB_REQ_SET_INTERFACE, 1,
+                                     USB_PAUDIO_STREAM_IN_IFACE);
+        break;
+    default:
+        break;
+    }
+}
+
+/* Begin enumeration (one-shot), once the firmware has configured peripheral
+ * mode and enabled the peripheral interrupt set. */
+static void rza1l_usb_peri_kick(RzA1lUsbState *s)
+{
+    if (!s->audio || s->peri_kicked) {
+        return;
+    }
+    if (s->regs[USB_SYSCFG0 >> 1] & USB_DCFM) {
+        return; /* still in host mode */
+    }
+    if (!(s->regs[USB_SYSCFG0 >> 1] & USB_USBE)) {
+        return;
+    }
+    s->peri_kicked = true;
+    s->peri_step = PERI_ATTACH;
+    rza1l_usb_wav_open(s);
+    rza1l_usb_peri_post(s);
+}
+
+/* The firmware cleared one or more INTSTS0 bits. If it acknowledged the event
+ * we were waiting on, advance the enumeration state machine. */
+static void rza1l_usb_peri_on_clear(RzA1lUsbState *s, uint16_t cleared)
+{
+    if (!s->audio || !s->peri_kicked || s->peri_wait == 0) {
+        return;
+    }
+    if (!(cleared & s->peri_wait)) {
+        return;
+    }
+    s->peri_wait = 0;
+
+    switch (s->peri_step) {
+    case PERI_ATTACH:
+        s->peri_step = PERI_RESET;
+        break;
+    case PERI_RESET:
+        s->peri_step = PERI_SET_ADDR;
+        break;
+    case PERI_SET_ADDR:
+        rza1l_usb_set_dvsq(s, USB_DS_ADDS);
+        s->peri_step = PERI_SET_CONFIG;
+        break;
+    case PERI_SET_CONFIG:
+        rza1l_usb_set_dvsq(s, USB_DS_CNFG);
+        s->peri_step = PERI_SET_IFACE;
+        break;
+    case PERI_SET_IFACE:
+        s->peri_step = PERI_STREAMING;
+        USB_DBG("USB-audio enum: configured, streaming");
+        return;
+    default:
+        return;
+    }
+    rza1l_usb_peri_post(s);
+}
+
+/* Accumulate a to-host audio packet word written by the DMAC to D0FIFO. */
+static void rza1l_usb_d0fifo_write(RzA1lUsbState *s, uint32_t value)
+{
+    int i;
+
+    for (i = 0; i < 4; i++) {
+        if (s->tohost_len < RZA1L_USB_AUDIO_PKT_MAX) {
+            s->tohost[s->tohost_len++] = (value >> (8 * i)) & 0xff;
+        }
+    }
+}
+
+/* Commit the accumulated to-host packet (D0FIFOCTR.BVAL) to the WAV sink. */
+static void rza1l_usb_d0fifo_commit(RzA1lUsbState *s)
+{
+    if (s->tohost_len) {
+        rza1l_usb_wav_write(s, s->tohost, s->tohost_len);
+        s->tohost_len = 0;
+    }
 }
 
 /* ---- Bulk MIDI data bridge ---------------------------------------------- */
@@ -597,6 +917,12 @@ static uint16_t rza1l_usb_read16(RzA1lUsbState *s, hwaddr offset)
         return USB_FRDY;
     }
 
+    case USB_D0FIFOCTR:
+        /* To-host audio buffer: always report FRDY (a buffer is free). The WAV
+         * sink consumes each committed packet immediately, so there is no
+         * back-pressure to model. */
+        return USB_FRDY;
+
     case USB_INTSTS0:
         return rza1l_usb_intsts0(s);
 
@@ -713,7 +1039,16 @@ static uint64_t rza1l_usb_read(void *opaque, hwaddr offset, unsigned size)
 static void rza1l_usb_write16(RzA1lUsbState *s, hwaddr offset, uint16_t value)
 {
     switch (offset) {
-    case USB_INTSTS0:
+    case USB_INTSTS0: {
+        /* Write-0-to-clear status: the firmware ANDs to acknowledge. Detect the
+         * edge bits it just cleared so the peripheral enumeration driver can
+         * advance when its posted event is acknowledged. */
+        uint16_t before = s->regs[offset >> 1];
+        s->regs[offset >> 1] &= value;
+        rza1l_usb_peri_on_clear(s, before & ~s->regs[offset >> 1]);
+        rza1l_usb_update_irq(s);
+        return;
+    }
     case USB_INTSTS1:
     case USB_BRDYSTS:
     case USB_NRDYSTS:
@@ -740,6 +1075,15 @@ static void rza1l_usb_write16(RzA1lUsbState *s, hwaddr offset, uint16_t value)
             s->pending_attach = true;
             rza1l_usb_schedule_event(s);
         }
+        if (offset == USB_INTENB0 && s->audio) {
+            /* Start enumeration once the firmware enables the peripheral
+             * interrupt set (VBINT et al) having configured function mode, and
+             * track the SOF clock (startToHost() enables INTENB0.SOFE). */
+            if (value & USB_VBINT) {
+                rza1l_usb_peri_kick(s);
+            }
+            rza1l_usb_sof_update(s);
+        }
         rza1l_usb_update_irq(s);
         return;
 
@@ -761,6 +1105,14 @@ static void rza1l_usb_write16(RzA1lUsbState *s, hwaddr offset, uint16_t value)
                 s->pending_bemp |= 0x0001;
                 rza1l_usb_schedule_event(s);
             }
+        } else if (s->audio && (value & USB_CCPL)) {
+            /*
+             * Peripheral control transfer completed. Return the control
+             * sequencer to idle (CTSQ = IDST, VALID clear) so the firmware's
+             * CTSQ read-back sees completion rather than a stuck status stage.
+             */
+            s->regs[offset >> 1] = value & ~USB_CCPL;
+            s->regs[USB_INTSTS0 >> 1] &= ~(USB_CTSQ | USB_VALID);
         } else {
             s->regs[offset >> 1] = value;
         }
@@ -820,6 +1172,16 @@ static void rza1l_usb_write16(RzA1lUsbState *s, hwaddr offset, uint16_t value)
         rza1l_usb_update_irq(s);
         return;
 
+    case USB_D0FIFOCTR:
+        /* BVAL commits the to-host audio packet the DMAC just staged into
+         * D0FIFO; flush it to the WAV sink. BCLR discards it. */
+        if (s->audio && (value & USB_BVAL)) {
+            rza1l_usb_d0fifo_commit(s);
+        } else if (value & USB_BCLR) {
+            s->tohost_len = 0;
+        }
+        return;
+
     case USB_CFIFOCTR: {
         uint16_t pipe = s->regs[USB_CFIFOSEL >> 1] & USB_CURPIPE;
         /*
@@ -877,8 +1239,19 @@ static void rza1l_usb_write(void *opaque, hwaddr offset, uint64_t value,
 {
     RzA1lUsbState *s = opaque;
 
+    if (rza1l_usb_debug() && offset != USB_CFIFO && offset != USB_D0FIFO &&
+        offset != USB_D1FIFO) {
+        USB_DBG("W [0x%02x]=0x%04x (sz%u)", (unsigned)offset,
+                (unsigned)(value & 0xffff), size);
+    }
+
     if (offset == USB_CFIFO) {
         rza1l_usb_write_cfifo(s, value);
+        return;
+    }
+    if (offset == USB_D0FIFO) {
+        /* To-host audio payload, written word-by-word by the DMAC (ch0). */
+        rza1l_usb_d0fifo_write(s, value);
         return;
     }
 
@@ -986,6 +1359,17 @@ static void rza1l_usb_reset(DeviceState *dev)
     s->sysex_len = 0;
     s->tx_len = 0;
 
+    /* Peripheral-mode USB-audio state. */
+    s->peri_step = PERI_IDLE;
+    s->peri_kicked = false;
+    s->peri_wait = 0;
+    s->tohost_len = 0;
+    if (s->sof_running && s->sof_timer) {
+        timer_del(s->sof_timer);
+    }
+    s->sof_running = false;
+    rza1l_usb_wav_close(s);
+
     qemu_set_irq(s->irq, 0);
 }
 
@@ -1000,6 +1384,7 @@ static void rza1l_usb_realize(DeviceState *dev, Error **errp)
     sysbus_init_irq(sbd, &s->irq);
 
     s->event_bh = qemu_bh_new(rza1l_usb_event, s);
+    s->sof_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rza1l_usb_sof_tick, s);
 
     /*
      * Bridge the bulk MIDI pipes to the host chardev (if one is configured).
@@ -1029,6 +1414,8 @@ static const VMStateDescription vmstate_rza1l_usb = {
 static const Property rza1l_usb_properties[] = {
     DEFINE_PROP_BOOL("midi", RzA1lUsbState, midi, false),
     DEFINE_PROP_CHR("chardev", RzA1lUsbState, chr),
+    DEFINE_PROP_BOOL("audio", RzA1lUsbState, audio, false),
+    DEFINE_PROP_STRING("audio-out", RzA1lUsbState, audio_out),
 };
 
 static void rza1l_usb_class_init(ObjectClass *klass, const void *data)
