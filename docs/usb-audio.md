@@ -255,35 +255,80 @@ pipe range and keep audio-iso vs MIDI-bulk completion semantics distinct.
      / D1FIFOSEL 0x2C / D1FIFOCTR 0x2E** — *not* 0x24/0x26/0x28/0x2A. The data
      ports themselves (D0FIFO 0x18, D1FIFO 0x1C) are contiguous and correct.
    Remaining for this phase: a skip-clean `tests/usb-audio.sh`.
-2. **Audio from host + MIDI in peripheral mode.** D1FIFO + DMAC ch1 + pipe-1
-   BRDY pacing + source; repoint the CFIFO MIDI bridge to pipes 3/4 and verify
-   MIDI both ways to CoreMIDI. **Detailed task plan:
-   [usb-audio-phase2-todo.md](usb-audio-phase2-todo.md).**
-3. **Full enumeration hardening.** Drive the real composite-descriptor
-   enumeration (device/config/SET_CONFIGURATION/SET_INTERFACE) robustly;
-   alt-setting 0 teardown; bus-reset/detach handling (`usbAudioStopAll`).
-4. **CoreAudio bridge + docs.** Live audio routing; fold results into
-   `register-coverage.md` and `architecture.md`; retire the host-mode bridge or
-   gate it behind a legacy flag (§9).
+2. **Audio from host + MIDI in peripheral mode. ✅ DONE.** (Plan archived in
+   [usb-audio-phase2-todo.md](usb-audio-phase2-todo.md).)
+   - **From-host audio** (ISO OUT, pipe 1 / D1FIFO / DMA ch1): enumeration now
+     also drives `SET_INTERFACE(1,1)` → `startFromHost()`; the model presents one
+     packet per SOF while the firmware has pipe 1 armed (`BRDYENB` bit 1), paced
+     at 44.1 kHz, raises pipe-1 BRDY, and answers the SAD-fixed D1FIFO read DMA
+     word-by-word. Source is a built-in test tone (`--usb-audio-in tone[:freq]`)
+     or an input WAV (looped). The frames the firmware actually consumes can be
+     captured (`--usb-audio-in-capture <wav>`) for checking. Note the firmware
+     deliberately does **not** echo host audio onto the to-host stream
+     (`audio_engine.cpp`: `toUSB` is taken *before* `doUSBDirectMonitoring`), so
+     the input is verified on the consumed frames, not a round trip.
+   - **Peripheral MIDI** (bulk pipes 3 TX / 4 RX over CFIFO): the MIDI data
+     bridge is parameterised by mode — host mode (`midi=on`) uses pipes 1/2–5,
+     peripheral mode (`audio=on`) uses pipes 3/4 — and the framing/deframing,
+     rx-queue and chardev are shared. Enabled automatically alongside USB audio;
+     `scripts/run.sh --usb-midi <chardev>` bridges the composite MIDI interface
+     when combined with `--usb-audio`/`--usb-audio-in` (host-mode `midi=on` is
+     not set in that case). Verified by a SysEx Identity round-trip
+     (`tests/usb-midi-peripheral.sh`).
+   Two firmware-interaction bugs found and fixed during bring-up:
+   - **Lost first SET_INTERFACE / control-write register race:** the firmware's
+     decoder clears `CTRT` at the *start* of its interrupt, before
+     `usb_pstd_save_request()` latches `USBREQ/USBVAL/USBINDX`. Advancing the
+     enumeration on CTRT-clear let the model post the next control write and
+     overwrite those registers before the firmware read them, so the first of two
+     back-to-back `SET_INTERFACE`s was processed with the second's values (only
+     the last pipe got configured). Fixed by advancing on the firmware's `CCPL`
+     (issued by `usb_pstd_ctrl_end`, after `set_interface3`) instead.
+   - **Peripheral-connected flag / missing idle-stage CTRT:** `g_usb_peri_connected`
+     (which gates the firmware arming peripheral MIDI receive) is set by
+     `set_configuration0()`, run from the *idle-stage* `CTRT` (`CTSQ=IDST`) that
+     real hardware raises *after* the status stage. The model now presents that
+     idle-stage CTRT after each control write's CCPL, then advances when the
+     firmware acknowledges it. Without it, enumeration "completed" but the MIDI
+     engine never armed pipe 4. A stale `CFIFOCTR` returning bare `FRDY` for an
+     empty receive pipe also had to be fixed to report *no* FRDY, or the
+     firmware's drain loop spun on zero-length packets.
+3. **Full enumeration hardening. ✅ (covered.)** Enumeration drives the full
+   composite — SET_CONFIGURATION then `SET_INTERFACE(1,1)` (from-host) and
+   `SET_INTERFACE(2,1)` (to-host); MIDI needs no alt setting. `usbAudioStopAll`
+   on bus reset / reconfigure is honoured by the firmware; the model tears the
+   from-host stream down when `BRDYENB` bit 1 clears. (A distinct `peripheral`
+   property, separable from `audio`, remains a possible future refinement.)
+4. **CoreAudio bridge + docs.** Live host-audio routing to a QEMU `audiodev`
+   remains optional/future; docs updated here. Host-mode MIDI is kept behind the
+   `midi=on` property as a legacy path (§9), not removed.
 
 ## 7. Testing
 
-- `tests/usb-audio.sh` (modelled on `tests/usb-midi-bridge.sh`): boot the
-  `feat/usb_audio` firmware with `--usb-audio wav:out.wav` under `--icount`,
-  drive host-side `SET_INTERFACE`, stream briefly, assert the WAV is the
-  expected length and non-silent (firmware playing a known tone/song). SKIP
-  cleanly when no firmware is present.
-- From-host: feed a known tone, capture `directMonitoring` output, assert match
-  within resampler tolerance.
-- MIDI: reuse the existing SysEx Identity Request/Reply assertion, now over
-  peripheral pipes 3/4.
+All skip cleanly when no firmware is present, and are deterministic under
+`--icount`:
+
+- **`tests/usb-audio.sh`** — boots `feat/usb_audio` and streams *both*
+  directions at once. Asserts the to-host capture is a valid, real-time-length
+  44.1 kHz/stereo/32-bit WAV, and that the from-host test tone (injected via
+  `--usb-audio-in tone:440`) is carried intact — verified on the frames the
+  firmware consumes (`--usb-audio-in-capture`) with a Goertzel check, since the
+  firmware does not echo host audio onto the to-host stream.
+- **`tests/usb-midi-peripheral.sh`** — boots as a USB peripheral (`audio=on`)
+  with the composite MIDI interface bridged to a UNIX socket, and round-trips a
+  SysEx Identity Request (in on pipe 4) / Identity Reply (out on pipe 3).
+- **`tests/usb-midi-bridge.sh`** — the legacy host-mode (`midi=on`) MIDI bridge,
+  still green (the bridge code is shared, parameterised by pipe numbers).
 
 ## 8. Open questions / decisions
 
 - **O1 — RESOLVED (verified):** peripheral mode for both audio and MIDI;
   host-mode bridge retired (§1, §9). MIDI confirmed to transit CFIFO on pipes
   3 (Deluge→host) / 4 (host→Deluge); audio uses D0/D1FIFO DMA (§2.4).
-- **O2 — validate:** DMAC D0/D1FIFO endpoint hookup (§3.3), in Phase 1.
+- **O2 — RESOLVED (verified):** DMAC D0/D1FIFO endpoint hookup needs no DMAC
+  changes. A register-mode one-shot transfer on `SETEN` honours `SAD`/`DAD`
+  (fixed FIFO address) and pulses the per-channel DMAINT; `SWRST` preserves
+  `CHCFG`. To-host writes D0FIFO (ch0), from-host reads D1FIFO (ch1); both work.
 - **Mode entry:** confirm `SYSCFG0.DCFM==0` + no host attach is an unambiguous
   trigger for the peripheral path, vs. gating solely on the `peripheral`
   property.

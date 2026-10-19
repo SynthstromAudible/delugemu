@@ -59,8 +59,20 @@ struct RzA1lUsbState {
     /* Properties. */
     bool midi;          /* present an attached USB-MIDI device on the host port */
     CharFrontend chr;   /* host serial-MIDI chardev bridged to the bulk pipes */
+
+    /* Resolved MIDI data-bridge configuration. The bridge logic is the same in
+     * either mode (the firmware receives on the RX pipe(s) and transmits on the
+     * TX pipe); only the pipe numbers and the enabling mode differ:
+     *   host mode   (midi=on):  TX pipe 1, RX pipes 2..5  (firmware is host)
+     *   peripheral  (audio=on): TX pipe 3, RX pipe 4      (firmware is device) */
+    bool     mbridge;   /* MIDI bulk bridge active (host or peripheral mode) */
+    uint16_t midi_tx_pipe;  /* pipe the firmware transmits MIDI on (-> chardev) */
+    uint16_t midi_rx_lo;    /* lowest pipe the firmware receives MIDI on */
+    uint16_t midi_rx_hi;    /* highest ditto (host mode scans a range) */
     bool audio;         /* present as a USB-audio peripheral (to-host stream) */
     char *audio_out;    /* WAV output path for the captured to-host stream */
+    char *audio_in;     /* from-host source: "tone[:freq]" or an input WAV path */
+    char *audio_in_capture; /* optional WAV sink: frames the firmware consumed */
 
     /* ---- Peripheral-mode USB-audio (only used when audio == true) -------- */
 
@@ -70,6 +82,7 @@ struct RzA1lUsbState {
     int      peri_step;     /* enumeration state-machine cursor */
     bool     peri_kicked;   /* enumeration has been started (one-shot) */
     uint16_t peri_wait;     /* INTSTS0 edge bit whose clear advances the SM */
+    bool     peri_ctrl_wait;/* a control write is awaiting its CCPL completion */
 
     /* To-host isochronous stream (pipe 2 / D0FIFO). The DMAC writes one packet
      * here via repeated fixed-address stores; committed to the WAV sink on
@@ -82,6 +95,25 @@ struct RzA1lUsbState {
     /* WAV sink for the to-host stream. */
     FILE    *wav;
     uint64_t wav_data_bytes;
+
+    /* From-host isochronous stream (pipe 1 / D1FIFO). The model presents one
+     * packet per SOF while the firmware has pipe 1 armed; the DMAC drains it
+     * via repeated fixed-address reads of D1FIFO. */
+    int      audio_in_kind;   /* AUDIO_IN_NONE / _TONE / _FILE (resolved once) */
+    uint32_t tone_freq;       /* test-tone generator frequency (Hz) */
+    uint64_t tone_phase;      /* generator sample counter */
+    FILE    *wav_in;          /* input WAV, when audio_in names a file */
+    uint16_t wav_in_bits;     /* input WAV sample width (16/24/32) */
+    uint16_t wav_in_ch;       /* input WAV channel count (1/2) */
+    long     wav_in_data_off; /* file offset of the PCM data */
+    uint8_t  fromhost[RZA1L_USB_AUDIO_PKT_MAX];
+    uint32_t fromhost_len;    /* bytes staged in the current from-host packet */
+    uint32_t fromhost_pos;    /* DMA read cursor within fromhost[] */
+    bool     fromhost_pending;/* a packet is staged for the DMA to drain */
+    uint32_t fromhost_frac;   /* 44.1 frames/ms pacing accumulator */
+    uint64_t fromhost_frames; /* total frames the firmware has drained */
+    FILE    *wav_in_cap;      /* capture sink for consumed from-host frames */
+    uint64_t wav_in_cap_bytes;
 
     /* 16-bit register file; status registers are synthesised on read. */
     uint16_t regs[RZA1L_USB_NUM_REGS];

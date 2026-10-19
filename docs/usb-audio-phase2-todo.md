@@ -1,11 +1,20 @@
-# USB-audio Phase 2 — TODO (from-host stream + peripheral MIDI)
+# USB-audio Phase 2 — DONE (from-host stream + peripheral MIDI)
 
-> Status: **planned, not started.** Companion to
-> [usb-audio.md](usb-audio.md) (the overall design + verified Phase 1 contract).
-> Phase 1 (to-host audio → WAV) is done and verified; this doc is the actionable
-> plan for Phase 2. Written against DelugeFirmware `feat/usb_audio`
-> (`src/deluge/drivers/usb/usb_audio.cpp`, `.../userdef/r_usb_p*_config.h`) and
-> the Phase 1 implementation in `src/hw/usb/rza1l_usb.c`.
+> Status: **✅ COMPLETE and verified** against DelugeFirmware `feat/usb_audio`
+> (commit `dd7304ebe`). Companion to [usb-audio.md](usb-audio.md) (the overall
+> design; see its §6 for the implementation summary and the two
+> firmware-interaction bugs fixed during bring-up, and §7 for the tests).
+> This doc is retained as the task record; the task checkboxes below are the
+> original plan. Outcome summary:
+>   - Task 1 (from-host audio, pipe 1 / D1FIFO / ch1): done — `--usb-audio-in`
+>     tone/WAV source, `--usb-audio-in-capture` sink, `tests/usb-audio.sh`.
+>   - Task 2 (peripheral MIDI, pipes 3/4 over CFIFO): done — the MIDI bridge is
+>     parameterised by mode and shared with host mode;
+>     `tests/usb-midi-peripheral.sh`.
+>   - Task 3 (enumeration hardening): done — full composite SET_INTERFACEs,
+>     control-write CCPL/IDST sequencing, `g_usb_peri_connected`.
+>   - Task 4 (run.sh + tests): done — `--usb-audio-in[-capture]`, mode-aware
+>     `--usb-midi`, two tests. Live CoreAudio routing left as optional future.
 
 Phase 2 = make the emulator feed the two *inbound* streams the firmware expects
 as a peripheral: **audio from the host** (ISO OUT, pipe 1 / D1FIFO) and

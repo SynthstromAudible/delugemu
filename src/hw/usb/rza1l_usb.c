@@ -43,6 +43,7 @@
 #include "qemu/main-loop.h"
 #include "qemu/timer.h"
 #include "qemu/error-report.h"
+#include <math.h>
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
@@ -157,10 +158,17 @@
 #define USB_PID      0x0003   /* PID field mask */
 #define USB_PID_BUF  0x0001   /* BUF: pipe armed for transfer */
 
-/* Bulk MIDI pipe assignment (firmware r_usb_hmidi_config.h). */
+/* Bulk MIDI pipe assignment, host mode (firmware r_usb_hmidi_config.h). */
 #define USB_BULK_SEND_PIPE 1  /* host OUT: Deluge transmits MIDI */
 #define USB_BULK_RECV_MIN  2  /* host IN:  Deluge receives MIDI */
 #define USB_BULK_RECV_MAX  5
+
+/* Bulk MIDI pipe assignment, peripheral mode (r_usb_pmidi_config.h). The
+ * device-perspective BULK_OUT/BULK_IN names are inverted from the USB host
+ * convention: BULK_OUT (pipe 3) is the Deluge transmitting to the host, BULK_IN
+ * (pipe 4) is the Deluge receiving from the host. */
+#define USB_PMIDI_PIPE_TX  3  /* USB_CFG_PMIDI_BULK_OUT: Deluge -> host */
+#define USB_PMIDI_PIPE_RX  4  /* USB_CFG_PMIDI_BULK_IN:  host -> Deluge */
 
 /* Standard control requests (bRequest). */
 #define USB_REQ_SET_ADDRESS       0x05
@@ -168,8 +176,20 @@
 #define USB_REQ_SET_CONFIGURATION 0x09
 #define USB_REQ_SET_INTERFACE     0x0b
 
-/* UAC1 streaming-in interface (Deluge -> host); alt 1 starts the stream. */
-#define USB_PAUDIO_STREAM_IN_IFACE 2
+/* UAC1 streaming interfaces (host's point of view); alt 1 starts each stream. */
+#define USB_PAUDIO_STREAM_OUT_IFACE 1   /* host -> Deluge (from-host audio)   */
+#define USB_PAUDIO_STREAM_IN_IFACE  2   /* Deluge -> host (to-host audio)     */
+
+/* Isochronous pipes (r_usb_paudio_config.h: ISO_OUT = PIPE1, ISO_IN = PIPE2). */
+#define USB_PAUDIO_PIPE_FROM_HOST 1     /* ISO OUT, drained via D1FIFO (ch1)  */
+#define USB_PAUDIO_PIPE_TO_HOST   2     /* ISO IN,  filled via D0FIFO (ch0)   */
+
+/* UAC1 stream format: 44.1 kHz, 2 channels, 24-in-32 MSB subframes. */
+#define USB_PAUDIO_SAMPLE_RATE  44100
+#define USB_PAUDIO_FRAME_BYTES  8       /* 2 channels x 4-byte subframe       */
+
+/* From-host audio source kinds (resolved from the "audio-in" property). */
+enum { AUDIO_IN_NONE = 0, AUDIO_IN_TONE, AUDIO_IN_FILE };
 
 /* GET_DESCRIPTOR types (wValue high byte). */
 #define USB_DT_DEVICE        0x01
@@ -337,14 +357,15 @@ static void rza1l_usb_wav_patch_u32(FILE *fp, long off, uint32_t v)
 }
 
 /*
- * Open the to-host WAV sink and write a 44-byte canonical header for
- * 44.1 kHz / 2-channel / 32-bit PCM. The RIFF and data sizes are placeholders,
- * patched on close once the total byte count is known. The stream carries the
- * Deluge's q31 samples (24-bit MSB-aligned in 32-bit subframes) verbatim.
+ * Open a WAV sink and write a 44-byte canonical header for 44.1 kHz /
+ * 2-channel / 32-bit PCM. The RIFF and data sizes are placeholders, kept
+ * current after every append (so the file is valid even if the emulator is
+ * killed). Both audio sinks carry the Deluge's q31 samples (24-bit MSB-aligned
+ * in 32-bit subframes) verbatim. Returns the open file, or NULL.
  */
-static void rza1l_usb_wav_open(RzA1lUsbState *s)
+static FILE *rza1l_usb_wav_open_file(const char *path)
 {
-    static const uint32_t rate = 44100;
+    static const uint32_t rate = USB_PAUDIO_SAMPLE_RATE;
     static const uint16_t channels = 2;
     static const uint16_t bits = 32;
     uint32_t byte_rate = rate * channels * (bits / 8);
@@ -354,14 +375,15 @@ static void rza1l_usb_wav_open(RzA1lUsbState *s)
         'f','m','t',' ', 16,0,0,0, 1,0, 0,0, 0,0,0,0, 0,0,0,0, 0,0, 0,0,
         'd','a','t','a', 0,0,0,0,
     };
+    FILE *fp;
 
-    if (!s->audio_out || s->audio_out[0] == '\0') {
-        return;
+    if (!path || path[0] == '\0') {
+        return NULL;
     }
-    s->wav = fopen(s->audio_out, "wb");
-    if (!s->wav) {
-        warn_report("rza1l-usb: cannot open USB-audio WAV '%s'", s->audio_out);
-        return;
+    fp = fopen(path, "wb");
+    if (!fp) {
+        warn_report("rza1l-usb: cannot open USB-audio WAV '%s'", path);
+        return NULL;
     }
     hdr[22] = channels & 0xff;    hdr[23] = channels >> 8;
     hdr[24] = rate & 0xff;        hdr[25] = (rate >> 8) & 0xff;
@@ -370,40 +392,268 @@ static void rza1l_usb_wav_open(RzA1lUsbState *s)
     hdr[30] = (byte_rate >> 16) & 0xff; hdr[31] = (byte_rate >> 24) & 0xff;
     hdr[32] = block_align & 0xff; hdr[33] = block_align >> 8;
     hdr[34] = bits & 0xff;        hdr[35] = bits >> 8;
-    fwrite(hdr, 1, sizeof(hdr), s->wav);
+    fwrite(hdr, 1, sizeof(hdr), fp);
+    return fp;
+}
+
+static void rza1l_usb_wav_append(FILE *fp, uint64_t *data_bytes,
+                                 const uint8_t *data, uint32_t len)
+{
+    if (!fp || len == 0) {
+        return;
+    }
+    fwrite(data, 1, len, fp);
+    *data_bytes += len;
+    /* Keep the RIFF/data sizes current so the file is a valid, playable WAV
+     * even if the emulator is killed without a clean close. */
+    rza1l_usb_wav_patch_u32(fp, 4, 36 + (uint32_t)*data_bytes);
+    rza1l_usb_wav_patch_u32(fp, 40, (uint32_t)*data_bytes);
+    fseek(fp, 0, SEEK_END);
+}
+
+static void rza1l_usb_wav_close_file(FILE **fp, uint64_t *data_bytes)
+{
+    if (!*fp) {
+        return;
+    }
+    rza1l_usb_wav_patch_u32(*fp, 4, 36 + (uint32_t)*data_bytes);
+    rza1l_usb_wav_patch_u32(*fp, 40, (uint32_t)*data_bytes);
+    fclose(*fp);
+    *fp = NULL;
+}
+
+/* Open the to-host WAV sink (Deluge -> host stream capture). */
+static void rza1l_usb_wav_open(RzA1lUsbState *s)
+{
+    s->wav = rza1l_usb_wav_open_file(s->audio_out);
     s->wav_data_bytes = 0;
-    USB_DBG("USB-audio: WAV sink open '%s'", s->audio_out);
+    if (s->wav) {
+        USB_DBG("USB-audio: to-host WAV sink open '%s'", s->audio_out);
+    }
 }
 
 static void rza1l_usb_wav_write(RzA1lUsbState *s, const uint8_t *data,
                                 uint32_t len)
 {
-    if (!s->wav || len == 0) {
-        return;
-    }
-    fwrite(data, 1, len, s->wav);
-    s->wav_data_bytes += len;
-    /*
-     * Keep the RIFF/data sizes current after every packet so the file is a
-     * valid, playable WAV even if the emulator is killed (SIGTERM/SIGKILL)
-     * without a clean close - the common case for headless capture runs.
-     */
-    rza1l_usb_wav_patch_u32(s->wav, 4, 36 + (uint32_t)s->wav_data_bytes);
-    rza1l_usb_wav_patch_u32(s->wav, 40, (uint32_t)s->wav_data_bytes);
-    fseek(s->wav, 0, SEEK_END);
+    rza1l_usb_wav_append(s->wav, &s->wav_data_bytes, data, len);
 }
 
 static void rza1l_usb_wav_close(RzA1lUsbState *s)
 {
-    if (!s->wav) {
+    if (s->wav) {
+        rza1l_usb_wav_close_file(&s->wav, &s->wav_data_bytes);
+        USB_DBG("USB-audio: to-host WAV sink closed, %" PRIu64 " data bytes",
+                s->wav_data_bytes);
+    }
+}
+
+/* ---- Peripheral-mode USB-audio: from-host source (pipe 1 / D1FIFO) ------ */
+
+/* Read a little-endian u32 (or fewer bytes) from a buffer. */
+static uint32_t rza1l_usb_rd_le(const uint8_t *p, int n)
+{
+    uint32_t v = 0;
+    int i;
+    for (i = 0; i < n; i++) {
+        v |= (uint32_t)p[i] << (8 * i);
+    }
+    return v;
+}
+
+/*
+ * Open and validate an input WAV naming the from-host source. Parses the RIFF
+ * chunks to find the PCM format and the start of the sample data. Accepts
+ * 16/24/32-bit, mono or stereo PCM; the sample rate is assumed to be 44.1 kHz
+ * (the only rate the stream runs at) and is not resampled. Returns true on
+ * success, leaving the file positioned at the data.
+ */
+static bool rza1l_usb_wav_in_open(RzA1lUsbState *s)
+{
+    uint8_t riff[12], chunk[8], fmt[16];
+    FILE *fp = fopen(s->audio_in, "rb");
+    uint16_t fmt_tag;
+    uint32_t rate;
+
+    if (!fp) {
+        warn_report("rza1l-usb: cannot open USB-audio input WAV '%s'",
+                    s->audio_in);
+        return false;
+    }
+    if (fread(riff, 1, 12, fp) != 12 ||
+        memcmp(riff, "RIFF", 4) != 0 || memcmp(riff + 8, "WAVE", 4) != 0) {
+        warn_report("rza1l-usb: '%s' is not a RIFF/WAVE file", s->audio_in);
+        fclose(fp);
+        return false;
+    }
+    /* Walk the chunks looking for "fmt " then "data". */
+    while (fread(chunk, 1, 8, fp) == 8) {
+        uint32_t size = rza1l_usb_rd_le(chunk + 4, 4);
+        if (memcmp(chunk, "fmt ", 4) == 0) {
+            uint32_t n = size < sizeof(fmt) ? size : sizeof(fmt);
+            if (fread(fmt, 1, n, fp) != n) {
+                break;
+            }
+            if (n < size) {
+                fseek(fp, size - n, SEEK_CUR);
+            }
+            fmt_tag = rza1l_usb_rd_le(fmt, 2);
+            s->wav_in_ch = rza1l_usb_rd_le(fmt + 2, 2);
+            rate = rza1l_usb_rd_le(fmt + 4, 4);
+            s->wav_in_bits = rza1l_usb_rd_le(fmt + 14, 2);
+            if (fmt_tag != 1) {
+                warn_report("rza1l-usb: input WAV '%s' is not PCM (tag %u)",
+                            s->audio_in, fmt_tag);
+                fclose(fp);
+                return false;
+            }
+            if ((s->wav_in_ch != 1 && s->wav_in_ch != 2) ||
+                (s->wav_in_bits != 16 && s->wav_in_bits != 24 &&
+                 s->wav_in_bits != 32)) {
+                warn_report("rza1l-usb: input WAV '%s' unsupported "
+                            "(%u ch, %u-bit)", s->audio_in, s->wav_in_ch,
+                            s->wav_in_bits);
+                fclose(fp);
+                return false;
+            }
+            if (rate != USB_PAUDIO_SAMPLE_RATE) {
+                warn_report("rza1l-usb: input WAV '%s' is %u Hz; feeding it as "
+                            "44.1 kHz (no resampling)", s->audio_in, rate);
+            }
+        } else if (memcmp(chunk, "data", 4) == 0) {
+            s->wav_in_data_off = ftell(fp);
+            s->wav_in = fp;
+            USB_DBG("USB-audio: from-host source WAV '%s' (%u ch, %u-bit)",
+                    s->audio_in, s->wav_in_ch, s->wav_in_bits);
+            return true;
+        } else {
+            fseek(fp, size + (size & 1), SEEK_CUR); /* chunks are word-aligned */
+        }
+    }
+    warn_report("rza1l-usb: input WAV '%s' has no data chunk", s->audio_in);
+    fclose(fp);
+    return false;
+}
+
+/* Fetch one stereo frame (two q31 samples, MSB-aligned) from the input WAV,
+ * looping at end-of-file. */
+static void rza1l_usb_wav_in_frame(RzA1lUsbState *s, int32_t *l, int32_t *r)
+{
+    uint8_t raw[2 * 4];
+    uint32_t stride = s->wav_in_ch * (s->wav_in_bits / 8);
+    int32_t ch[2] = { 0, 0 };
+    int c;
+
+    if (fread(raw, 1, stride, s->wav_in) != stride) {
+        /* Loop the file (skip past the header to the data). */
+        fseek(s->wav_in, s->wav_in_data_off, SEEK_SET);
+        if (fread(raw, 1, stride, s->wav_in) != stride) {
+            *l = *r = 0;
+            return;
+        }
+    }
+    for (c = 0; c < s->wav_in_ch; c++) {
+        const uint8_t *p = raw + c * (s->wav_in_bits / 8);
+        switch (s->wav_in_bits) {
+        case 16:
+            ch[c] = (int32_t)(int16_t)rza1l_usb_rd_le(p, 2) << 16;
+            break;
+        case 24:
+            ch[c] = (int32_t)(rza1l_usb_rd_le(p, 3) << 8); /* sign via <<8 */
+            break;
+        default: /* 32 */
+            ch[c] = (int32_t)rza1l_usb_rd_le(p, 4);
+            break;
+        }
+    }
+    *l = ch[0];
+    *r = (s->wav_in_ch == 2) ? ch[1] : ch[0]; /* mono -> both channels */
+}
+
+/* Produce `frames` stereo frames of from-host audio into buf: interleaved
+ * left/right, each a 4-byte little-endian q31 sample (24-bit MSB-aligned). */
+static void rza1l_usb_fromhost_fill(RzA1lUsbState *s, uint8_t *buf,
+                                    uint32_t frames)
+{
+    uint32_t i;
+
+    for (i = 0; i < frames; i++) {
+        int32_t l = 0, r = 0;
+
+        if (s->audio_in_kind == AUDIO_IN_TONE) {
+            double t = (double)s->tone_phase / USB_PAUDIO_SAMPLE_RATE;
+            double v = sin(2.0 * M_PI * (double)s->tone_freq * t);
+            /* ~0.37 of full scale, zeroing the low byte to keep it a clean
+             * 24-bit value in the top bits (MSB-aligned q31). */
+            l = r = (int32_t)(v * (double)0x30000000) & ~0xff;
+            s->tone_phase++;
+        } else if (s->audio_in_kind == AUDIO_IN_FILE) {
+            rza1l_usb_wav_in_frame(s, &l, &r);
+        }
+
+        buf[i * 8 + 0] = l & 0xff;
+        buf[i * 8 + 1] = (l >> 8) & 0xff;
+        buf[i * 8 + 2] = (l >> 16) & 0xff;
+        buf[i * 8 + 3] = (l >> 24) & 0xff;
+        buf[i * 8 + 4] = r & 0xff;
+        buf[i * 8 + 5] = (r >> 8) & 0xff;
+        buf[i * 8 + 6] = (r >> 16) & 0xff;
+        buf[i * 8 + 7] = (r >> 24) & 0xff;
+    }
+}
+
+/*
+ * Present one from-host packet in pipe 1's buffer, if the firmware has armed
+ * the pipe (BRDYENB bit set by startFromHost) and the previous packet has been
+ * drained. Paces 44 or 45 frames per USB frame, averaging 44.1 kHz. Raises the
+ * pipe's BRDY so the firmware's usbAudioHandleBrdy() starts the receive DMA.
+ */
+static void rza1l_usb_fromhost_present(RzA1lUsbState *s)
+{
+    uint16_t bit = (uint16_t)(1u << USB_PAUDIO_PIPE_FROM_HOST);
+    uint32_t frames;
+
+    if (s->audio_in_kind == AUDIO_IN_NONE || s->fromhost_pending) {
         return;
     }
-    rza1l_usb_wav_patch_u32(s->wav, 4, 36 + (uint32_t)s->wav_data_bytes);
-    rza1l_usb_wav_patch_u32(s->wav, 40, (uint32_t)s->wav_data_bytes);
-    fclose(s->wav);
-    s->wav = NULL;
-    USB_DBG("USB-audio: WAV sink closed, %" PRIu64 " data bytes",
-            s->wav_data_bytes);
+    if (!(s->regs[USB_BRDYENB >> 1] & bit)) {
+        return; /* firmware has not armed the from-host pipe */
+    }
+
+    s->fromhost_frac += USB_PAUDIO_SAMPLE_RATE / 100; /* 441 per frame */
+    frames = s->fromhost_frac / 10;
+    s->fromhost_frac %= 10;
+    if (frames * USB_PAUDIO_FRAME_BYTES > RZA1L_USB_AUDIO_PKT_MAX) {
+        frames = RZA1L_USB_AUDIO_PKT_MAX / USB_PAUDIO_FRAME_BYTES;
+    }
+
+    rza1l_usb_fromhost_fill(s, s->fromhost, frames);
+    s->fromhost_len = frames * USB_PAUDIO_FRAME_BYTES;
+    s->fromhost_pos = 0;
+    s->fromhost_pending = true;
+    s->regs[USB_BRDYSTS >> 1] |= bit;
+}
+
+/* D1FIFO read: hand the DMAC the next word of the staged from-host packet.
+ * With the source address fixed (CHCFG.SAD), the DMAC reads this port once per
+ * 32-bit word; drain in order and retire the packet when the last word goes. */
+static uint32_t rza1l_usb_read_d1fifo(RzA1lUsbState *s)
+{
+    uint32_t v = 0;
+    int i;
+
+    for (i = 0; i < 4; i++) {
+        if (s->fromhost_pos < s->fromhost_len) {
+            v |= (uint32_t)s->fromhost[s->fromhost_pos++] << (8 * i);
+        }
+    }
+    if (s->fromhost_pending && s->fromhost_pos >= s->fromhost_len) {
+        /* The firmware's DMA has drained the whole packet. */
+        s->fromhost_frames += s->fromhost_len / USB_PAUDIO_FRAME_BYTES;
+        rza1l_usb_wav_append(s->wav_in_cap, &s->wav_in_cap_bytes,
+                             s->fromhost, s->fromhost_len);
+        s->fromhost_pending = false;
+    }
+    return v;
 }
 
 /* ---- Peripheral-mode USB-audio: 1 ms SOF clock -------------------------- */
@@ -415,8 +665,11 @@ static void rza1l_usb_sof_tick(void *opaque)
     if (!s->sof_running) {
         return;
     }
-    /* Raise the SOF interrupt; the firmware's handler pumps usbAudioHandleSof(),
-     * which stages a packet and kicks the to-host DMA. */
+    /* Present a from-host packet for this USB frame (raises pipe-1 BRDY), then
+     * raise SOFR. The firmware's handler pumps usbAudioHandleSof(), which
+     * services both directions, and usbAudioHandleBrdy() starts the receive
+     * DMA for the packet just presented. */
+    rza1l_usb_fromhost_present(s);
     s->regs[USB_INTSTS0 >> 1] |= USB_SOFR;
     rza1l_usb_update_irq(s);
 
@@ -454,12 +707,13 @@ static void rza1l_usb_sof_update(RzA1lUsbState *s)
  */
 enum {
     PERI_IDLE = 0,
-    PERI_ATTACH,     /* raise VBINT (VBUS present) */
-    PERI_RESET,      /* raise DVST, device state -> Default */
-    PERI_SET_ADDR,   /* SET_ADDRESS control write */
-    PERI_SET_CONFIG, /* SET_CONFIGURATION control write */
-    PERI_SET_IFACE,  /* SET_INTERFACE(stream-in, alt 1) control write */
-    PERI_STREAMING,  /* configured; to-host stream driven by SOF */
+    PERI_ATTACH,        /* raise VBINT (VBUS present) */
+    PERI_RESET,         /* raise DVST, device state -> Default */
+    PERI_SET_ADDR,      /* SET_ADDRESS control write */
+    PERI_SET_CONFIG,    /* SET_CONFIGURATION control write */
+    PERI_SET_IFACE_OUT, /* SET_INTERFACE(stream-out, alt 1): from-host audio */
+    PERI_SET_IFACE_IN,  /* SET_INTERFACE(stream-in, alt 1): to-host audio */
+    PERI_STREAMING,     /* configured; both streams driven by SOF */
 };
 
 /* Set the INTSTS0 device-state (DVSQ) field without disturbing other bits. */
@@ -483,7 +737,17 @@ static void rza1l_usb_peri_control_write(RzA1lUsbState *s, uint8_t bmreq,
 
     s->regs[USB_INTSTS0 >> 1] =
         (s->regs[USB_INTSTS0 >> 1] & ~USB_CTSQ) | USB_CS_WRND | USB_VALID;
-    s->peri_wait = USB_CTRT;
+    /*
+     * Advance on the firmware's CCPL, not on it clearing CTRT. The firmware's
+     * decoder clears CTRT at the very start of its interrupt handling, before
+     * usb_pstd_save_request() has latched USBREQ/USBVAL/USBINDX. Advancing then
+     * would let us post the next control write and overwrite those registers
+     * before the firmware reads them, so the first request would be processed
+     * with the next one's values. CCPL (issued by usb_pstd_ctrl_end, after
+     * set_interface3 has run) is the real completion point.
+     */
+    s->peri_wait = 0;
+    s->peri_ctrl_wait = true;
     s->pending_ints0 |= USB_CTRT;
     rza1l_usb_schedule_event(s);
 }
@@ -514,8 +778,14 @@ static void rza1l_usb_peri_post(RzA1lUsbState *s)
         USB_DBG("USB-audio enum: SET_CONFIGURATION");
         rza1l_usb_peri_control_write(s, 0x00, USB_REQ_SET_CONFIGURATION, 1, 0);
         break;
-    case PERI_SET_IFACE:
-        USB_DBG("USB-audio enum: SET_INTERFACE(%d, alt 1)",
+    case PERI_SET_IFACE_OUT:
+        USB_DBG("USB-audio enum: SET_INTERFACE(%d, alt 1) [from-host]",
+                USB_PAUDIO_STREAM_OUT_IFACE);
+        rza1l_usb_peri_control_write(s, 0x01, USB_REQ_SET_INTERFACE, 1,
+                                     USB_PAUDIO_STREAM_OUT_IFACE);
+        break;
+    case PERI_SET_IFACE_IN:
+        USB_DBG("USB-audio enum: SET_INTERFACE(%d, alt 1) [to-host]",
                 USB_PAUDIO_STREAM_IN_IFACE);
         rza1l_usb_peri_control_write(s, 0x01, USB_REQ_SET_INTERFACE, 1,
                                      USB_PAUDIO_STREAM_IN_IFACE);
@@ -541,21 +811,29 @@ static void rza1l_usb_peri_kick(RzA1lUsbState *s)
     s->peri_kicked = true;
     s->peri_step = PERI_ATTACH;
     rza1l_usb_wav_open(s);
+
+    /* Prime the from-host source for a fresh streaming session. */
+    s->tone_phase = 0;
+    s->fromhost_frac = 0;
+    s->fromhost_frames = 0;
+    s->fromhost_pending = false;
+    s->fromhost_pos = s->fromhost_len = 0;
+    if (s->wav_in) {
+        fseek(s->wav_in, s->wav_in_data_off, SEEK_SET);
+    }
+    if (s->audio_in_kind != AUDIO_IN_NONE) {
+        s->wav_in_cap = rza1l_usb_wav_open_file(s->audio_in_capture);
+        s->wav_in_cap_bytes = 0;
+    }
+
     rza1l_usb_peri_post(s);
 }
 
-/* The firmware cleared one or more INTSTS0 bits. If it acknowledged the event
- * we were waiting on, advance the enumeration state machine. */
-static void rza1l_usb_peri_on_clear(RzA1lUsbState *s, uint16_t cleared)
+/* Move to the next enumeration step and post its event. Shared by the two
+ * completion signals: an INTSTS0 edge the firmware clears (VBINT / DVST) and a
+ * control write's CCPL. */
+static void rza1l_usb_peri_advance(RzA1lUsbState *s)
 {
-    if (!s->audio || !s->peri_kicked || s->peri_wait == 0) {
-        return;
-    }
-    if (!(cleared & s->peri_wait)) {
-        return;
-    }
-    s->peri_wait = 0;
-
     switch (s->peri_step) {
     case PERI_ATTACH:
         s->peri_step = PERI_RESET;
@@ -569,9 +847,15 @@ static void rza1l_usb_peri_on_clear(RzA1lUsbState *s, uint16_t cleared)
         break;
     case PERI_SET_CONFIG:
         rza1l_usb_set_dvsq(s, USB_DS_CNFG);
-        s->peri_step = PERI_SET_IFACE;
+        /* Start the from-host (stream-out) interface only when a source is
+         * configured; otherwise go straight to the to-host interface. */
+        s->peri_step = (s->audio_in_kind != AUDIO_IN_NONE) ? PERI_SET_IFACE_OUT
+                                                           : PERI_SET_IFACE_IN;
         break;
-    case PERI_SET_IFACE:
+    case PERI_SET_IFACE_OUT:
+        s->peri_step = PERI_SET_IFACE_IN;
+        break;
+    case PERI_SET_IFACE_IN:
         s->peri_step = PERI_STREAMING;
         USB_DBG("USB-audio enum: configured, streaming");
         return;
@@ -579,6 +863,44 @@ static void rza1l_usb_peri_on_clear(RzA1lUsbState *s, uint16_t cleared)
         return;
     }
     rza1l_usb_peri_post(s);
+}
+
+/* The firmware cleared one or more INTSTS0 bits. If it acknowledged the edge
+ * event we were waiting on (VBINT attach / DVST bus reset), advance. */
+static void rza1l_usb_peri_on_clear(RzA1lUsbState *s, uint16_t cleared)
+{
+    if (!s->audio || !s->peri_kicked || s->peri_wait == 0) {
+        return;
+    }
+    if (!(cleared & s->peri_wait)) {
+        return;
+    }
+    s->peri_wait = 0;
+    rza1l_usb_peri_advance(s);
+}
+
+/*
+ * The firmware issued CCPL, completing the status stage of the control write we
+ * posted. Real hardware then returns the control sequencer to idle and raises
+ * one more CTRT with CTSQ = IDST; the firmware's stand_req0() handles that
+ * "setup/idle" stage - running the setup-time callbacks it defers past the
+ * status stage, in particular set_configuration0() -> usb_peri_configured()
+ * (which sets g_usb_peri_connected, gating peripheral MIDI) and set_interface0().
+ * Present that idle-stage CTRT now (it uses the request the firmware already
+ * latched, so it is safe), and advance only once the firmware acknowledges it -
+ * see rza1l_usb_peri_control_write() for why advancing on the earlier,
+ * status-stage CTRT would race save_request().
+ */
+static void rza1l_usb_peri_on_ccpl(RzA1lUsbState *s)
+{
+    if (!s->audio || !s->peri_kicked || !s->peri_ctrl_wait) {
+        return;
+    }
+    s->peri_ctrl_wait = false;
+    /* CTSQ is already IDST and VALID clear (the CCPL handler cleared them). */
+    s->peri_wait = USB_CTRT;
+    s->pending_ints0 |= USB_CTRT;
+    rza1l_usb_schedule_event(s);
 }
 
 /* Accumulate a to-host audio packet word written by the DMAC to D0FIFO. */
@@ -749,11 +1071,11 @@ static void rza1l_usb_try_deliver_rx(RzA1lUsbState *s)
 {
     uint16_t pipe;
 
-    if (!s->midi || s->rx_xfer_len != 0 || s->rx_q_count == 0) {
+    if (!s->mbridge || s->rx_xfer_len != 0 || s->rx_q_count == 0) {
         return;
     }
 
-    for (pipe = USB_BULK_RECV_MIN; pipe <= USB_BULK_RECV_MAX; pipe++) {
+    for (pipe = s->midi_rx_lo; pipe <= s->midi_rx_hi; pipe++) {
         uint16_t bit = rza1l_usb_pipe_bit(pipe);
 
         if (!(s->recv_armed & bit)) {
@@ -899,12 +1221,16 @@ static uint16_t rza1l_usb_read16(RzA1lUsbState *s, hwaddr offset)
     case USB_CFIFOCTR: {
         uint16_t pipe = s->regs[USB_CFIFOSEL >> 1] & USB_CURPIPE;
 
-        /* Bulk IN pipe with a latched transfer: report FRDY and the number of
-         * bytes the firmware should read out of CFIFO. */
-        if (pipe >= USB_BULK_RECV_MIN && pipe <= USB_BULK_RECV_MAX &&
-            pipe == s->rx_xfer_pipe && s->rx_xfer_len > s->rx_xfer_pos) {
-            uint32_t rem = s->rx_xfer_len - s->rx_xfer_pos;
-            return USB_FRDY | (rem & USB_DTLN);
+        /* Bulk IN (receive) pipe: report FRDY and the remaining byte count only
+         * while a transfer is latched. With nothing waiting it must report NO
+         * FRDY, so the firmware's drain loop (which keeps reading until FRDY
+         * clears) stops instead of spinning on a zero-length packet. */
+        if (pipe >= s->midi_rx_lo && pipe <= s->midi_rx_hi) {
+            if (pipe == s->rx_xfer_pipe && s->rx_xfer_len > s->rx_xfer_pos) {
+                uint32_t rem = s->rx_xfer_len - s->rx_xfer_pos;
+                return USB_FRDY | (rem & USB_DTLN);
+            }
+            return 0; /* no packet waiting on this receive pipe */
         }
 
         /* Control IN data: FIFO ready, DTLN = bytes left in this packet. */
@@ -913,7 +1239,7 @@ static uint16_t rza1l_usb_read16(RzA1lUsbState *s, hwaddr offset)
             uint32_t pkt = MIN(rem, RZA1L_USB_DCP_MAXP);
             return USB_FRDY | (pkt & USB_DTLN);
         }
-        /* Otherwise the FIFO is ready/empty (e.g. bulk OUT write, no IN data). */
+        /* Otherwise the FIFO is ready to accept a write (bulk/control OUT). */
         return USB_FRDY;
     }
 
@@ -922,6 +1248,16 @@ static uint16_t rza1l_usb_read16(RzA1lUsbState *s, hwaddr offset)
          * sink consumes each committed packet immediately, so there is no
          * back-pressure to model. */
         return USB_FRDY;
+
+    case USB_D1FIFOCTR:
+        /* From-host audio buffer: report FRDY and the staged packet's byte
+         * count while one is waiting; otherwise no data (no FRDY), which stops
+         * startFromHostDma() re-arming once the pipe has been drained. */
+        if (s->audio && s->fromhost_pending &&
+            s->fromhost_pos < s->fromhost_len) {
+            return USB_FRDY | ((s->fromhost_len - s->fromhost_pos) & USB_DTLN);
+        }
+        return 0;
 
     case USB_INTSTS0:
         return rza1l_usb_intsts0(s);
@@ -948,7 +1284,7 @@ static uint32_t rza1l_usb_read_cfifo(RzA1lUsbState *s)
     int i;
 
     /* Bulk IN pipe: drain the latched transfer four bytes at a time, LE. */
-    if (pipe >= USB_BULK_RECV_MIN && pipe <= USB_BULK_RECV_MAX &&
+    if (pipe >= s->midi_rx_lo && pipe <= s->midi_rx_hi &&
         pipe == s->rx_xfer_pipe && s->rx_xfer_len > 0) {
         for (i = 0; i < 4; i++) {
             if (s->rx_xfer_pos < s->rx_xfer_len) {
@@ -996,7 +1332,7 @@ static void rza1l_usb_write_cfifo(RzA1lUsbState *s, uint32_t value)
     uint16_t pipe = s->regs[USB_CFIFOSEL >> 1] & USB_CURPIPE;
     int i;
 
-    if (s->midi && pipe == USB_BULK_SEND_PIPE) {
+    if (s->mbridge && pipe == s->midi_tx_pipe) {
         for (i = 0; i < 4; i++) {
             if (s->tx_len < RZA1L_USB_TXBUF_BYTES) {
                 s->tx_buf[s->tx_len++] = (value >> (8 * i)) & 0xff;
@@ -1012,6 +1348,10 @@ static uint64_t rza1l_usb_read(void *opaque, hwaddr offset, unsigned size)
 
     if (offset == USB_CFIFO) {
         return rza1l_usb_read_cfifo(s);
+    }
+    if (offset == USB_D1FIFO) {
+        /* From-host audio payload, drained word-by-word by the DMAC (ch1). */
+        return rza1l_usb_read_d1fifo(s);
     }
 
     switch (size) {
@@ -1113,13 +1453,29 @@ static void rza1l_usb_write16(RzA1lUsbState *s, hwaddr offset, uint16_t value)
              */
             s->regs[offset >> 1] = value & ~USB_CCPL;
             s->regs[USB_INTSTS0 >> 1] &= ~(USB_CTSQ | USB_VALID);
+            /* Control write complete: advance enumeration (and post the next
+             * control write, now that the firmware has read this one). */
+            rza1l_usb_peri_on_ccpl(s);
         } else {
             s->regs[offset >> 1] = value;
         }
         return;
 
-    case USB_BRDYENB:
+    case USB_BRDYENB: {
+        uint16_t before = s->regs[offset >> 1];
         s->regs[offset >> 1] = value;
+        if (s->audio) {
+            /* startFromHost() sets this pipe's BRDY enable; stopFromHost()
+             * clears it. On either edge, reset the from-host pacing and staging
+             * so a (re)started stream begins cleanly and a stopped one stops
+             * presenting packets. */
+            uint16_t fb = (uint16_t)(1u << USB_PAUDIO_PIPE_FROM_HOST);
+            if ((value & fb) != (before & fb)) {
+                s->fromhost_frac = 0;
+                s->fromhost_pending = false;
+                s->fromhost_pos = s->fromhost_len = 0;
+            }
+        }
         if (s->midi && (value & 0x0001)) {
             if (s->data_ready && s->resp_pos < s->resp_len) {
                 /*
@@ -1148,6 +1504,7 @@ static void rza1l_usb_write16(RzA1lUsbState *s, hwaddr offset, uint16_t value)
          */
         rza1l_usb_update_irq(s);
         return;
+    }
 
     case USB_BEMPENB:
         s->regs[offset >> 1] = value;
@@ -1190,9 +1547,9 @@ static void rza1l_usb_write16(RzA1lUsbState *s, hwaddr offset, uint16_t value)
          * transmit completion via the pipe's BEMP interrupt. BCLR discards a
          * (zero-length) buffer. Pipe-0 control writes are no-ops here.
          */
-        if (s->midi && pipe == USB_BULK_SEND_PIPE && (value & USB_BVAL)) {
+        if (s->mbridge && pipe == s->midi_tx_pipe && (value & USB_BVAL)) {
             rza1l_usb_flush_tx(s);
-            s->pending_bemp |= rza1l_usb_pipe_bit(USB_BULK_SEND_PIPE);
+            s->pending_bemp |= rza1l_usb_pipe_bit(s->midi_tx_pipe);
             rza1l_usb_schedule_event(s);
         } else if (value & USB_BCLR) {
             s->tx_len = 0;
@@ -1215,7 +1572,7 @@ static void rza1l_usb_write16(RzA1lUsbState *s, hwaddr offset, uint16_t value)
          * Writing PID=BUF to a bulk IN pipe arms it to receive: the firmware
          * is ready for the next USB-MIDI transfer. Deliver any queued data.
          */
-        if (s->midi && pipe >= USB_BULK_RECV_MIN && pipe <= USB_BULK_RECV_MAX &&
+        if (s->mbridge && pipe >= s->midi_rx_lo && pipe <= s->midi_rx_hi &&
             (value & USB_PID) == USB_PID_BUF) {
             s->recv_armed |= rza1l_usb_pipe_bit(pipe);
             USB_DBG("arm bulk IN pipe %u (PID=BUF), recv_armed=0x%x",
@@ -1363,12 +1720,25 @@ static void rza1l_usb_reset(DeviceState *dev)
     s->peri_step = PERI_IDLE;
     s->peri_kicked = false;
     s->peri_wait = 0;
+    s->peri_ctrl_wait = false;
     s->tohost_len = 0;
     if (s->sof_running && s->sof_timer) {
         timer_del(s->sof_timer);
     }
     s->sof_running = false;
     rza1l_usb_wav_close(s);
+
+    /* From-host stream state. */
+    if (s->wav_in_cap) {
+        USB_DBG("USB-audio: from-host delivered %" PRIu64 " frames",
+                s->fromhost_frames);
+    }
+    rza1l_usb_wav_close_file(&s->wav_in_cap, &s->wav_in_cap_bytes);
+    s->fromhost_pending = false;
+    s->fromhost_pos = s->fromhost_len = 0;
+    s->fromhost_frac = 0;
+    s->fromhost_frames = 0;
+    s->tone_phase = 0;
 
     qemu_set_irq(s->irq, 0);
 }
@@ -1385,6 +1755,55 @@ static void rza1l_usb_realize(DeviceState *dev, Error **errp)
 
     s->event_bh = qemu_bh_new(rza1l_usb_event, s);
     s->sof_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rza1l_usb_sof_tick, s);
+
+    /*
+     * Resolve the from-host audio source once. "tone" / "tone:<freq>" drives a
+     * built-in sine generator (a deterministic, self-contained test source);
+     * anything else is taken as a path to an input WAV, looped as it plays.
+     * With no source configured the from-host (stream-out) interface is left
+     * unstarted and only the to-host stream runs.
+     */
+    s->audio_in_kind = AUDIO_IN_NONE;
+    if (s->audio && s->audio_in && s->audio_in[0]) {
+        if (strncmp(s->audio_in, "tone", 4) == 0) {
+            const char *colon = strchr(s->audio_in, ':');
+            s->tone_freq = 440;
+            if (colon) {
+                int f = atoi(colon + 1);
+                if (f > 0 && f < USB_PAUDIO_SAMPLE_RATE / 2) {
+                    s->tone_freq = f;
+                }
+            }
+            s->audio_in_kind = AUDIO_IN_TONE;
+            USB_DBG("USB-audio: from-host source = %u Hz test tone",
+                    s->tone_freq);
+        } else if (rza1l_usb_wav_in_open(s)) {
+            s->audio_in_kind = AUDIO_IN_FILE;
+        }
+    }
+
+    /*
+     * MIDI bulk data bridge. The firmware's MIDI engine is the same in both
+     * modes; only which pipes it uses and which end is the host differ, so the
+     * bridge is parameterised rather than duplicated:
+     *   - host mode (midi=on): the model presents a USB-MIDI device and the
+     *     firmware (as host) transmits on pipe 1, receives on pipes 2..5.
+     *   - peripheral mode (audio=on): the composite device's MIDI interface is
+     *     live; the firmware (as device) transmits on pipe 3, receives on
+     *     pipe 4. Enabled alongside USB audio so a Deluge-as-peripheral also
+     *     carries MIDI, over the same host chardev.
+     */
+    if (s->midi) {
+        s->mbridge = true;
+        s->midi_tx_pipe = USB_BULK_SEND_PIPE;
+        s->midi_rx_lo = USB_BULK_RECV_MIN;
+        s->midi_rx_hi = USB_BULK_RECV_MAX;
+    } else if (s->audio) {
+        s->mbridge = true;
+        s->midi_tx_pipe = USB_PMIDI_PIPE_TX;
+        s->midi_rx_lo = USB_PMIDI_PIPE_RX;
+        s->midi_rx_hi = USB_PMIDI_PIPE_RX;
+    }
 
     /*
      * Bridge the bulk MIDI pipes to the host chardev (if one is configured).
@@ -1416,6 +1835,8 @@ static const Property rza1l_usb_properties[] = {
     DEFINE_PROP_CHR("chardev", RzA1lUsbState, chr),
     DEFINE_PROP_BOOL("audio", RzA1lUsbState, audio, false),
     DEFINE_PROP_STRING("audio-out", RzA1lUsbState, audio_out),
+    DEFINE_PROP_STRING("audio-in", RzA1lUsbState, audio_in),
+    DEFINE_PROP_STRING("audio-in-capture", RzA1lUsbState, audio_in_capture),
 };
 
 static void rza1l_usb_class_init(ObjectClass *klass, const void *data)
