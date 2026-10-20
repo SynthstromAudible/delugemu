@@ -1,19 +1,22 @@
 /*
  * Renesas RZ/A1 USB 2.0 host/function controller
  *
- * Models the USB200/USB201 register window. By default no device is attached,
- * so status registers report an idle, disconnected bus (SE0 line state, no
- * pending interrupts) and the USBI interrupt line is held deasserted.
+ * Models the USB200/USB201 register window. The controller is dual-role and the
+ * model supports both roles (see rza1l_usb.c for the full description):
  *
- * When the "midi" property is set, the controller presents a permanently
- * attached full-speed USB-MIDI device on the host port: it drives the attach
- * interrupt, answers the firmware's control-transfer enumeration over the DCP
- * (pipe 0) with synthetic descriptors, and lets the firmware's USB host-MIDI
- * driver enumerate and configure the device. The bulk MIDI pipes are bridged
- * to a host serial-MIDI chardev (the "chardev" property): bytes arriving on the
- * chardev are framed into 32-bit USB-MIDI event packets and delivered to the
- * firmware over the bulk IN pipe (BRDY), and packets the firmware transmits on
- * the bulk OUT pipe are deframed back to a raw MIDI byte stream on the chardev.
+ *  - Peripheral ("peripheral" property, on by default): the Deluge as a USB
+ *    device plugged into a computer. The model plays the host and drives
+ *    enumeration; on its own it is a USB-MIDI device (the default), and the
+ *    "audio" property adds the UAC1 audio streams.
+ *  - Host ("midi" property): the Deluge hosting an attached USB-MIDI device;
+ *    overrides the peripheral default.
+ *
+ * MIDI data is bridged to a host serial-MIDI chardev (the "chardev" property)
+ * in both roles: raw bytes are framed into 32-bit USB-MIDI event packets for the
+ * firmware's receive pipe (BRDY), and the firmware's transmit-pipe packets are
+ * deframed back to a raw byte stream (BEMP). Only the pipe numbers differ
+ * between the roles. Setting "peripheral" off with no other USB property leaves
+ * the bus disconnected (SE0, no interrupts, USBI deasserted).
  *
  * Copyright (c) 2026 delugemu contributors
  *
@@ -25,10 +28,15 @@
 
 #include "hw/core/sysbus.h"
 #include "chardev/char-fe.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
+#include <stdio.h>
 
 #define TYPE_RZA1L_USB "rza1l-usb"
 OBJECT_DECLARE_SIMPLE_TYPE(RzA1lUsbState, RZA1L_USB)
+
+/* Largest UAC1 isochronous packet (48 frames x 2ch x 4-byte subframe). */
+#define RZA1L_USB_AUDIO_PKT_MAX 384
 
 /* MMIO register window for one USB controller (covers SYSCFG0..PIPExCTR). */
 #define RZA1L_USB_MMIO_SIZE 0x200
@@ -54,6 +62,64 @@ struct RzA1lUsbState {
     /* Properties. */
     bool midi;          /* present an attached USB-MIDI device on the host port */
     CharFrontend chr;   /* host serial-MIDI chardev bridged to the bulk pipes */
+
+    /* Resolved MIDI data-bridge configuration. The bridge logic is the same in
+     * either mode (the firmware receives on the RX pipe(s) and transmits on the
+     * TX pipe); only the pipe numbers and the enabling mode differ:
+     *   host mode   (midi=on):  TX pipe 1, RX pipes 2..5  (firmware is host)
+     *   peripheral  (audio=on): TX pipe 3, RX pipe 4      (firmware is device) */
+    bool     mbridge;   /* MIDI bulk bridge active (host or peripheral mode) */
+    uint16_t midi_tx_pipe;  /* pipe the firmware transmits MIDI on (-> chardev) */
+    uint16_t midi_rx_lo;    /* lowest pipe the firmware receives MIDI on */
+    uint16_t midi_rx_hi;    /* highest ditto (host mode scans a range) */
+    bool peripheral;    /* act as a USB peripheral (default): enumerate + MIDI.
+                         * Suppressed by host mode (midi=on); audio implies it. */
+    bool audio;         /* also run the UAC1 audio streams (implies peripheral) */
+    char *audio_out;    /* WAV output path for the captured to-host stream */
+    char *audio_in;     /* from-host source: "tone[:freq]" or an input WAV path */
+    char *audio_in_capture; /* optional WAV sink: frames the firmware consumed */
+    bool audio_adaptive; /* from-host uses the adaptive alt setting (2), not implicit (1) */
+
+    /* ---- Peripheral-mode USB-audio (only used when audio == true) -------- */
+
+    /* Enumeration driver: the model plays USB host against the firmware's
+     * peripheral stack, driving attach -> bus reset -> SET_ADDRESS ->
+     * SET_CONFIGURATION -> SET_INTERFACE(stream-in, alt 1) to start streaming. */
+    int      peri_step;     /* enumeration state-machine cursor */
+    bool     peri_kicked;   /* enumeration has been started (one-shot) */
+    uint16_t peri_wait;     /* INTSTS0 edge bit whose clear advances the SM */
+    bool     peri_ctrl_wait;/* a control write is awaiting its CCPL completion */
+
+    /* To-host isochronous stream (pipe 2 / D0FIFO). The DMAC writes one packet
+     * here via repeated fixed-address stores; committed to the WAV sink on
+     * D0FIFOCTR.BVAL. */
+    uint8_t  tohost[RZA1L_USB_AUDIO_PKT_MAX];
+    uint32_t tohost_len;
+    QEMUTimer *sof_timer;   /* 1 ms Start-Of-Frame clock while streaming */
+    bool     sof_running;
+
+    /* WAV sink for the to-host stream. */
+    FILE    *wav;
+    uint64_t wav_data_bytes;
+
+    /* From-host isochronous stream (pipe 1 / D1FIFO). The model presents one
+     * packet per SOF while the firmware has pipe 1 armed; the DMAC drains it
+     * via repeated fixed-address reads of D1FIFO. */
+    int      audio_in_kind;   /* AUDIO_IN_NONE / _TONE / _FILE (resolved once) */
+    uint32_t tone_freq;       /* test-tone generator frequency (Hz) */
+    uint64_t tone_phase;      /* generator sample counter */
+    FILE    *wav_in;          /* input WAV, when audio_in names a file */
+    uint16_t wav_in_bits;     /* input WAV sample width (16/24/32) */
+    uint16_t wav_in_ch;       /* input WAV channel count (1/2) */
+    long     wav_in_data_off; /* file offset of the PCM data */
+    uint8_t  fromhost[RZA1L_USB_AUDIO_PKT_MAX];
+    uint32_t fromhost_len;    /* bytes staged in the current from-host packet */
+    uint32_t fromhost_pos;    /* DMA read cursor within fromhost[] */
+    bool     fromhost_pending;/* a packet is staged for the DMA to drain */
+    uint32_t fromhost_frac;   /* 44.1 frames/ms pacing accumulator */
+    uint64_t fromhost_frames; /* total frames the firmware has drained */
+    FILE    *wav_in_cap;      /* capture sink for consumed from-host frames */
+    uint64_t wav_in_cap_bytes;
 
     /* 16-bit register file; status registers are synthesised on read. */
     uint16_t regs[RZA1L_USB_NUM_REGS];

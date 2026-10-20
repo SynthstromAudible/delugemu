@@ -195,20 +195,48 @@ CRDA. With no capture source the input is silence.
 Base `0xE8010000` (USB200, used) and `0xE8207000` (USB201) · size `0x200` ·
 IRQs USBI0/USBI1 (GIC SPI 41/42 ← INTC 73/74).
 
-The firmware brings up the Renesas USB stack at start-up in host mode. Two
-modes are modelled, selected by the `midi` property (default off):
+The RZ/A1L USB controller is dual-role, and the emulator models both roles
+equally: the Deluge as a **peripheral** (a composite USB-audio (UAC1) + USB-MIDI
+device plugged into a computer — the model plays the host) and as a **host** (a
+MIDI device plugged into the Deluge — the model fabricates that device).
+Peripheral mode (MIDI only, no audio) is the **default** — the lowest common
+denominator every firmware supports — so any image comes up as a USB-MIDI device
+out of the box. Three configurations are modelled, selected by properties:
 
-**Disconnected (default).** No device is attached, mirroring an unplugged
-cable:
+**Peripheral: MIDI only (default)** (`peripheral` property, on by default). The
+model acts as the host and enumerates the Deluge's USB-MIDI interface; no audio
+streams run. This is how a USB-MIDI-only firmware — new or old — comes up.
+SYSSTS0.LNST reads 00 (SE0) so the firmware's host probe in `hw_usb_hmodule_init`
+falls to peripheral/function mode, and the model then drives the enumeration
+(below). Set `peripheral=off` with no other USB property for a truly
+disconnected bus (status registers read zero, USBIn deasserted).
 
-- SYSSTS0.LNST = 00 (SE0). The firmware's synchronous attach probe in
-  `hw_usb_hmodule_init` sees no device and falls back to peripheral mode.
-- Configuration registers (SYSCFG0, BUSWAIT, DVSTCTR0, the FIFO/pipe selectors,
-  INTENB0/1, …) are shadowed; status registers read back zero, so the USBIn
-  line stays deasserted.
+**Peripheral: audio + MIDI** (`-global rza1l-usb.audio=on`). Adds the UAC1 audio
+streams on top of the default peripheral role. The model stands in
+for the computer: once the firmware configures function mode and enables the
+peripheral interrupt set, the model drives enumeration by posting the control
+sequence a host would — VBUS attach (VBINT) → bus reset (DVST → Default) →
+SET_ADDRESS → SET_CONFIGURATION → the streaming `SET_INTERFACE`s — advancing
+each step on the firmware's acknowledgement. See docs/usb-audio.md for the full
+contract. Three streams then run over the data FIFOs and CFIFO:
 
-**Attached USB-MIDI device** (`-global rza1l-usb.midi=on`). The controller
-presents a permanently-attached full-speed USB-MIDI device on the host port and
+- **Audio to host** (ISO IN, interface 2 alt 1, pipe 2 / D0FIFO / DMAC ch0). A
+  1 ms SOF timer paces `usbAudioHandleSof()`; the firmware DMAs each rendered
+  packet into D0FIFO and commits it with `D0FIFOCTR.BVAL`, which the model writes
+  to a WAV (`audio-out`). Started when `audio-out` is set.
+- **Audio from host** (ISO OUT, interface 1, pipe 1 / D1FIFO / DMAC ch1). The
+  model presents one packet per SOF (44.1 kHz) from a tone or input WAV
+  (`audio-in`), raises pipe-1 BRDY, and answers the SAD-fixed D1FIFO read DMA.
+  Alt 1 is implicit-feedback, alt 2 is adaptive (`audio-in-adaptive`); both use
+  the same pipe/format, the model just selects the `SET_INTERFACE` alt. Started
+  when `audio-in` is set.
+- **MIDI** (bulk pipes 3 TX / 4 RX over CFIFO), configured at SET_CONFIGURATION;
+  always available in peripheral mode (see *Bulk MIDI data bridge*). With
+  neither audio stream enabled the device is effectively MIDI-only.
+
+**Host mode: attached USB-MIDI device** (`-global rza1l-usb.midi=on`). The Deluge
+is the USB *host* and the controller presents a permanently-attached full-speed
+USB-MIDI device — i.e. a MIDI controller/keyboard plugged *into* the Deluge. It
 drives the firmware's host enumeration to completion:
 
 - SYSSTS0.LNST reports FS-J from boot, so the firmware's synchronous attach
@@ -236,9 +264,11 @@ drives the firmware's host enumeration to completion:
 | 0x02 | BUSWAIT | shadow | bus wait cycles |
 | 0x04 | SYSSTS0 | model | LNST = SE0 (disconnected) or FS-J (midi attached) |
 | 0x08 | DVSTCTR0 | model | bus reset / UACT / speed; RHST reports FS after reset |
-| 0x14 | CFIFO | model | DCP control data port **and** bulk pipe data port (CURPIPE-routed) |
+| 0x14 | CFIFO | model | DCP control data port **and** bulk MIDI data port (CURPIPE-routed) |
+| 0x18/0x1C | D0FIFO/D1FIFO | model | audio ISO data ports: D0FIFO ← to-host DMA (ch0), D1FIFO → from-host DMA (ch1) |
 | 0x20–0x22 | CFIFOSEL/CTR | model | FIFO selector (CURPIPE/ISEL) + FRDY/DTLN; BVAL/BCLR commit |
-| 0x30/0x32 | INTENB0/1 | model | interrupt enables; INTENB1.ATTCH arms attach |
+| 0x28–0x2E | D0/D1FIFOSEL/CTR | model | audio FIFO selectors + FRDY/DTLN/BVAL (note the `dummy4[4]` gap: these sit at 0x28/0x2A/0x2C/0x2E) |
+| 0x30/0x32 | INTENB0/1 | model | interrupt enables; INTENB0.SOFE paces audio, INTENB1.ATTCH arms host attach |
 | 0x36–0x3A | BRDY/NRDY/BEMPENB | model | per-pipe interrupt enables (re-evaluate IRQ on write) |
 | 0x40/0x42 | INTSTS0/1 | model | INTSTS0 BRDY/NRDY/BEMP are live summaries |
 | 0x46–0x4A | BRDY/NRDY/BEMPSTS | model | write-0-to-clear per-pipe status |
@@ -251,25 +281,37 @@ drives the firmware's host enumeration to completion:
 **Bulk MIDI data bridge.** The Deluge's customised ("rohan") USB driver does not
 use the D0/D1 FIFOs for MIDI — both directions stream 32-bit USB-MIDI event
 packets through the shared **CFIFO** with the active pipe selected on
-`CFIFOSEL.CURPIPE`. The model routes CFIFO accesses by the selected pipe:
+`CFIFOSEL.CURPIPE`. The *same* bridge serves both USB roles; only the pipe
+numbers differ, so the model resolves them once by mode:
 
-- *Receive* (host → device, bulk IN, pipes 2–5). Raw MIDI from the chardev is
-  framed into 4-byte USB-MIDI packets (running-status aware, with SysEx
-  continuation) and queued. When the firmware arms a receive pipe (`PIPEnCTR`
-  PID=BUF) with its `BRDYENB` bit set, the model latches up to 64 bytes,
-  reports the byte count via `CFIFOCTR.DTLN`, hands the packets out on CFIFO
-  reads, and raises that pipe's **BRDY**.
-- *Transmit* (device → host, bulk OUT, pipe 1). The firmware writes packets to
-  CFIFO and commits the buffer with `CFIFOCTR.BVAL`; the model deframes them
-  (per the USB-MIDI CIN→length table) back to raw MIDI on the chardev and
-  raises pipe 1's **BEMP** send-complete interrupt. Because the firmware enables
+- **host mode** (`midi=on`): the firmware transmits on pipe 1, receives on
+  pipes 2–5.
+- **peripheral mode** (`audio=on`): the firmware transmits on pipe 3
+  (`USB_CFG_PMIDI_BULK_OUT`, Deluge→host), receives on pipe 4
+  (`USB_CFG_PMIDI_BULK_IN`, host→Deluge). The device-perspective BULK_OUT/IN
+  names are inverted from the host convention.
+
+The model routes CFIFO accesses by the selected pipe:
+
+- *Firmware receives* (the RX pipe(s)). Raw MIDI from the chardev is framed into
+  4-byte USB-MIDI packets (running-status aware, with SysEx continuation) and
+  queued. When the firmware arms a receive pipe (`PIPEnCTR` PID=BUF) with its
+  `BRDYENB` bit set, the model latches up to 64 bytes, reports the byte count via
+  `CFIFOCTR.DTLN`, hands the packets out on CFIFO reads, and raises that pipe's
+  **BRDY**. An idle receive pipe reports *no* FRDY, so the firmware's drain loop
+  stops instead of spinning on a zero-length packet.
+- *Firmware transmits* (the TX pipe). The firmware writes packets to CFIFO and
+  commits the buffer with `CFIFOCTR.BVAL`; the model deframes them (per the
+  USB-MIDI CIN→length table) back to raw MIDI on the chardev and raises the
+  pipe's **BEMP** send-complete interrupt. Because the firmware enables
   `BEMPENB` *after* committing the buffer, enable-register writes re-evaluate
   the level-triggered interrupt so the already-latched completion fires and
   multi-transfer sends (e.g. a SysEx reply spanning several 8-byte chunks)
-  continue. `PIPE1CTR.INBUFM` reads back 0 so the firmware's BEMP handler
+  continue. `PIPEnCTR.INBUFM` reads back 0 so the firmware's BEMP handler
   invokes its send-complete path.
 
-USB mass-storage device emulation remains out of scope.
+USB mass-storage device emulation, and exposing a real enumerable USB device to
+the host OS, remain out of scope.
 
 ### ADC — S12AD battery sense · `rza1l-adc`
 

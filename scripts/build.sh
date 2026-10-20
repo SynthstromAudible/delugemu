@@ -36,6 +36,13 @@ for arg in "$@"; do
     esac
 done
 
+# On macOS, Homebrew's GNU binutils (if on PATH) shadows Apple's ar/ranlib and
+# produces archives ld64 rejects ("archive member '/' not a mach-o file").
+if [ "$(uname -s)" = "Darwin" ]; then
+    PATH="$(printf '%s' "${PATH}" | tr ':' '\n' | grep -v '/binutils/' | paste -sd: -)"
+    export PATH
+fi
+
 cd "${QEMU_DIR}"
 
 if [ "${RECONFIGURE}" -eq 1 ] || [ ! -f "${QEMU_BUILD_DIR}/build.ninja" ]; then
