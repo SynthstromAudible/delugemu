@@ -7,10 +7,10 @@
 > This doc is retained as the task record; the task checkboxes below are the
 > original plan. Outcome summary:
 >   - Task 1 (from-host audio, pipe 1 / D1FIFO / ch1): done — `--usb-audio-in`
->     tone/WAV source, `--usb-audio-in-capture` sink, `tests/usb-audio.sh`.
+>     tone/WAV source, `--usb-audio-in-capture` sink, exercised by the `implicit`
+>     and `adaptive` modes of `tests/usb-peripheral.sh`.
 >   - Task 2 (peripheral MIDI, pipes 3/4 over CFIFO): done — the MIDI bridge is
->     parameterised by mode and shared with host mode;
->     `tests/usb-midi-peripheral.sh`.
+>     parameterised by mode and shared with host mode; `tests/usb-peripheral.sh`.
 >   - Task 3 (enumeration hardening): done — full composite SET_INTERFACEs,
 >     control-write CCPL/IDST sequencing, `g_usb_peri_connected`.
 >   - Task 4 (run.sh + tests): done — `--usb-audio-in[-capture]`, mode-aware
@@ -140,7 +140,8 @@ MIDI interface is #3).
       MIDI wired, host-mode bridge retired or behind a legacy flag), and
       `docs/register-coverage.md` / `docs/architecture.md` to describe
       peripheral mode as the primary USB behaviour.
-- [ ] Add `tests/usb-audio.sh` from-host + round-trip assertions.
+- [ ] Add from-host + round-trip assertions (landed in `tests/usb-peripheral.sh`
+      `implicit`/`adaptive` modes).
 
 ## Out of scope (unchanged)
 

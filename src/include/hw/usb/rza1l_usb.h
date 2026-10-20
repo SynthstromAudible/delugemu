@@ -1,19 +1,22 @@
 /*
  * Renesas RZ/A1 USB 2.0 host/function controller
  *
- * Models the USB200/USB201 register window. By default no device is attached,
- * so status registers report an idle, disconnected bus (SE0 line state, no
- * pending interrupts) and the USBI interrupt line is held deasserted.
+ * Models the USB200/USB201 register window. The controller is dual-role and the
+ * model supports both roles (see rza1l_usb.c for the full description):
  *
- * When the "midi" property is set, the controller presents a permanently
- * attached full-speed USB-MIDI device on the host port: it drives the attach
- * interrupt, answers the firmware's control-transfer enumeration over the DCP
- * (pipe 0) with synthetic descriptors, and lets the firmware's USB host-MIDI
- * driver enumerate and configure the device. The bulk MIDI pipes are bridged
- * to a host serial-MIDI chardev (the "chardev" property): bytes arriving on the
- * chardev are framed into 32-bit USB-MIDI event packets and delivered to the
- * firmware over the bulk IN pipe (BRDY), and packets the firmware transmits on
- * the bulk OUT pipe are deframed back to a raw MIDI byte stream on the chardev.
+ *  - Peripheral ("peripheral" property, on by default): the Deluge as a USB
+ *    device plugged into a computer. The model plays the host and drives
+ *    enumeration; on its own it is a USB-MIDI device (the default), and the
+ *    "audio" property adds the UAC1 audio streams.
+ *  - Host ("midi" property): the Deluge hosting an attached USB-MIDI device;
+ *    overrides the peripheral default.
+ *
+ * MIDI data is bridged to a host serial-MIDI chardev (the "chardev" property)
+ * in both roles: raw bytes are framed into 32-bit USB-MIDI event packets for the
+ * firmware's receive pipe (BRDY), and the firmware's transmit-pipe packets are
+ * deframed back to a raw byte stream (BEMP). Only the pipe numbers differ
+ * between the roles. Setting "peripheral" off with no other USB property leaves
+ * the bus disconnected (SE0, no interrupts, USBI deasserted).
  *
  * Copyright (c) 2026 delugemu contributors
  *
@@ -69,7 +72,9 @@ struct RzA1lUsbState {
     uint16_t midi_tx_pipe;  /* pipe the firmware transmits MIDI on (-> chardev) */
     uint16_t midi_rx_lo;    /* lowest pipe the firmware receives MIDI on */
     uint16_t midi_rx_hi;    /* highest ditto (host mode scans a range) */
-    bool audio;         /* present as a USB-audio peripheral (to-host stream) */
+    bool peripheral;    /* act as a USB peripheral (default): enumerate + MIDI.
+                         * Suppressed by host mode (midi=on); audio implies it. */
+    bool audio;         /* also run the UAC1 audio streams (implies peripheral) */
     char *audio_out;    /* WAV output path for the captured to-host stream */
     char *audio_in;     /* from-host source: "tone[:freq]" or an input WAV path */
     char *audio_in_capture; /* optional WAV sink: frames the firmware consumed */

@@ -2,33 +2,36 @@
  * Renesas RZ/A1 USB 2.0 host/function controller
  *
  * Models the USB200/USB201 register window (st_usb20, base 0xE8010000 /
- * 0xE8207000). Two modes:
+ * 0xE8207000). The controller is dual-role; the model supports both roles, and
+ * audio streaming layers onto the peripheral one. Selected by properties:
  *
- *   - Default (disconnected): configuration registers are shadowed so the
- *     firmware reads back what it wrote; status registers report an idle bus
- *     (SYSSTS0.LNST = SE0, INTSTS0/1 = 0). The firmware's USB init completes
- *     without a device, falling back to peripheral mode, and the USBI line is
- *     never asserted.
+ *   - Peripheral (the "peripheral" property, ON BY DEFAULT): the Deluge is a USB
+ *     device plugged into a computer, and the model plays the host. Once the
+ *     firmware configures function mode and enables the peripheral interrupts,
+ *     the model drives enumeration (VBUS attach -> bus reset -> SET_ADDRESS ->
+ *     SET_CONFIGURATION -> streaming SET_INTERFACEs), advancing on the firmware's
+ *     acknowledgements. On its own this is a USB-MIDI device (MIDI only) — the
+ *     lowest common denominator every firmware supports, hence the default. With
+ *     "audio" also set, the UAC1 audio streams run too: to-host (ISO IN, pipe 2 /
+ *     D0FIFO / DMA ch0) captured to a WAV, from-host (ISO OUT, pipe 1 / D1FIFO /
+ *     DMA ch1) fed from a tone or WAV. See docs/usb-audio.md.
  *
- *   - "midi" property set (host mode with an attached device): the controller
- *     presents a permanently attached full-speed USB-MIDI device. Once the
- *     firmware finishes host-mode init and enables the attach interrupt, the
- *     model raises ATTCH; the firmware then drives bus reset and enumerates the
- *     device over the DCP (pipe 0). The model answers each control transfer
- *     (GET_DESCRIPTOR / SET_ADDRESS / SET_CONFIGURATION) with synthetic
- *     descriptors and generates the SACK / BRDY / BEMP interrupts the
- *     firmware's host control-transfer state machine expects. The firmware
- *     recognises the MIDIStreaming (audio-class) interface, completes
- *     enumeration (SET_CONFIGURATION), and sets up its bulk MIDI pipes.
+ *   - Host ("midi" property): the Deluge is the USB host with an attached device
+ *     (a controller plugged into it). The model presents a permanently attached
+ *     full-speed USB-MIDI device; once the firmware enables the attach interrupt
+ *     the model raises ATTCH, and the firmware drives bus reset and enumerates
+ *     the device over the DCP (pipe 0), which the model answers with synthetic
+ *     descriptors and the SACK / BRDY / BEMP interrupts its host control-transfer
+ *     state machine expects. Host mode overrides the peripheral default. Setting
+ *     "peripheral" off with no other USB property gives a truly disconnected bus.
  *
- *     Bulk MIDI data is bridged to a host serial-MIDI chardev (the "chardev"
- *     property). The firmware selects a bulk pipe onto the CFIFO data port via
- *     CFIFOSEL.CURPIPE and transfers 32-bit USB-MIDI event packets: the bulk IN
- *     pipe (PIPE2..PIPE5) carries host->device MIDI, delivered by framing raw
- *     chardev bytes into packets and raising the pipe's BRDY interrupt; the bulk
- *     OUT pipe (PIPE1) carries device->host MIDI, deframed from the packets the
- *     firmware writes to CFIFO and emitted as a raw MIDI byte stream, with the
- *     transfer acknowledged by the pipe's BEMP interrupt.
+ *   Bulk MIDI data is bridged to a host serial-MIDI chardev (the "chardev"
+ *   property) in both roles, over the shared CFIFO (CURPIPE-routed) with
+ *   32-bit USB-MIDI event packets. The framing/deframing is identical; only the
+ *   pipe numbers differ (peripheral: TX pipe 3 / RX pipe 4; host: TX pipe 1 /
+ *   RX pipes 2..5). The firmware's receive pipe gets raw chardev bytes framed
+ *   into packets and the pipe's BRDY raised; its transmit pipe's packets are
+ *   deframed back to a raw MIDI byte stream, acknowledged via the pipe's BEMP.
  *
  * Register offsets and bit definitions are taken from the firmware's
  * usb20_iodefine.h and r_usb_bitdefine.h.
@@ -213,6 +216,21 @@ static bool rza1l_usb_debug(void)
             fprintf(stderr, "rza1l-usb: " fmt "\n", ##__VA_ARGS__); \
         } \
     } while (0)
+
+/*
+ * Whether the controller is acting as a USB peripheral — the Deluge plugged
+ * into a computer, with the model playing the host and driving enumeration.
+ * This is the default role (the `peripheral` property, on by default, and the
+ * lowest-common-denominator that every firmware supports as USB-MIDI); it is
+ * suppressed by host mode (`midi=on`, the Deluge hosting a MIDI device), and
+ * running the audio streams (`audio=on`) implies it. Audio *streaming* is
+ * gated separately on `audio` / `audio-out` / `audio-in`, so peripheral mode on
+ * its own is a MIDI-only device.
+ */
+static inline bool rza1l_usb_is_peripheral(RzA1lUsbState *s)
+{
+    return !s->midi && (s->peripheral || s->audio);
+}
 
 /* ---- Synthetic USB-MIDI device descriptors ----------------------------- */
 
@@ -805,7 +823,7 @@ static void rza1l_usb_peri_post(RzA1lUsbState *s)
  * mode and enabled the peripheral interrupt set. */
 static void rza1l_usb_peri_kick(RzA1lUsbState *s)
 {
-    if (!s->audio || s->peri_kicked) {
+    if (!rza1l_usb_is_peripheral(s) || s->peri_kicked) {
         return;
     }
     if (s->regs[USB_SYSCFG0 >> 1] & USB_DCFM) {
@@ -890,7 +908,7 @@ static void rza1l_usb_peri_advance(RzA1lUsbState *s)
  * event we were waiting on (VBINT attach / DVST bus reset), advance. */
 static void rza1l_usb_peri_on_clear(RzA1lUsbState *s, uint16_t cleared)
 {
-    if (!s->audio || !s->peri_kicked || s->peri_wait == 0) {
+    if (!rza1l_usb_is_peripheral(s) || !s->peri_kicked || s->peri_wait == 0) {
         return;
     }
     if (!(cleared & s->peri_wait)) {
@@ -914,7 +932,7 @@ static void rza1l_usb_peri_on_clear(RzA1lUsbState *s, uint16_t cleared)
  */
 static void rza1l_usb_peri_on_ccpl(RzA1lUsbState *s)
 {
-    if (!s->audio || !s->peri_kicked || !s->peri_ctrl_wait) {
+    if (!rza1l_usb_is_peripheral(s) || !s->peri_kicked || !s->peri_ctrl_wait) {
         return;
     }
     s->peri_ctrl_wait = false;
@@ -1436,10 +1454,11 @@ static void rza1l_usb_write16(RzA1lUsbState *s, hwaddr offset, uint16_t value)
             s->pending_attach = true;
             rza1l_usb_schedule_event(s);
         }
-        if (offset == USB_INTENB0 && s->audio) {
+        if (offset == USB_INTENB0 && rza1l_usb_is_peripheral(s)) {
             /* Start enumeration once the firmware enables the peripheral
              * interrupt set (VBINT et al) having configured function mode, and
-             * track the SOF clock (startToHost() enables INTENB0.SOFE). */
+             * track the SOF clock (startToHost() enables INTENB0.SOFE; a
+             * MIDI-only peripheral never sets it, so the clock stays off). */
             if (value & USB_VBINT) {
                 rza1l_usb_peri_kick(s);
             }
@@ -1466,7 +1485,7 @@ static void rza1l_usb_write16(RzA1lUsbState *s, hwaddr offset, uint16_t value)
                 s->pending_bemp |= 0x0001;
                 rza1l_usb_schedule_event(s);
             }
-        } else if (s->audio && (value & USB_CCPL)) {
+        } else if (rza1l_usb_is_peripheral(s) && (value & USB_CCPL)) {
             /*
              * Peripheral control transfer completed. Return the control
              * sequencer to idle (CTSQ = IDST, VALID clear) so the firmware's
@@ -1819,7 +1838,7 @@ static void rza1l_usb_realize(DeviceState *dev, Error **errp)
         s->midi_tx_pipe = USB_BULK_SEND_PIPE;
         s->midi_rx_lo = USB_BULK_RECV_MIN;
         s->midi_rx_hi = USB_BULK_RECV_MAX;
-    } else if (s->audio) {
+    } else if (rza1l_usb_is_peripheral(s)) {
         s->mbridge = true;
         s->midi_tx_pipe = USB_PMIDI_PIPE_TX;
         s->midi_rx_lo = USB_PMIDI_PIPE_RX;
@@ -1854,6 +1873,9 @@ static const VMStateDescription vmstate_rza1l_usb = {
 static const Property rza1l_usb_properties[] = {
     DEFINE_PROP_BOOL("midi", RzA1lUsbState, midi, false),
     DEFINE_PROP_CHR("chardev", RzA1lUsbState, chr),
+    /* Peripheral (USB-MIDI device) is the default role, so any firmware comes up
+     * as a USB-MIDI peripheral out of the box; host mode (midi=on) overrides it. */
+    DEFINE_PROP_BOOL("peripheral", RzA1lUsbState, peripheral, true),
     DEFINE_PROP_BOOL("audio", RzA1lUsbState, audio, false),
     DEFINE_PROP_STRING("audio-out", RzA1lUsbState, audio_out),
     DEFINE_PROP_STRING("audio-in", RzA1lUsbState, audio_in),

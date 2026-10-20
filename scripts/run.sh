@@ -38,10 +38,13 @@
 #                           e.g. --usb-midi udp:127.0.0.1:1998 or --usb-midi pty.
 #                           Pass 'coremidi' to expose it as a real host MIDI
 #                           in/out port named "DelugEmu USB" (macOS). Routed to
-#                           serial slot 1. On its own the Deluge is the USB host
-#                           with an attached MIDI device; combined with
-#                           --usb-audio/--usb-audio-in it is a USB peripheral and
-#                           this bridges its composite MIDI interface instead.
+#                           serial slot 1. The Deluge is a USB *peripheral* by
+#                           default (a USB-MIDI device plugged into the computer);
+#                           add --usb-host for the reverse (a controller plugged
+#                           into the Deluge).
+#   --usb-host              Run USB as a *host* with an attached MIDI device
+#                           instead of the default peripheral role. Applies to
+#                           --usb-midi; mutually exclusive with --usb-audio*.
 #   --usb-audio <wav>       Present the Deluge as a USB-audio (UAC1) peripheral
 #                           and capture the audio it streams to the host into
 #                           <wav> (44.1 kHz, stereo, 32-bit PCM). Pair with
@@ -58,9 +61,6 @@
 #   --usb-audio-adaptive    Use the from-host stream's adaptive alternate setting
 #                           (host-clocked, like Windows) instead of the default
 #                           implicit-feedback one. Only affects --usb-audio-in.
-#   --usb-peripheral        Run as a USB peripheral with no audio streams (a
-#                           MIDI-only composite device). Combine with --usb-midi
-#                           to bridge its MIDI interface. Implied by --usb-audio*.
 #   --audio <driver>        Select a non-default host audio backend for the
 #                           SSIF (I2S) output (-audiodev <driver>). Audio is on
 #                           by default using the OS default backend (coreaudio
@@ -429,7 +429,7 @@ USB_AUDIO=""
 USB_AUDIO_IN=""
 USB_AUDIO_IN_CAPTURE=""
 USB_AUDIO_ADAPTIVE=0
-USB_PERIPHERAL=0
+USB_HOST=0
 AUDIO=""
 AUDIO_BUFFER=""
 # Render-head clamp. Defaults to 'auto' (overridable by flag or the Settings
@@ -518,7 +518,7 @@ while [ $# -gt 0 ]; do
             ;;
         --usb-audio-in-capture=*) USB_AUDIO_IN_CAPTURE="${1#--usb-audio-in-capture=}"; shift ;;
         --usb-audio-adaptive) USB_AUDIO_ADAPTIVE=1; shift ;;
-        --usb-peripheral) USB_PERIPHERAL=1; shift ;;
+        --usb-host) USB_HOST=1; shift ;;
         --audio)
             [ -n "${2:-}" ] || die "--audio requires a driver name"
             AUDIO="$2"; shift 2
@@ -673,51 +673,45 @@ else
 fi
 
 # USB-MIDI bridge: route the USB controller's bulk MIDI pipes to the second
-# serial chardev (serial_hd(1)), which the SoC binds to usb0. Two modes share
-# this chardev:
-#   - peripheral MIDI: when USB audio is also active (--usb-audio/--usb-audio-in),
-#     the Deluge is a USB *device*, so its composite MIDI interface is bridged
-#     and the "midi=on" host device is NOT presented (audio=on enables it).
-#   - host MIDI: otherwise the Deluge is the USB *host* and the model presents an
-#     attached MIDI device (rza1l-usb.midi=on).
+# serial chardev (serial_hd(1)), which the SoC binds to usb0. The Deluge is a USB
+# *peripheral* by default (the model's default role — a USB-MIDI device, which
+# every firmware supports), so --usb-midi bridges the peripheral MIDI interface.
+# Pass --usb-host to instead run as a USB *host* with an attached MIDI device
+# (plugging a controller into the Deluge); that sets rza1l-usb.midi=on.
 USB_MIDI_ARGS=()
-if [ -n "${USB_AUDIO}" ] || [ -n "${USB_AUDIO_IN}" ] || [ "${USB_PERIPHERAL}" -eq 1 ]; then
-    USB_PERIPHERAL_MIDI=1
-else
-    USB_PERIPHERAL_MIDI=0
-fi
 if [ "${USB_MIDI}" = "coremidi" ]; then
     rm -f "${USB_SOCK}"
     USB_MIDI_ARGS=(-chardev "socket,id=usbm,path=${USB_SOCK},server=on,wait=off" \
                    -serial chardev:usbm)
-    [ "${USB_PERIPHERAL_MIDI}" -eq 1 ] || USB_MIDI_ARGS+=(-global "rza1l-usb.midi=on")
+    [ "${USB_HOST}" -eq 1 ] && USB_MIDI_ARGS+=(-global "rza1l-usb.midi=on")
     BRIDGE_SPECS+=("DelugEmu USB=${USB_SOCK}")
-    if [ "${USB_PERIPHERAL_MIDI}" -eq 1 ]; then
-        log "Bridging peripheral USB-MIDI to a host CoreMIDI port (\"DelugEmu USB\")"
-    else
+    if [ "${USB_HOST}" -eq 1 ]; then
         log "Bridging host USB-MIDI to a host CoreMIDI port (\"DelugEmu USB\")"
+    else
+        log "Bridging peripheral USB-MIDI to a host CoreMIDI port (\"DelugEmu USB\")"
     fi
 elif [ -n "${USB_MIDI}" ]; then
     USB_MIDI_ARGS=(-serial "${USB_MIDI}")
-    [ "${USB_PERIPHERAL_MIDI}" -eq 1 ] || USB_MIDI_ARGS+=(-global "rza1l-usb.midi=on")
-    if [ "${USB_PERIPHERAL_MIDI}" -eq 1 ]; then
-        log "Bridging peripheral USB-MIDI on chardev: ${USB_MIDI}"
-    else
+    [ "${USB_HOST}" -eq 1 ] && USB_MIDI_ARGS+=(-global "rza1l-usb.midi=on")
+    if [ "${USB_HOST}" -eq 1 ]; then
         log "Attaching host USB-MIDI device on chardev: ${USB_MIDI}"
+    else
+        log "Bridging peripheral USB-MIDI on chardev: ${USB_MIDI}"
     fi
+elif [ "${USB_HOST}" -eq 1 ]; then
+    USB_MIDI_ARGS=(-global "rza1l-usb.midi=on")
+    log "USB host mode (attached MIDI device, no data chardev)"
 fi
 
-# USB-audio peripheral: present the Deluge as a UAC1 device. The to-host stream
-# (audio the Deluge sends the computer) is captured to a WAV; the from-host
-# stream (audio the computer sends the Deluge) is fed from a test tone or an
-# input WAV, and the frames the firmware consumes can be captured for checking.
-# Deterministic captures pair well with --icount.
+# USB-audio: run the UAC1 audio streams on top of the peripheral role. The
+# to-host stream (audio the Deluge sends the computer) is captured to a WAV; the
+# from-host stream (audio the computer sends the Deluge) is fed from a test tone
+# or an input WAV, and the frames the firmware consumes can be captured for
+# checking. Deterministic captures pair well with --icount. (Peripheral MIDI is
+# the default even without any audio flags — see the USB-MIDI block above.)
 USB_AUDIO_ARGS=()
-if [ -n "${USB_AUDIO}" ] || [ -n "${USB_AUDIO_IN}" ] || [ "${USB_PERIPHERAL}" -eq 1 ]; then
+if [ -n "${USB_AUDIO}" ] || [ -n "${USB_AUDIO_IN}" ]; then
     USB_AUDIO_ARGS=(-global "rza1l-usb.audio=on")
-    if [ "${USB_PERIPHERAL}" -eq 1 ] && [ -z "${USB_AUDIO}" ] && [ -z "${USB_AUDIO_IN}" ]; then
-        log "USB peripheral: MIDI only (no audio streams)"
-    fi
     if [ -n "${USB_AUDIO}" ]; then
         USB_AUDIO_ARGS+=(-global "rza1l-usb.audio-out=${USB_AUDIO}")
         log "Capturing USB-audio to-host stream to WAV: ${USB_AUDIO}"

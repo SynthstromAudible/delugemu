@@ -198,19 +198,21 @@ IRQs USBI0/USBI1 (GIC SPI 41/42 ← INTC 73/74).
 The RZ/A1L USB controller is dual-role, and the emulator models both roles
 equally: the Deluge as a **peripheral** (a composite USB-audio (UAC1) + USB-MIDI
 device plugged into a computer — the model plays the host) and as a **host** (a
-MIDI device plugged into the Deluge — the model fabricates that device). Three
-configurations are modelled, selected by properties (all default off):
+MIDI device plugged into the Deluge — the model fabricates that device).
+Peripheral mode (MIDI only, no audio) is the **default** — the lowest common
+denominator every firmware supports — so any image comes up as a USB-MIDI device
+out of the box. Three configurations are modelled, selected by properties:
 
-**Disconnected (default).** No device/host is attached, mirroring an unplugged
-cable:
+**Peripheral: MIDI only (default)** (`peripheral` property, on by default). The
+model acts as the host and enumerates the Deluge's USB-MIDI interface; no audio
+streams run. This is how a USB-MIDI-only firmware — new or old — comes up.
+SYSSTS0.LNST reads 00 (SE0) so the firmware's host probe in `hw_usb_hmodule_init`
+falls to peripheral/function mode, and the model then drives the enumeration
+(below). Set `peripheral=off` with no other USB property for a truly
+disconnected bus (status registers read zero, USBIn deasserted).
 
-- SYSSTS0.LNST = 00 (SE0). The firmware's synchronous attach probe in
-  `hw_usb_hmodule_init` sees no device and falls back to peripheral mode.
-- Configuration registers (SYSCFG0, BUSWAIT, DVSTCTR0, the FIFO/pipe selectors,
-  INTENB0/1, …) are shadowed; status registers read back zero, so the USBIn
-  line stays deasserted.
-
-**Peripheral: audio + MIDI** (`-global rza1l-usb.audio=on`). The model stands in
+**Peripheral: audio + MIDI** (`-global rza1l-usb.audio=on`). Adds the UAC1 audio
+streams on top of the default peripheral role. The model stands in
 for the computer: once the firmware configures function mode and enables the
 peripheral interrupt set, the model drives enumeration by posting the control
 sequence a host would — VBUS attach (VBINT) → bus reset (DVST → Default) →

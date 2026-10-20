@@ -5,7 +5,7 @@
 # device plugged into a computer (the model plays the USB host). Covers the
 # three peripheral configurations independently:
 #
-#   midi-only   MIDI interface only, no audio streams (--usb-peripheral).
+#   midi-only   MIDI interface only, no audio streams (the default role).
 #   implicit    MIDI + audio both directions, from-host using the implicit-
 #               feedback alternate setting (the default; follows our clock).
 #   adaptive    MIDI + audio both directions, from-host using the adaptive
@@ -63,10 +63,12 @@ run_one() {
     log="$(mktemp "${TMPDIR:-/tmp}/delugemu-peri.XXXXXX.log")"
     rm -f "${sock}"
 
+    # Peripheral is the default role, so midi-only needs no extra flags beyond
+    # the MIDI chardev; the audio modes add the audio streams.
     extra=()
     audio=0
     case "${mode}" in
-        midi-only) extra=(--usb-peripheral) ;;
+        midi-only) extra=() ;;
         implicit)  extra=(--usb-audio "${th}" --usb-audio-in "tone:${TONE_HZ}" \
                           --usb-audio-in-capture "${fh}"); audio=1 ;;
         adaptive)  extra=(--usb-audio "${th}" --usb-audio-in "tone:${TONE_HZ}" \
@@ -82,7 +84,7 @@ run_one() {
     timeout "${RUN_SECONDS}" "${REPO_ROOT}/scripts/run.sh" "${FIRMWARE}" \
         --display headless --audio none --icount \
         --usb-midi "unix:${sock},server=on,wait=off" \
-        "${extra[@]}" >"${log}" 2>&1 &
+        ${extra[@]+"${extra[@]}"} >"${log}" 2>&1 &
     local runpid=$!
 
     local reply
