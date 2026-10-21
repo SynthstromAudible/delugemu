@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+name: Run delugemu scenarios
+description: >-
+  Drive the Deluge emulator through delugemu scenario files and assert on
+  deterministic display state. Resolves firmware from an explicit path, or by
+  downloading the latest GitHub release when enabled, and skips cleanly when no
+  firmware is available. Assumes the repo is checked out and qemu-system-arm is
+  already built (run scripts/build.sh in a prior step).
+
+inputs:
+  scenarios:
+    description: "Scenario file(s) to run (space-separated); default: all in tests/scenarios/."
+    required: false
+    default: ""
+  firmware-path:
+    description: Path to a firmware .bin/.elf image to drive. Takes precedence.
+    required: false
+    default: ""
+  fetch-latest:
+    description: >-
+      If "true", download the latest firmware release when no firmware path is
+      given (sets DELUGEMU_FETCH_FIRMWARE=1).
+    required: false
+    default: "false"
+  firmware-repo:
+    description: >-
+      owner/repo whose latest release is downloaded when fetch-latest is true
+      (default: the upstream community firmware).
+    required: false
+    default: ""
+  sd-path:
+    description: Optional SD-card image to attach.
+    required: false
+    default: ""
+  artifacts-dir:
+    description: Directory for screenshots and interrupt logs.
+    required: false
+    default: build/scenario-artifacts
+
+runs:
+  using: composite
+  steps:
+    - name: Verify control map is in sync with the C headers
+      shell: bash
+      run: ./tests/geometry-sync.sh
+
+    - name: Run scenarios
+      shell: bash
+      env:
+        DELUGE_FIRMWARE: ${{ inputs.firmware-path }}
+        DELUGEMU_FETCH_FIRMWARE: ${{ inputs.fetch-latest == 'true' && '1' || '0' }}
+        DELUGEMU_FIRMWARE_REPO: ${{ inputs.firmware-repo }}
+        DELUGEMU_ARTIFACTS: ${{ inputs.artifacts-dir }}
+        DELUGEMU_SD: ${{ inputs.sd-path }}
+        # GITHUB_TOKEN lifts the release-API rate limit for fetch-latest.
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        # shellcheck disable=SC2206
+        scns=(${{ inputs.scenarios }})
+        ./tests/scenario.sh "${scns[@]}"

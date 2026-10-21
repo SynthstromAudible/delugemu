@@ -1,0 +1,17 @@
+{
+  "name": "play-transport-led",
+  "firmware": null,
+  "sd": null,
+  "boot_wait": 4.0,
+  "steps": [
+    {"assert_no_aborts": true},
+    {"press": "PLAY"},
+    {"wait": 0.5},
+    {"assert_led": ["PLAY", true]},
+    {"screenshot": "playing.png"},
+    {"press": "PLAY"},
+    {"wait": 0.5},
+    {"assert_led": ["PLAY", false]},
+    {"assert_no_aborts": true}
+  ]
+}
