@@ -1,0 +1,10 @@
+{
+  "name": "boot-healthy",
+  "firmware": null,
+  "sd": null,
+  "boot_wait": 4.0,
+  "steps": [
+    {"assert_no_aborts": true},
+    {"screenshot": "boot.png"}
+  ]
+}

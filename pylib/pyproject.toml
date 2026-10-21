@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "delugemu"
+version = "0.1.0"
+description = "Scripting interface for the Deluge QEMU emulator (delugemu)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "GPL-2.0-or-later" }
+# Intentionally zero runtime dependencies: the package is stdlib-only so it
+# runs in CI without a pip install step. PyYAML is an optional extra for YAML
+# scenarios.
+dependencies = []
+
+[project.optional-dependencies]
+yaml = ["pyyaml"]
+
+[project.scripts]
+delugemu = "delugemu.cli:main"
+
+[tool.setuptools]
+packages = ["delugemu"]
