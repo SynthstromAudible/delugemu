@@ -6,18 +6,22 @@ name / pad coordinate / key, read back deterministic display state, and assert
 on it. All input goes through the documented QMP ``input-send-event`` contract,
 exercising the same firmware hit-test path a real click would.
 """
+import logging
 import os
 import signal
 import subprocess
 import tempfile
 import time
+import warnings
 
-from . import display, geometry
+from . import display, geometry, qwerty
 from .qmp import QmpClient, QmpError
 
 # The firmware needs a press held briefly or it never registers it; the device
 # model (deluge_input.c) defers a too-fast release. Match that with a margin.
 DEFAULT_HOLD_MS = 120
+
+log = logging.getLogger("delugemu")
 
 
 def find_repo_root(start=None):
@@ -216,6 +220,30 @@ class DelugeSession:
         """Context manager: latch several controls down at once (Alt-latch)."""
         return _Latch(self, names)
 
+    def _alt(self, down):
+        self._events([{"type": "key", "data": {
+            "down": down, "key": {"type": "qcode", "data": "alt"}}}])
+
+    def type_text(self, text, gap=0.15):
+        """Type ``text`` on the pad-grid QWERTY keyboard the firmware shows
+        while naming a file or browsing (see ``delugemu.qwerty``). In a file
+        browser this jumps to the first entry the text prefixes. Raises
+        ValueError, before pressing anything, if a character is untypeable."""
+        keys = [qwerty.key_for(ch) for ch in text]
+        for (x, y), shifted in keys:
+            if shifted:
+                # Shift is a pad held while the key is pressed: Alt-latch the
+                # shift pad, tap the key (latched press, then release), and drop
+                # the latch.
+                self._alt(True)
+                self._click(*geometry.pad_point(*qwerty.SHIFT_PAD), DEFAULT_HOLD_MS)
+                self._click(*geometry.pad_point(x, y), DEFAULT_HOLD_MS)
+                self._click(*geometry.pad_point(x, y), DEFAULT_HOLD_MS)
+                self._alt(False)
+            else:
+                self.pad(x, y)
+            self.wait(gap)
+
     # -- readout -----------------------------------------------------------
     def read_oled(self):
         path = self._dev("oled", "deluge-oled", "/machine/soc/oled")
@@ -259,6 +287,120 @@ class DelugeSession:
                 path = path[:-4] + ".ppm"
         self.q.execute("screendump", filename=path)
         return path
+
+    def sd_command_count(self):
+        """Total SD commands the firmware has issued since power-on."""
+        path = self._dev("sdhi", "rza1l-sdhi", "/machine/soc/sdhi")
+        return int(self.q.qom_get(path, "dz-cmd-count"))
+
+    def wait_sd_idle(self, quiet=1.0, timeout=60.0, poll=0.1):
+        """Wait until the firmware issues no SD command for ``quiet`` seconds
+        (e.g. a song or preset has finished loading). Returns True once quiet,
+        False on timeout. Sample streaming during playback never goes quiet."""
+        deadline = time.monotonic() + timeout
+        last = self.sd_command_count()
+        since = time.monotonic()
+        while time.monotonic() < deadline:
+            self.wait(poll)
+            now = self.sd_command_count()
+            if now != last:
+                last, since = now, time.monotonic()
+            elif time.monotonic() - since >= quiet:
+                return True
+        return False
+
+    def browser_open(self, window=0.8, poll=0.05):
+        """Whether a load browser is open, judged by the LOAD LED, which
+        blinks for as long as one is. Samples the LED over ``window`` seconds."""
+        deadline = time.monotonic() + window
+        while time.monotonic() < deadline:
+            if self.read_leds().get("LOAD"):
+                return True
+            self.wait(poll)
+        return False
+
+    def _open_song_browser(self, settle):
+        self.press("LOAD")
+        self.wait(settle)
+        if not self.wait_until(lambda s: s.browser_open(), timeout=10.0, poll=0):
+            raise AssertionError("LOAD did not open the song browser")
+
+    def _song_browser_to_root(self, settle):
+        """Open the song browser at the SONGS folder. It opens in the current
+        song's folder and BACK climbs one level, closing the browser from
+        SONGS itself; so count the BACKs that close it, reopen, and climb one
+        fewer."""
+        self._open_song_browser(settle)
+        depth = 0
+        while True:
+            self.press("BACK")
+            self.wait(settle)
+            if not self.browser_open():
+                break
+            depth += 1
+            if depth > 32:
+                raise AssertionError("BACK never closed the song browser")
+        log.debug("song browser opened %d folder(s) below SONGS", depth)
+        self._open_song_browser(settle)
+        for _ in range(depth):
+            self.press("BACK")
+            self.wait(settle)
+
+    def _type_entry(self, name, settle):
+        prefix = qwerty.typeable_prefix(name)
+        if not prefix:
+            raise ValueError("browser entry %r starts with a character the "
+                             "keyboard cannot type" % name)
+        if prefix != name:
+            warnings.warn("typing only %r of %r (the rest cannot be typed); "
+                          "the browser will pick the first entry it prefixes"
+                          % (prefix, name), stacklevel=3)
+        self.type_text(prefix)
+        self.wait(settle)
+
+    def load_song(self, path, timeout=60.0, settle=0.6):
+        """Load a song by its card path, e.g.
+        ``/SONGS/problem_songs/Some Folder/My Song.XML`` (the ``/SONGS`` prefix
+        and ``.XML`` extension are optional).
+
+        Opens the song browser at ``SONGS``, then for each path part types its
+        name on the pad QWERTY keyboard (the browser jumps to the first entry
+        it prefixes) and presses SELECT: entering each folder, then loading the
+        song. Returns once the browser has closed and the card has gone quiet.
+        If a folder shares the song's name (``X/`` beside ``X.XML``), the
+        browser may land on the folder; that is detected and the song beside it
+        is selected instead. Names are matched as typed prefixes, so a name the
+        keyboard cannot fully type (``(``, ``&``, ...) may resolve to a
+        neighbouring entry (a warning says so)."""
+        parts = qwerty.song_path_parts(path)
+        self._song_browser_to_root(settle)
+        for folder in parts[:-1]:
+            log.debug("entering folder %r", folder)
+            self._type_entry(folder, settle)
+            self.press("SELECT_ENC")
+            self.wait(settle)
+            self.wait_sd_idle(quiet=0.3, timeout=timeout)
+
+        log.debug("loading song %r", parts[-1])
+        self._type_entry(parts[-1], settle)
+        self.press("SELECT_ENC")
+        self.wait(settle)
+        if self.browser_open():
+            # Still browsing: SELECT entered a folder of the same name rather
+            # than loading. Back out (which reselects that folder) and step to
+            # the next entry, the song, which sorts straight after it.
+            self.press("BACK")
+            self.wait(settle)
+            self.turn("SELECT_ENC", -1)
+            self.wait(settle)
+            self.press("SELECT_ENC")
+            self.wait(settle)
+            if self.browser_open():
+                raise AssertionError("could not load %r: the browser is still "
+                                     "open after selecting it" % path)
+        if not self.wait_sd_idle(quiet=1.0, timeout=timeout):
+            raise AssertionError("song %r still loading after %.0f s"
+                                 % (path, timeout))
 
     # -- timing ------------------------------------------------------------
     def wait(self, seconds):

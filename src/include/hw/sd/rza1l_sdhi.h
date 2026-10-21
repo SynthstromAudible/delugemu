@@ -88,6 +88,13 @@ struct RzA1lSdhiState {
     uint32_t write_block_us;
     uint32_t write_busy_us;
 
+    /*
+     * Commands issued since power-on, exported read-only as the QOM property
+     * dz-cmd-count so scripts can wait for the card to go quiet (e.g. for a
+     * song load to finish).
+     */
+    uint64_t total_cmds;
+
     /* DELUGEMU_SDHI_STATS probe (per virtual-second activity summary). */
     QEMUTimer *stats_timer;
     int64_t  busy_since_ns;

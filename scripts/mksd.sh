@@ -63,6 +63,11 @@ if [ "${uname_s}" = "Darwin" ]; then
     # but it clutters the card and ping-pongs back via the _rw write-back.
     rsync -rlt --exclude '._*' --exclude '.DS_Store' --exclude '__MACOSX' \
         "${CONTENT_DIR}/" "${mp}/"
+    # The kernel itself still writes a ._ sidecar for any xattr it attaches on
+    # create (com.apple.provenance tags every file a modern macOS process
+    # writes), whatever rsync is told; strip them, and Spotlight's journal.
+    find "${mp}" -name '._*' -type f -delete
+    rm -rf "${mp}/.fseventsd" "${mp}/.Spotlight-V100"
     sync
     diskutil unmount "${dev}" >/dev/null
     hdiutil detach "${dev}" >/dev/null

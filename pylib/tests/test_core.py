@@ -11,7 +11,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from delugemu import display, geometry  # noqa: E402
+from delugemu import display, geometry, qwerty  # noqa: E402
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -128,6 +128,42 @@ class TestControlMapSync(unittest.TestCase):
         self.assertEqual(res.returncode, 0,
                          "control map is stale; run scripts/gen_control_map.py\n"
                          + res.stderr)
+
+
+class TestQwerty(unittest.TestCase):
+    # Positions from keyboardChars in the firmware's gui/ui/qwerty_ui.cpp.
+    def test_letter_rows(self):
+        self.assertEqual(qwerty.key_for("Q"), ((3, 4), False))
+        self.assertEqual(qwerty.key_for("a"), ((3, 3), False))
+        self.assertEqual(qwerty.key_for("M"), ((9, 2), False))
+        self.assertEqual(qwerty.key_for("1"), ((3, 5), False))
+
+    def test_punctuation_and_space(self):
+        self.assertEqual(qwerty.key_for("'"), ((13, 3), False))
+        self.assertEqual(qwerty.key_for("."), ((11, 2), False))
+        self.assertEqual(qwerty.key_for(" "), (qwerty.SPACE_PAD, False))
+
+    def test_shifted(self):
+        self.assertEqual(qwerty.key_for("_"), ((13, 5), True))
+        self.assertEqual(qwerty.key_for("#"), ((5, 5), True))
+
+    def test_untypeable(self):
+        # "\0" is the firmware's marker for an unassigned pad, not a key.
+        for ch in "(&\0":
+            with self.assertRaises(ValueError):
+                qwerty.key_for(ch)
+        self.assertEqual(qwerty.typeable_prefix("Mix (v2)"), "Mix ")
+
+    def test_song_path_parts(self):
+        want = ["problem_songs", "Deal_COLLECT.ALL", "I'Ll Make You A Deal 2"]
+        for path in ("/SONGS/problem_songs/Deal_COLLECT.ALL/I'Ll Make You A Deal 2.XML",
+                     "SONGS/problem_songs/Deal_COLLECT.ALL/I'Ll Make You A Deal 2",
+                     "problem_songs/Deal_COLLECT.ALL/I'Ll Make You A Deal 2.xml"):
+            self.assertEqual(qwerty.song_path_parts(path), want)
+        self.assertEqual(qwerty.song_path_parts("SONG001.XML"), ["SONG001"])
+        for bad in ("", "/SONGS/", "SONGS/.XML"):
+            with self.assertRaises(ValueError):
+                qwerty.song_path_parts(bad)
 
 
 if __name__ == "__main__":

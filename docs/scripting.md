@@ -72,6 +72,11 @@ Input (controls are a `Control` enum member — e.g. `Control.PLAY` — or its n
 - `pad(x, y, hold_ms=120)` — tap pad grid cell. Columns 0–15 are the main grid, 16/17 the sidebar; row 0 is the bottom.
 - `key(qcode)` — press a host key by QMP qcode (`"spc"`, `"a"`, `"1"`).
 - `latch([names])` — context manager latching several controls down at once.
+- `type_text(text)` — type on the pad-grid QWERTY keyboard the firmware shows when naming or browsing files (letters, digits, space, `- ' , .` and shifted `_ ! #`). In a browser this jumps to the first entry the text prefixes. Layout: `delugemu.qwerty`.
+
+Navigation
+- `load_song(path)` — load a song by card path, e.g. `"/SONGS/problem_songs/Ring 7.XML"` (`/SONGS` prefix and `.XML` optional). Opens the song browser, climbs to `SONGS` (it opens in the current song's folder), types each folder name and SELECTs into it, then types and SELECTs the song; returns when the browser has closed and the card is quiet. Handles a folder sharing the song's name. Names are matched as typed prefixes; characters the keyboard can't type truncate the prefix (with a warning). `logging.getLogger("delugemu")` at DEBUG traces each step.
+- `browser_open()` — whether a load browser is open (its LOAD LED blinks).
 
 Readout (deterministic, via `qom-get`)
 - `read_oled()` → 48×128 list of bools; `oled_text()` → `#`/`.` rows; `oled_on()` → bool.
@@ -82,6 +87,7 @@ Readout (deterministic, via `qom-get`)
 
 Timing & assertions
 - `wait(seconds)`, `wait_until(predicate, timeout, poll)`.
+- `sd_command_count()` — SD commands issued since power-on (SDHI `dz-cmd-count`); `wait_sd_idle(quiet=1.0, timeout=60)` — wait until no SD command for `quiet` s (a load finished). Never quiet while a song is streaming samples.
 - `assert_led(name, on=True)`, `assert_segment(text)`, `assert_oled_contains(marker)`, `assert_no_aborts()` (needs `int_log`).
 
 ## CLI

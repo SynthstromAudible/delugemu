@@ -342,6 +342,7 @@ static void rza1l_sdhi_command(RzA1lSdhiState *s, uint16_t cmdreg)
     memset(s->resp, 0, sizeof(s->resp));
     s->pending_info2 = 0;
     s->stats_cmds++;
+    s->total_cmds++;
 
     rlen = sdbus_do_command(&s->sdbus, &req, rsp, sizeof(rsp));
 
@@ -802,6 +803,9 @@ static void rza1l_sdhi_init(Object *obj)
     qdev_init_gpio_out_named(DEVICE(s), &s->dreq, RZA1L_SDHI_DREQ, 1);
 
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rza1l_sdhi_timer_cb, s);
+
+    object_property_add_uint64_ptr(obj, "dz-cmd-count", &s->total_cmds,
+                                   OBJ_PROP_FLAG_READ);
 }
 
 static void rza1l_sdhi_realize(DeviceState *dev, Error **errp)
