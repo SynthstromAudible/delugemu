@@ -2,6 +2,11 @@
 """Drive a Deluge rotary encoder over QMP and capture screenshots.
 
 Usage: enc_test.py <x> <y> <label> [updelta] [downdelta]
+
+Superseded by the `delugemu` scripting package (see docs/scripting.md), which
+turns encoders by name:
+    PYTHONPATH=pylib python3 -m delugemu.cli turn SELECT_ENC 8
+Kept as a minimal raw-QMP example.
 """
 import json
 import os

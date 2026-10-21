@@ -501,6 +501,13 @@ uint8_t deluge_pic_get_gold_knob(Chardev *chr, int which, int led)
     return s->gold_knob[which][led];
 }
 
+void deluge_pic_get_seven_seg(Chardev *chr, uint8_t out[DELUGE_PIC_SEG_DIGITS])
+{
+    DelugePicState *s = DELUGE_PIC(chr);
+
+    memcpy(out, s->seven_seg, sizeof(s->seven_seg));
+}
+
 static void deluge_pic_class_init(ObjectClass *oc, const void *data)
 {
     ChardevClass *cc = CHARDEV_CLASS(oc);

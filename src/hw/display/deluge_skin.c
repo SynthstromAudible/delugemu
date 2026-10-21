@@ -1381,6 +1381,66 @@ static const Property deluge_skin_props[] = {
     DEFINE_PROP_BOOL("inverse", DelugeSkinState, inverse, false),
 };
 
+/*
+ * Deterministic readout for the scripting interface (pylib/delugemu).
+ *
+ * The indicator LEDs, 7-segment digits and gold-knob brightness live in the
+ * PIC, which is an anonymous chardev with no stable QOM path; the skin holds a
+ * live pointer to it and already reads this state for rendering, so the readout
+ * properties are exposed here. Each getter returns an empty string when the PIC
+ * is not wired (a headless bring-up config). Fetched via `qom-get`.
+ *
+ * dz-leds:      36 chars '0'/'1', indexed led = col + 9*row (col 0..8, row 0..3)
+ * dz-seven-seg: 8 hex chars, one byte (raw segment bitmask) per digit
+ * dz-gold-knob: base64 of 8 bytes, gold_knob[which=0..1][led=0..3] brightness
+ */
+static char *deluge_skin_get_leds(Object *obj, Error **errp)
+{
+    DelugeSkinState *s = DELUGE_SKIN(obj);
+    char buf[DELUGE_PIC_NUM_LEDS + 1];
+    int i = 0;
+
+    if (!s->pic) {
+        return g_strdup("");
+    }
+    for (int row = 0; row < DELUGE_PIC_BTN_ROWS; row++) {
+        for (int col = 0; col < DELUGE_PIC_BTN_COLS; col++) {
+            buf[i++] = deluge_pic_get_led(s->pic, col, row) ? '1' : '0';
+        }
+    }
+    buf[DELUGE_PIC_NUM_LEDS] = '\0';
+    return g_strdup(buf);
+}
+
+static char *deluge_skin_get_seven_seg(Object *obj, Error **errp)
+{
+    DelugeSkinState *s = DELUGE_SKIN(obj);
+    uint8_t seg[DELUGE_PIC_SEG_DIGITS];
+
+    if (!s->pic) {
+        return g_strdup("");
+    }
+    deluge_pic_get_seven_seg(s->pic, seg);
+    return g_strdup_printf("%02x%02x%02x%02x", seg[0], seg[1], seg[2], seg[3]);
+}
+
+static char *deluge_skin_get_gold_knob(Object *obj, Error **errp)
+{
+    DelugeSkinState *s = DELUGE_SKIN(obj);
+    uint8_t buf[DELUGE_PIC_GOLD_KNOBS * DELUGE_PIC_GOLD_LEDS];
+    int i = 0;
+
+    if (!s->pic) {
+        return g_strdup("");
+    }
+    for (int w = 0; w < DELUGE_PIC_GOLD_KNOBS; w++) {
+        for (int led = 0; led < DELUGE_PIC_GOLD_LEDS; led++) {
+            buf[i++] = deluge_pic_get_gold_knob(s->pic, w, led);
+        }
+    }
+    return g_base64_encode(buf, sizeof(buf));
+}
+
 static void deluge_skin_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -1390,6 +1450,14 @@ static void deluge_skin_class_init(ObjectClass *klass, const void *data)
     device_class_set_legacy_reset(dc, deluge_skin_reset);
     device_class_set_props(dc, deluge_skin_props);
     dc->desc = "Synthstrom Deluge composited skin";
+
+    /* State readout for the scripting interface (see getters above). */
+    object_class_property_add_str(klass, "dz-leds",
+                                  deluge_skin_get_leds, NULL);
+    object_class_property_add_str(klass, "dz-seven-seg",
+                                  deluge_skin_get_seven_seg, NULL);
+    object_class_property_add_str(klass, "dz-gold-knob",
+                                  deluge_skin_get_gold_knob, NULL);
 }
 
 static const TypeInfo deluge_skin_info = {

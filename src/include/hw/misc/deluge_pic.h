@@ -162,4 +162,7 @@ void deluge_pic_button_event(Chardev *chr, int x, int y, bool pressed);
 bool deluge_pic_get_led(Chardev *chr, int col, int row);
 uint8_t deluge_pic_get_gold_knob(Chardev *chr, int which, int led);
 
+/* Copy the 4 raw 7-segment digit bitmasks into out (for state readout). */
+void deluge_pic_get_seven_seg(Chardev *chr, uint8_t out[DELUGE_PIC_SEG_DIGITS]);
+
 #endif /* HW_MISC_DELUGE_PIC_H */
