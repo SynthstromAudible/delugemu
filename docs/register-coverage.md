@@ -60,6 +60,9 @@ Base `0xE8200000` · size `0x800` · 16 channels (0x40-byte blocks), group commo
 On `CHCTRL.SETEN` it synchronously copies `N0TB` bytes `N0SA → N0DA` honouring
 addr modes, then sets `END|TC` and pulses the per-channel DMAINT (if `DEM` clear).
 Channel 6 is a self-advancing audio TX ring; channel 12 is the PIC RX ring.
+Channel 2 (SD data) is **DREQ-paced**: `SETEN` only arms it (`EN` set,
+`CRSA/CRDA/CRTB` loaded); it moves data while the SDHI holds its level request
+(`dreq` GPIO input) high and completes when `CRTB` reaches zero.
 
 ### SDHI — SD host · `rza1l-sdhi`
 
@@ -67,20 +70,47 @@ Base `0xE804E800` · size `0x100` · IRQ GIC SPI 273 (INTC 305).
 
 | Offset | Reg | Coverage | Notes |
 | ------ | --- | -------- | ----- |
-| 0x00 | SD_CMD | modelled | issues command on the QEMU SD bus |
+| 0x00 | SD_CMD | modelled | issues command on the QEMU SD bus; response after its bus time |
 | 0x04/06 | SD_ARG0/1 | modelled | argument |
-| 0x08/0A | SD_STOP/SECCNT | shadow | |
+| 0x08/0A | SD_STOP/SECCNT | modelled | block count; `SEC` = multi-block + auto CMD12 |
 | 0x0C–0x1A | SD_RESP0–7 | modelled | latched response |
 | 0x1C | SD_INFO1 | modelled | RESP/DATA/card-detect events |
-| 0x1E | SD_INFO2 | modelled | error/busy status |
+| 0x1E | SD_INFO2 | modelled | error status, BRE/BWE, `CBSY` while busy, `SCLKDIVEN` clear during a command |
 | 0x20/22 | SD_INFO1/2_MASK | modelled | inverted-logic masks |
-| 0x24–0x2E | CLK_CTRL/SIZE/OPTION/ERR_STS | shadow | |
+| 0x24 | SD_CLK_CTRL | modelled | divider sets the modelled SD clock (IMCLK 66.67 MHz) |
+| 0x26 | SD_SIZE | modelled | block length |
+| 0x28 | SD_OPTION | modelled | bit 15 = 1-bit bus (timing) |
+| 0x2C/2E | SD_ERR_STS1/2 | shadow | |
 | 0x30 | SD_BUF0 | special | data FIFO |
 | 0x00–0x3F | (DMA window) | special | when `CC_EXT_MODE.DMASDRW`, the FIFO is mirrored over the low 64 bytes |
 | 0xD8 | CC_EXT_MODE | shadow | bit 1 = DMASDRW |
 | 0xE0 | SOFT_RST | special | write-to-act |
 | 0xE2 | SD_VERSION | stub | 0xB001 |
 | 0xF0 | EXT_SWAP | shadow | endian |
+
+**Timing.** The bus is modelled in virtual time so SD-bound firmware behaves
+as on hardware (the firmware yields to the audio engine while it waits). Each
+command takes its bits (48 + NCR + 48/136-bit response) in SD clocks; each data
+block takes `512 × 8 / width + 18` clocks. Flash reads (CMD17/18) wait the
+card's access latency before the first block; flash writes (CMD24/25) add
+per-block programming time and a final busy period. The one-block buffer only
+refills once drained, and DMA is paced by the SDHI's `dreq` line (above).
+Properties (`-global rza1l-sdhi.<prop>=…`):
+
+| Property | Default | Meaning |
+| -------- | ------- | ------- |
+| `timing` | `on` | `off` = every step completes instantly (the old model) |
+| `read-latency-us` | 300 | card access time before the first block of a read |
+| `write-block-us` | 20 | card programming time per written block |
+| `write-busy-us` | 1000 | busy time to commit a write after its last block |
+
+At the firmware's 33.3 MHz 4-bit clock a block is ~31 µs on the bus, so a
+single-sector read costs ~335 µs and a streamed 32 KiB cluster ~2.3 ms.
+Without `-icount`, QEMU's main loop only fires virtual timers to the
+millisecond on macOS (no `ppoll`), so the MTU2/OSTM counter reads the firmware
+makes constantly also run due SD deadlines on the vCPU thread
+(`deluge_vcpu_tick`). Set `DELUGEMU_SDHI_STATS=1` to print, per virtual second,
+commands issued, KiB read/written and the fraction of time the bus was busy.
 
 ### OSTM — OS timer · `rza1l-ostm`
 

@@ -28,6 +28,7 @@
 #include "qemu/host-utils.h"
 #include "qemu/timer.h"
 #include "migration/vmstate.h"
+#include "hw/misc/deluge_vcpu_tick.h"
 #include "hw/timer/rza1l_mtu2.h"
 
 /*
@@ -75,6 +76,9 @@ static uint64_t rza1l_mtu2_read(void *opaque, hwaddr offset, unsigned size)
 {
     RzA1lMtu2State *s = opaque;
     uint64_t val = 0;
+
+    /* The firmware's tick source: let fine-grained device timers catch up. */
+    deluge_vcpu_tick();
 
     for (unsigned i = 0; i < size; i++) {
         hwaddr boff = offset + i;

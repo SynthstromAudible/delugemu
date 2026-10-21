@@ -31,6 +31,7 @@
 #include "qemu/host-utils.h"
 #include "qemu/timer.h"
 #include "migration/vmstate.h"
+#include "hw/misc/deluge_vcpu_tick.h"
 #include "hw/timer/rza1l_ostm.h"
 
 /*
@@ -88,6 +89,8 @@ static uint64_t rza1l_ostm_read(void *opaque, hwaddr offset, unsigned size)
     case OSTM_CMP:
         return c->cmp;
     case OSTM_CNT:
+        /* A tick source: let fine-grained device timers catch up. */
+        deluge_vcpu_tick();
         return rza1l_ostm_cnt_value(c);
     case OSTM_TE:
         return c->enabled ? 1 : 0;

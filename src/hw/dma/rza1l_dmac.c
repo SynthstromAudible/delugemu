@@ -16,6 +16,11 @@
  * interrupts are not modelled; synchronous completion is sufficient for the
  * firmware's polled transfers and keeps boot moving.
  *
+ * The exception is channels registered as DREQ-paced (the SDHI data channel):
+ * those transfer only while the peripheral asserts its request line, so the
+ * transfer's duration is set by the peripheral's own timing model (see
+ * rza1l_dmac_register_dreq).
+ *
  * Register offsets verified via offsetof on the firmware st_dmac:
  *   Per channel (0x40 stride): N0SA 0x00 N0DA 0x04 N0TB 0x08 N1SA 0x0c
  *   N1DA 0x10 N1TB 0x14 CRSA 0x18 CRDA 0x1c CRTB 0x20 CHSTAT 0x24 CHCTRL 0x28
@@ -173,20 +178,33 @@ static uint32_t rza1l_dmac_dstat(RzA1lDmacState *s, int group, uint32_t bit)
     return val;
 }
 
+#define RZA1L_DMAC_MAX_UNIT 32
+
+/*
+ * Bytes moved per bus access: the smaller of the source/destination transfer
+ * sizes. Wider units (the SDHI's 512-bit setting) fall back to byte accesses so
+ * a fixed-address peripheral FIFO is still read at its one register offset.
+ */
+static unsigned rza1l_dmac_unit(RzA1lDmacChannel *c)
+{
+    unsigned sds = 1u << ((c->chcfg & CHCFG_SDS_MASK) >> CHCFG_SDS_SHIFT);
+    unsigned dds = 1u << ((c->chcfg & CHCFG_DDS_MASK) >> CHCFG_DDS_SHIFT);
+    unsigned unit = MIN(sds, dds);
+
+    if (unit == 0 || unit > RZA1L_DMAC_MAX_UNIT) {
+        unit = 1;
+    }
+    return unit;
+}
+
 /* Copy `remaining` bytes from `sa` to `da`, honouring address direction/unit. */
 static void rza1l_dmac_copy(RzA1lDmacChannel *c, uint64_t sa, uint64_t da,
                             uint32_t remaining)
 {
     bool sad_fixed = c->chcfg & CHCFG_SAD;
     bool dad_fixed = c->chcfg & CHCFG_DAD;
-    unsigned sds = 1u << ((c->chcfg & CHCFG_SDS_MASK) >> CHCFG_SDS_SHIFT);
-    unsigned dds = 1u << ((c->chcfg & CHCFG_DDS_MASK) >> CHCFG_DDS_SHIFT);
-    unsigned unit = MIN(sds, dds);
-    uint8_t buf[32];
-
-    if (unit == 0 || unit > sizeof(buf)) {
-        unit = 1;
-    }
+    unsigned unit = rza1l_dmac_unit(c);
+    uint8_t buf[RZA1L_DMAC_MAX_UNIT];
 
     while (remaining) {
         unsigned n = MIN(unit, remaining);
@@ -228,6 +246,68 @@ static void rza1l_dmac_do_transfer(RzA1lDmacState *s, int ch)
     }
 }
 
+/*
+ * Advance a DREQ-paced channel for as long as its request line stays high,
+ * one transfer unit at a time, so a peripheral that drops DREQ part-way (its
+ * buffer emptied or filled) stops the transfer at exactly that point. Completes
+ * the channel once CRTB reaches zero.
+ */
+static void rza1l_dmac_dreq_service(RzA1lDmacState *s, int ch)
+{
+    RzA1lDmacChannel *c = &s->ch[ch];
+    bool sad_fixed = c->chcfg & CHCFG_SAD;
+    bool dad_fixed = c->chcfg & CHCFG_DAD;
+    unsigned unit = rza1l_dmac_unit(c);
+    uint8_t buf[RZA1L_DMAC_MAX_UNIT];
+
+    /*
+     * The peripheral raises and lowers DREQ from inside the FIFO accesses made
+     * below; the loop re-checks the level after every unit, so a nested call
+     * has nothing to do.
+     */
+    if (c->dreq_servicing) {
+        return;
+    }
+    c->dreq_servicing = true;
+
+    while (c->dreq_level && (c->chstat & CHSTAT_EN) && c->crtb) {
+        unsigned n = MIN(unit, c->crtb);
+
+        dma_memory_read(&address_space_memory, c->crsa, buf, n,
+                        MEMTXATTRS_UNSPECIFIED);
+        dma_memory_write(&address_space_memory, c->crda, buf, n,
+                         MEMTXATTRS_UNSPECIFIED);
+        if (!sad_fixed) {
+            c->crsa += n;
+        }
+        if (!dad_fixed) {
+            c->crda += n;
+        }
+        c->crtb -= n;
+    }
+
+    c->dreq_servicing = false;
+
+    if ((c->chstat & CHSTAT_EN) && c->crtb == 0) {
+        c->chstat &= ~(CHSTAT_EN | CHSTAT_TACT);
+        c->chstat |= CHSTAT_END | CHSTAT_TC;
+        if (!(c->chcfg & CHCFG_DEM)) {
+            qemu_irq_pulse(s->irq[ch]);
+        }
+    }
+}
+
+static void rza1l_dmac_dreq_set(void *opaque, int ch, int level)
+{
+    RzA1lDmacState *s = opaque;
+    RzA1lDmacChannel *c = &s->ch[ch];
+
+    c->dreq_level = level;
+    if (level && c->dreq_paced) {
+        rza1l_dmac_dreq_service(s, ch);
+    }
+}
+
 static void rza1l_dmac_chctrl_write(RzA1lDmacState *s, int ch, uint32_t val)
 {
     RzA1lDmacChannel *c = &s->ch[ch];
@@ -245,7 +325,19 @@ static void rza1l_dmac_chctrl_write(RzA1lDmacState *s, int ch, uint32_t val)
     if (val & CHCTRL_CLRTC) {
         c->chstat &= ~CHSTAT_TC;
     }
-    if (val & CHCTRL_SETEN) {
+    if ((val & CHCTRL_SETEN) && c->dreq_paced) {
+        /*
+         * Arm the Next0 transfer and move whatever the peripheral is already
+         * requesting; the rest follows as it raises DREQ. EN stays set (TACT
+         * does not: the firmware's close path spins on it) until done.
+         */
+        c->crsa = c->n0sa;
+        c->crda = c->n0da;
+        c->crtb = c->n0tb;
+        c->chstat &= ~(CHSTAT_TACT | CHSTAT_ER | CHSTAT_END | CHSTAT_TC);
+        c->chstat |= CHSTAT_EN;
+        rza1l_dmac_dreq_service(s, ch);
+    } else if (val & CHCTRL_SETEN) {
         /*
          * Run the transfer to completion immediately. The channel never
          * lingers in the active state, so the firmware's "wait for TACT/EN to
@@ -351,6 +443,13 @@ static void rza1l_dmac_chctrl_write(RzA1lDmacState *s, int ch, uint32_t val)
                 c->timing_cursor = c->timing_base;
             }
         }
+    }
+}
+
+void rza1l_dmac_register_dreq(RzA1lDmacState *s, int ch)
+{
+    if (ch >= 0 && ch < RZA1L_DMAC_NUM_CH) {
+        s->ch[ch].dreq_paced = true;
     }
 }
 
@@ -677,13 +776,16 @@ static void rza1l_dmac_reset(DeviceState *dev)
     bool timing_capture_link[RZA1L_DMAC_NUM_CH];
     int timing_capture_ch[RZA1L_DMAC_NUM_CH];
     int timing_capture_src_ch[RZA1L_DMAC_NUM_CH];
+    bool dreq_paced[RZA1L_DMAC_NUM_CH];
+    bool dreq_level[RZA1L_DMAC_NUM_CH];
 
     /*
      * rx_ring_peripheral, tx_audio_ring, rx_audio_ring and the timing-capture
      * wiring are static wiring properties (set once at machine construction by
      * rza1l_dmac_register_*), not transfer state, so they must survive a device
      * reset. Preserve them across the memset that clears the per-channel
-     * registers.
+     * registers. So must each DREQ input's level: it mirrors the peripheral's
+     * output line, which only changes when the peripheral drives it.
      */
     for (int i = 0; i < RZA1L_DMAC_NUM_CH; i++) {
         rx_ring_peripheral[i] = s->ch[i].rx_ring_peripheral;
@@ -693,6 +795,8 @@ static void rza1l_dmac_reset(DeviceState *dev)
         timing_capture_link[i] = s->ch[i].timing_capture_link;
         timing_capture_ch[i] = s->ch[i].timing_capture_ch;
         timing_capture_src_ch[i] = s->ch[i].timing_capture_src_ch;
+        dreq_paced[i] = s->ch[i].dreq_paced;
+        dreq_level[i] = s->ch[i].dreq_level;
     }
 
     memset(s->ch, 0, sizeof(s->ch));
@@ -706,6 +810,8 @@ static void rza1l_dmac_reset(DeviceState *dev)
         s->ch[i].timing_capture_link = timing_capture_link[i];
         s->ch[i].timing_capture_ch = timing_capture_ch[i];
         s->ch[i].timing_capture_src_ch = timing_capture_src_ch[i];
+        s->ch[i].dreq_paced = dreq_paced[i];
+        s->ch[i].dreq_level = dreq_level[i];
     }
 
     /*
@@ -738,12 +844,14 @@ static void rza1l_dmac_realize(DeviceState *dev, Error **errp)
     for (int i = 0; i < RZA1L_DMAC_NUM_CH; i++) {
         sysbus_init_irq(sbd, &s->irq[i]);
     }
+    qdev_init_gpio_in_named(dev, rza1l_dmac_dreq_set, RZA1L_DMAC_DREQ,
+                            RZA1L_DMAC_NUM_CH);
 }
 
 static const VMStateDescription vmstate_rza1l_dmac_channel = {
     .name = "rza1l-dmac-channel",
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(n0sa, RzA1lDmacChannel),
         VMSTATE_UINT32(n0da, RzA1lDmacChannel),
@@ -778,6 +886,7 @@ static const VMStateDescription vmstate_rza1l_dmac_channel = {
         VMSTATE_UINT32(timing_base, RzA1lDmacChannel),
         VMSTATE_UINT32(timing_size, RzA1lDmacChannel),
         VMSTATE_UINT32(timing_cursor, RzA1lDmacChannel),
+        VMSTATE_BOOL(dreq_level, RzA1lDmacChannel),
         VMSTATE_END_OF_LIST()
     },
 };

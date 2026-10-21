@@ -106,6 +106,21 @@ typedef struct RzA1lDmacChannel {
     bool     timing_capture_link;
     int      timing_capture_ch;
     int      timing_capture_src_ch;
+
+    /*
+     * Peripheral-request (DREQ) paced channel (the SDHI data channel). Rather
+     * than copying N0TB bytes the moment it is enabled, such a channel only
+     * moves data while its peripheral holds the channel's DREQ input high (a
+     * level-detected request, as the SDHI asserts while its data buffer is
+     * ready), so the transfer takes as long as the peripheral needs to supply
+     * or accept it. CRSA/CRDA/CRTB track progress; END/TC are set (and DMAINT
+     * pulsed) once CRTB reaches zero. Only channels registered via
+     * rza1l_dmac_register_dreq behave this way. dreq_servicing guards against
+     * re-entry when the peripheral toggles DREQ from inside a transfer access.
+     */
+    bool     dreq_paced;
+    bool     dreq_level;
+    bool     dreq_servicing;
 } RzA1lDmacChannel;
 
 struct RzA1lDmacState {
@@ -220,5 +235,18 @@ bool rza1l_dmac_peripheral_rx_push(RzA1lDmacState *s, int ch, uint8_t byte);
  */
 void rza1l_dmac_register_timing_capture(RzA1lDmacState *s, int timing_ch,
                                         int rx_ch, int src_ch);
+
+/*
+ * Named GPIO input array (one line per channel) carrying peripheral DMA
+ * requests. Wire a peripheral's DREQ output to line <ch> and register the
+ * channel with rza1l_dmac_register_dreq.
+ */
+#define RZA1L_DMAC_DREQ "dreq"
+
+/*
+ * Mark a channel as DREQ-paced: once enabled it transfers only while its
+ * RZA1L_DMAC_DREQ input line is high, completing when N0TB bytes have moved.
+ */
+void rza1l_dmac_register_dreq(RzA1lDmacState *s, int ch);
 
 #endif /* HW_DMA_RZA1L_DMAC_H */
