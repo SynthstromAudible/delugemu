@@ -114,13 +114,59 @@ parser:
 It **skips cleanly** (exit 0) when not on macOS or when `python-rtmidi` is not
 installed.
 
+## `scenario.sh`
+
+The scripting-interface regression harness. It runs every scenario under
+`tests/scenarios/` against a freshly launched headless emulator using the
+[`delugemu`](../pylib) Python package, driving the front panel and asserting on
+deterministic display state (OLED / 7-segment / indicator LEDs / pads) read back
+over QMP. Each scenario runs its own instance with `-d int` logging so
+`assert_no_aborts` works.
+
+```sh
+./tests/scenario.sh                          # all scenarios
+./tests/scenario.sh tests/scenarios/boot.json
+DELUGE_FIRMWARE=path ./tests/scenario.sh
+DELUGEMU_FETCH_FIRMWARE=1 ./tests/scenario.sh   # download the latest release
+```
+
+Like `boot.sh`, it **skips cleanly** (exit 0) when no firmware or `python3` is
+present. See [`docs/scripting.md`](../docs/scripting.md) for the full interface.
+
+## `geometry-sync.sh`
+
+Guards that the committed Python control map
+(`pylib/delugemu/_controls.py`) is in sync with the C front-panel headers it is
+generated from. If a control's geometry changes in C without regenerating, the
+scripting interface would click the wrong pixels; this fails so the generator is
+re-run (`scripts/gen_control_map.py`). Skips cleanly without `python3`.
+
 ## Adding tests
 
 Keep tests runnable standalone and CI-friendly: exit non-zero on failure, avoid
 interactive prompts, and don't depend on a real Deluge firmware image unless the
 test explicitly fetches/locates one and skips cleanly when it is absent.
 
-## Driving the panel over QMP
+## Driving the panel: the `delugemu` scripting interface
+
+The standard way to script the emulator is the [`delugemu`](../pylib) Python
+package (library + `delugemu` CLI + declarative scenario files), documented in
+[`docs/scripting.md`](../docs/scripting.md). It wraps the raw QMP contract below
+with named controls, deterministic display readout and assertions:
+
+```sh
+# one-shot verbs against a running instance (see "Expose the socket" below)
+PYTHONPATH=../pylib python3 -m delugemu.cli press PLAY
+PYTHONPATH=../pylib python3 -m delugemu.cli oled
+# or a whole scenario, launching its own emulator
+PYTHONPATH=../pylib python3 -m delugemu.cli run scenarios/transport.json \
+    --firmware ../firmware/deluge.bin
+```
+
+The one-off helper scripts below (`press_key.py`, `enc_test.py`) predate the
+package and are **superseded** by it; they remain only as thin raw-QMP examples.
+
+### The raw QMP contract
 
 QMP (the **QEMU Machine Protocol**) is QEMU's JSON control channel: a socket on
 which you send commands to and query a running instance. We use it to drive the

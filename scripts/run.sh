@@ -255,6 +255,11 @@ FIRMWARE_DIR="${DELUGEMU_FIRMWARE_DIR:-${REPO_ROOT}/firmware}"
 COMMUNITY_FW_URL="https://github.com/SynthstromAudible/DelugeFirmware/releases/download/release_1_2_1/deluge-community-release-1_2_1.zip"
 COMMUNITY_FW_NAME="Deluge community firmware 1.2.1 (Chopin)"
 
+# GitHub repo whose *latest* release is used for the non-interactive firmware
+# fetch (CI / scripted runs). Configurable because a firmware developer may
+# publish their own builds; defaults to the upstream community firmware.
+FIRMWARE_REPO="${DELUGEMU_FIRMWARE_REPO:-SynthstromAudible/DelugeFirmware}"
+
 # The Synthstrom factory SD-card contents offered when no card is given and no
 # default sdcard folder exists. Downloaded and unzipped into SD_DIR, not
 # redistributed. SD_DIR (overridable) is also the folder auto-detected below.
@@ -315,6 +320,72 @@ download_and_unzip() {
         die "no unzip or python found to extract the archive"
     fi
     rm -rf "${tmp}"
+}
+
+# Resolve and fetch the latest firmware release from a GitHub repo into
+# FIRMWARE_DIR, non-interactively. Queries the releases API (honouring
+# GITHUB_TOKEN to dodge rate limits), picks the best-looking asset (a release
+# .zip, else a .bin), and downloads it. Returns non-zero on any failure so the
+# caller can fall back or skip. Used by CI and the scripting interface.
+fetch_latest_firmware() {
+    local repo="$1" api json url
+    api="https://api.github.com/repos/${repo}/releases/latest"
+    command -v python3 >/dev/null 2>&1 || { log "python3 needed to resolve release"; return 1; }
+
+    if command -v curl >/dev/null 2>&1; then
+        if [ -n "${GITHUB_TOKEN:-}" ]; then
+            json="$(curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" "${api}" 2>/dev/null)" || return 1
+        else
+            json="$(curl -fsSL "${api}" 2>/dev/null)" || return 1
+        fi
+    elif command -v wget >/dev/null 2>&1; then
+        if [ -n "${GITHUB_TOKEN:-}" ]; then
+            json="$(wget -qO- --header="Authorization: Bearer ${GITHUB_TOKEN}" "${api}" 2>/dev/null)" || return 1
+        else
+            json="$(wget -qO- "${api}" 2>/dev/null)" || return 1
+        fi
+    else
+        log "neither curl nor wget found; cannot query ${api}"
+        return 1
+    fi
+
+    url="$(printf '%s' "${json}" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+def score(a):
+    n = a.get("name", "").lower()
+    s = 0
+    if n.endswith(".zip"): s += 2
+    if "community" in n or "release" in n: s += 1
+    if n.endswith(".bin"): s += 2
+    return s
+best = None
+for a in d.get("assets", []):
+    if best is None or score(a) > score(best):
+        best = a
+print(best.get("browser_download_url", "") if best else "")
+' 2>/dev/null)" || return 1
+    [ -n "${url}" ] || { log "no downloadable asset in latest ${repo} release"; return 1; }
+
+    log "Latest ${repo} release asset: ${url##*/}"
+    case "${url}" in
+    *.zip)
+        download_and_unzip "${url}" "${FIRMWARE_DIR}" "latest ${repo} firmware"
+        ;;
+    *)
+        mkdir -p "${FIRMWARE_DIR}"
+        local out="${FIRMWARE_DIR}/${url##*/}"
+        if command -v curl >/dev/null 2>&1; then
+            curl -fL --progress-bar -o "${out}" "${url}" || return 1
+        else
+            wget -q -O "${out}" "${url}" || return 1
+        fi
+        ;;
+    esac
+    return 0
 }
 
 # Ask the user a yes/no question, returning 0 for yes. On a terminal this reads
@@ -399,10 +470,24 @@ esac
 
 # Resolve the firmware image when none was given on the command line: use one
 # from the firmware folder, or offer to download the community release.
+# Honour an explicit firmware path from the environment (used by CI and the
+# scripting interface) before auto-detecting or downloading.
+if [ -z "${FIRMWARE}" ] && [ -n "${DELUGEMU_FIRMWARE:-${DELUGE_FIRMWARE:-}}" ]; then
+    FIRMWARE="${DELUGEMU_FIRMWARE:-${DELUGE_FIRMWARE}}"
+    log "Using firmware from environment: ${FIRMWARE}"
+fi
 if [ -z "${FIRMWARE}" ]; then
     FIRMWARE="$(find_local_firmware)"
     if [ -n "${FIRMWARE}" ]; then
         log "No firmware given; using ${FIRMWARE#"${REPO_ROOT}/"}"
+    elif [ "${DELUGEMU_FETCH_FIRMWARE:-0}" = "1" ] || [ -n "${DELUGEMU_FIRMWARE_REPO:-}" ]; then
+        # Non-interactive fallback: fetch the latest release (CI / scripted).
+        log "No firmware found; fetching latest release from ${FIRMWARE_REPO}..."
+        fetch_latest_firmware "${FIRMWARE_REPO}" || true
+        FIRMWARE="$(find_local_firmware)"
+        [ -n "${FIRMWARE}" ] \
+            || die "could not fetch a firmware image from ${FIRMWARE_REPO}"
+        log "Using ${FIRMWARE#"${REPO_ROOT}/"}"
     elif interactive; then
         if confirm "No firmware specified and none found in ${FIRMWARE_DIR}.
 Download ${COMMUNITY_FW_NAME} (~900 KB) from Synthstrom and use it?"; then
@@ -417,7 +502,7 @@ Download ${COMMUNITY_FW_NAME} (~900 KB) from Synthstrom and use it?"; then
         fi
     else
         usage
-        die "no firmware given and none found in ${FIRMWARE_DIR} (run interactively to fetch the community firmware, or pass a firmware path)"
+        die "no firmware given and none found in ${FIRMWARE_DIR} (set DELUGEMU_FIRMWARE=path, set DELUGEMU_FETCH_FIRMWARE=1 to download the latest ${FIRMWARE_REPO} release, run interactively to fetch the community firmware, or pass a firmware path)"
     fi
 fi
 

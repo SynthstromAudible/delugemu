@@ -57,6 +57,62 @@ jobs:
         # image in a prior step and point DELUGE_FIRMWARE at it.
         run: ./tests/boot.sh
 
+  # Scripting-interface checks: the stdlib-only delugemu package unit tests, the
+  # control-map drift guard, and the scenario harness. Firmware is not shipped,
+  # so the scenario step skips cleanly (exit 0). To drive real firmware in CI,
+  # set DELUGEMU_FETCH_FIRMWARE=1 (downloads the latest release) or point
+  # DELUGE_FIRMWARE at an image fetched in a prior step.
+  scenarios:
+    name: Scripting interface (unit + scenarios)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout (without submodules; we fetch QEMU shallowly)
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git ninja-build pkg-config python3-venv \
+            libglib2.0-dev libpixman-1-dev libpng-dev flex bison
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja pkg-config glib pixman libpng meson
+
+      - name: Package unit tests (stdlib only, no emulator)
+        run: PYTHONPATH=pylib python3 -m unittest discover -s pylib/tests -v
+
+      - name: Bootstrap QEMU submodule
+        run: ./scripts/bootstrap.sh
+
+      - name: Integrate device models
+        run: ./scripts/integrate.sh
+
+      - name: Build
+        run: ./scripts/build.sh
+
+      - name: Run scenarios (skips cleanly without firmware)
+        uses: ./.github/actions/run-scenario
+        with:
+          # Flip to 'true' to drive the latest published firmware release.
+          fetch-latest: "false"
+
+      - name: Upload scenario artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scenario-artifacts-${{ matrix.os }}
+          path: build/scenario-artifacts
+          if-no-files-found: ignore
+
   # Windows build runs under MSYS2/MinGW -- the same toolchain QEMU itself uses
   # for its official Windows binaries. The Bash build scripts run unmodified in
   # the MINGW64 shell (see docs/windows.md).

@@ -33,6 +33,18 @@ static void deluge_padgrid_invalidate(void *opaque)
     s->dirty = true;
 }
 
+/*
+ * Deterministic pad-colour readout for the scripting interface. Returns the
+ * raw rgb[] array (columns x rows x 3, column-major) base64-encoded; `qom-get`
+ * fetches it with no QAPI schema change.
+ */
+static char *deluge_padgrid_get_leds(Object *obj, Error **errp)
+{
+    DelugePadGridState *s = DELUGE_PADGRID(obj);
+
+    return g_base64_encode((const guchar *)s->rgb, sizeof(s->rgb));
+}
+
 static void deluge_padgrid_fill_cell(uint32_t *dst, int stride, int x0, int y0,
                                      uint32_t argb)
 {
@@ -136,6 +148,10 @@ static void deluge_padgrid_class_init(ObjectClass *klass, const void *data)
     device_class_set_legacy_reset(dc, deluge_padgrid_reset);
     device_class_set_props(dc, deluge_padgrid_props);
     dc->desc = "Synthstrom Deluge RGB pad grid";
+
+    /* State readout for the scripting interface. */
+    object_class_property_add_str(klass, "dz-pad-leds",
+                                  deluge_padgrid_get_leds, NULL);
 }
 
 static const TypeInfo deluge_padgrid_info = {

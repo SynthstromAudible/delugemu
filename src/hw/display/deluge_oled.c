@@ -220,6 +220,30 @@ static const GraphicHwOps deluge_oled_gfx_ops = {
     .gfx_update = deluge_oled_update,
 };
 
+/*
+ * Deterministic state readout for the scripting interface (pylib/delugemu).
+ * Registered as read-only QOM properties and fetched with the standard
+ * `qom-get` QMP command — no QAPI schema change. The framebuffer is the raw
+ * GDDRAM (8 pages x 128 columns, page-major); bit b of byte [page][col] is the
+ * pixel at row page*8 + b. The Python side decodes it alongside the flags.
+ */
+static char *deluge_oled_get_framebuffer(Object *obj, Error **errp)
+{
+    DelugeOledState *s = DELUGE_OLED(obj);
+
+    return g_base64_encode((const guchar *)s->gddram, sizeof(s->gddram));
+}
+
+static bool deluge_oled_get_display_on(Object *obj, Error **errp)
+{
+    return DELUGE_OLED(obj)->display_on && DELUGE_OLED(obj)->enabled;
+}
+
+static bool deluge_oled_get_inverted(Object *obj, Error **errp)
+{
+    return DELUGE_OLED(obj)->inverted;
+}
+
 static void deluge_oled_reset(DeviceState *dev)
 {
     DelugeOledState *s = DELUGE_OLED(dev);
@@ -304,6 +328,14 @@ static void deluge_oled_class_init(ObjectClass *klass, const void *data)
     device_class_set_legacy_reset(dc, deluge_oled_reset);
     device_class_set_props(dc, deluge_oled_props);
     dc->desc = "Synthstrom Deluge OLED display";
+
+    /* State readout for the scripting interface (see getters above). */
+    object_class_property_add_str(klass, "dz-framebuffer",
+                                  deluge_oled_get_framebuffer, NULL);
+    object_class_property_add_bool(klass, "dz-display-on",
+                                   deluge_oled_get_display_on, NULL);
+    object_class_property_add_bool(klass, "dz-inverted",
+                                   deluge_oled_get_inverted, NULL);
 }
 
 static const TypeInfo deluge_oled_info = {

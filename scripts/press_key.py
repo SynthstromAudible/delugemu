@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Press a key (qcode) over QMP and screendump. Usage: press_key.py <qcode> <name>"""
+"""Press a key (qcode) over QMP and screendump. Usage: press_key.py <qcode> <name>
+
+Superseded by the `delugemu` scripting package (see docs/scripting.md):
+    PYTHONPATH=pylib python3 -m delugemu.cli key <qcode>
+    PYTHONPATH=pylib python3 -m delugemu.cli shot <name>.png
+Kept as a minimal raw-QMP example.
+"""
 import json
 import socket
 import sys
