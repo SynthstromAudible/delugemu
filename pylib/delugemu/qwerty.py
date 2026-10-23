@@ -30,21 +30,30 @@ _SHIFTED = {"_": "-", "!": "1", "#": "3"}
 SONGS_ROOT = "SONGS"
 SONG_EXTENSION = ".XML"
 
+# (x, y) pad and shift state for every typeable character, built once so
+# key_for is O(1). The firmware's unassigned home-row pad (the \0 slot in the
+# row strings below) is skipped.
+_KEYS = {" ": SPACE_PAD + (False,)}
+for y, keys in _ROWS:
+    for x, ch in enumerate(keys):
+        if ch != "\0":
+            _KEYS[ch] = (FIRST_COL + x, y, False)
+for shifted, base in _SHIFTED.items():
+    x, y, _ = _KEYS[base]
+    _KEYS[shifted] = (x, y, True)
+
 
 def key_for(ch):
     """Return ``(pad, shifted)`` for one character, where ``pad`` is the (x, y)
     cell that types it and ``shifted`` says whether the shift pad must be held.
     Letters are case-insensitive. Raises ValueError for a character the
     keyboard cannot type."""
-    if ch == " ":
-        return SPACE_PAD, False
-    shifted = ch in _SHIFTED
-    base = _SHIFTED.get(ch, ch.upper())
-    for y, keys in _ROWS:
-        x = keys.find(base)
-        if x >= 0 and base != "\0":
-            return (_FIRST_COL + x, y), shifted
-    raise ValueError("character %r cannot be typed on the Deluge keyboard" % ch)
+    try:
+        x, y, shifted = _KEYS[ch.upper()]
+    except (AttributeError, KeyError):
+        raise ValueError(
+            "character %r cannot be typed on the Deluge keyboard" % ch)
+    return (x, y), shifted
 
 
 def typeable(ch):
