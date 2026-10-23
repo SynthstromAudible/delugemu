@@ -20,13 +20,27 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Build the emulator, then run the whole suite (tests/run-all.sh) against real
+  # firmware: the latest stable community release, plus the rolling beta on
+  # Linux so firmware-side changes surface early. The beta leg is
+  # continue-on-error -- it moves daily outside this repo, so it reports but does
+  # not block merges. --require-firmware fails the job if a firmware-driven test
+  # skips, so a broken asset download can't pass silently; each test's outcome
+  # is listed in the job summary.
   build-and-test:
-    name: Build qemu-system-arm + smoke + regression
+    name: Build + tests (${{ matrix.os }}, ${{ matrix.firmware }} firmware)
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.firmware == 'beta' }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            firmware: latest
+          - os: macos-latest
+            firmware: latest
+          - os: ubuntu-latest
+            firmware: beta
     steps:
       - name: Checkout (without submodules; we fetch QEMU shallowly)
         uses: actions/checkout@v4
@@ -39,63 +53,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             git ninja-build pkg-config python3-venv \
-            libglib2.0-dev libpixman-1-dev libpng-dev flex bison
+            libglib2.0-dev libpixman-1-dev libpng-dev flex bison \
+            dosfstools mtools
 
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
           brew install ninja pkg-config glib pixman libpng meson
 
-      - name: Bootstrap QEMU submodule
-        run: ./scripts/bootstrap.sh
-
-      - name: Integrate device models
-        run: ./scripts/integrate.sh
-
-      - name: Build
-        run: ./scripts/build.sh
-
-      - name: Smoke test
-        run: ./tests/smoke.sh
-
-      - name: Firmware-boot regression test
-        # Firmware is not shipped with the repo, so this skips cleanly (exit 0)
-        # when no image is present. To exercise the full boot in CI, fetch an
-        # image in a prior step and point DELUGE_FIRMWARE at it.
-        run: ./tests/boot.sh
-
-  # Scripting-interface checks: the stdlib-only delugemu package unit tests, the
-  # control-map drift guard, and the scenario harness. Firmware is not shipped,
-  # so the scenario step skips cleanly (exit 0). To drive real firmware in CI,
-  # set DELUGEMU_FETCH_FIRMWARE=1 (downloads the latest release) or point
-  # DELUGE_FIRMWARE at an image fetched in a prior step.
-  scenarios:
-    name: Scripting interface (unit + scenarios)
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    steps:
-      - name: Checkout (without submodules; we fetch QEMU shallowly)
-        uses: actions/checkout@v4
-        with:
-          submodules: false
-
-      - name: Install build dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            git ninja-build pkg-config python3-venv \
-            libglib2.0-dev libpixman-1-dev libpng-dev flex bison
-
-      - name: Install build dependencies (macOS)
+      - name: Install python-rtmidi for the CoreMIDI bridge test (macOS)
         if: runner.os == 'macOS'
-        run: brew install ninja pkg-config glib pixman libpng meson
-
-      - name: Package unit tests (stdlib only, no emulator)
-        run: PYTHONPATH=pylib python3 -m unittest discover -s pylib/tests -v
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/venv"
+          "${RUNNER_TEMP}/venv/bin/pip" install --quiet python-rtmidi
+          echo "${RUNNER_TEMP}/venv/bin" >> "$GITHUB_PATH"
 
       - name: Bootstrap QEMU submodule
         run: ./scripts/bootstrap.sh
@@ -106,25 +77,32 @@ jobs:
       - name: Build
         run: ./scripts/build.sh
 
-      - name: Run scenarios (skips cleanly without firmware)
-        uses: ./.github/actions/run-scenario
+      - name: Fetch firmware and build the SD image
+        uses: ./.github/actions/test-assets
         with:
-          # Flip to 'true' to drive the latest published firmware release.
-          fetch-latest: "false"
+          firmware-release: ${{ matrix.firmware }}
+          sd-card: "true"
 
-      - name: Upload scenario artifacts
+      - name: Run the test suite
+        run: ./tests/run-all.sh --require-firmware
+        env:
+          DELUGEMU_ARTIFACTS: build/scenario-artifacts
+
+      - name: Upload test logs and scenario artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: scenario-artifacts-${{ matrix.os }}
-          path: build/scenario-artifacts
+          name: test-results-${{ matrix.os }}-${{ matrix.firmware }}
+          path: |
+            build/test-logs
+            build/scenario-artifacts
           if-no-files-found: ignore
 
   # Windows build runs under MSYS2/MinGW -- the same toolchain QEMU itself uses
   # for its official Windows binaries. The Bash build scripts run unmodified in
   # the MINGW64 shell (see docs/windows.md).
   build-windows:
-    name: Build qemu-system-arm.exe + smoke + regression (Windows/MSYS2)
+    name: Build + tests (Windows/MSYS2, latest firmware)
     runs-on: windows-latest
     defaults:
       run:
@@ -166,14 +144,21 @@ jobs:
       - name: Build
         run: ./scripts/build.sh
 
-      - name: Smoke test
-        run: ./tests/smoke.sh
+      - name: Fetch firmware
+        uses: ./.github/actions/test-assets
 
-      - name: Firmware-boot regression test
-        # Firmware is not shipped with the repo, so this skips cleanly (exit 0)
-        # when no image is present. To exercise the full boot in CI, fetch an
-        # image in a prior step and point DELUGE_FIRMWARE at it.
-        run: ./tests/boot.sh
+      # The emulator-driving tests beyond boot use UNIX sockets and are not yet
+      # run on Windows; the unit tests and control-map guard are host-neutral.
+      - name: Run the test suite (Windows subset)
+        run: ./tests/run-all.sh --require-firmware smoke unit geometry-sync boot
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-windows
+          path: build/test-logs
+          if-no-files-found: ignore
 
   # On a version tag (v*), build a self-contained, relocatable bundle for each
   # OS and attach it to the GitHub Release so users can download and run without
