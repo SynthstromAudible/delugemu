@@ -54,12 +54,12 @@ jobs:
           sudo apt-get install -y \
             git ninja-build pkg-config python3-venv \
             libglib2.0-dev libpixman-1-dev libpng-dev flex bison \
-            dosfstools mtools
+            dosfstools mtools ccache
 
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install ninja pkg-config glib pixman libpng meson
+          brew install ninja pkg-config glib pixman libpng meson ccache
 
       - name: Install python-rtmidi for the CoreMIDI bridge test (macOS)
         if: runner.os == 'macOS'
@@ -68,14 +68,85 @@ jobs:
           "${RUNNER_TEMP}/venv/bin/pip" install --quiet python-rtmidi
           echo "${RUNNER_TEMP}/venv/bin" >> "$GITHUB_PATH"
 
+      # Reuse the emulator when nothing that feeds its build has changed: the
+      # pinned QEMU commit, our device models, patches and build scripts, and
+      # the installed toolchain/library versions. On an exact hit the QEMU
+      # checkout and build are skipped (run.sh and the tests need only the
+      # binary). On a miss, ccache keeps the rebuild incremental: a restored
+      # ninja tree would not, as a fresh checkout gives every source file a new
+      # mtime. Saving right after the build means a later test failure still
+      # leaves the binary cached for the re-run.
+      - name: Fingerprint the QEMU build inputs
+        id: qemu-key
+        env:
+          INPUTS_HASH: ${{ hashFiles('src/**', 'qemu-patches/**', 'scripts/bootstrap.sh', 'scripts/integrate.sh', 'scripts/build.sh', 'scripts/common.sh', '.gitmodules') }}
+        run: |
+          mkdir -p build
+          {
+            git rev-parse HEAD:qemu
+            if [ "${RUNNER_OS}" = "Linux" ]; then
+              dpkg-query -W ninja-build pkg-config libglib2.0-dev libpixman-1-dev libpng-dev flex bison ccache
+            else
+              brew list --versions ninja pkg-config glib pixman libpng meson ccache
+              xcrun --show-sdk-version
+            fi
+            cc --version | head -n1
+            python3 --version
+          } > build/qemu-build-inputs.txt
+          cat build/qemu-build-inputs.txt
+          deps="$(git hash-object build/qemu-build-inputs.txt | cut -c1-16)"
+          prefix="${RUNNER_OS}-${RUNNER_ARCH}-${deps}"
+          echo "bin-key=qemu-bin-${prefix}-${INPUTS_HASH}" >> "$GITHUB_OUTPUT"
+          echo "ccache-prefix=ccache-${prefix}-" >> "$GITHUB_OUTPUT"
+
+      - name: Restore a QEMU build for these exact inputs
+        id: qemu-bin
+        uses: actions/cache/restore@v4
+        with:
+          path: qemu/build/qemu-system-arm
+          key: ${{ steps.qemu-key.outputs.bin-key }}
+
+      - name: Restore the compiler cache
+        if: steps.qemu-bin.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ${{ steps.qemu-key.outputs.ccache-prefix }}${{ github.run_id }}
+          restore-keys: ${{ steps.qemu-key.outputs.ccache-prefix }}
+
       - name: Bootstrap QEMU submodule
+        if: steps.qemu-bin.outputs.cache-hit != 'true'
         run: ./scripts/bootstrap.sh
 
       - name: Integrate device models
+        if: steps.qemu-bin.outputs.cache-hit != 'true'
         run: ./scripts/integrate.sh
 
       - name: Build
-        run: ./scripts/build.sh
+        if: steps.qemu-bin.outputs.cache-hit != 'true'
+        env:
+          CC: ccache cc
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_BASEDIR: ${{ github.workspace }}
+          CCACHE_MAXSIZE: 600M
+        run: |
+          ccache --zero-stats
+          ./scripts/build.sh
+          ccache --show-stats
+
+      - name: Save the QEMU build
+        if: steps.qemu-bin.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: qemu/build/qemu-system-arm
+          key: ${{ steps.qemu-key.outputs.bin-key }}
+
+      - name: Save the compiler cache
+        if: steps.qemu-bin.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ${{ steps.qemu-key.outputs.ccache-prefix }}${{ github.run_id }}
 
       - name: Fetch firmware and build the SD image
         uses: ./.github/actions/test-assets
@@ -132,17 +203,85 @@ jobs:
             mingw-w64-x86_64-SDL2
             mingw-w64-x86_64-libpng
             mingw-w64-x86_64-zstd
+            mingw-w64-x86_64-ccache
             dosfstools
             mingw-w64-x86_64-mtools
 
+      # Reuse the emulator when nothing that feeds its build has changed: the
+      # pinned QEMU commit, our device models, patches and build scripts, and
+      # the installed toolchain/library versions. On an exact hit the QEMU
+      # checkout and build are skipped (run.sh and the tests need only the
+      # binary). On a miss, ccache keeps the rebuild incremental: a restored
+      # ninja tree would not, as a fresh checkout gives every source file a new
+      # mtime. Saving right after the build means a later test failure still
+      # leaves the binary cached for the re-run.
+      - name: Fingerprint the QEMU build inputs
+        id: qemu-key
+        env:
+          INPUTS_HASH: ${{ hashFiles('src/**', 'qemu-patches/**', 'scripts/bootstrap.sh', 'scripts/integrate.sh', 'scripts/build.sh', 'scripts/common.sh', '.gitmodules') }}
+        run: |
+          mkdir -p build
+          {
+            git rev-parse HEAD:qemu
+            pacman -Q mingw-w64-x86_64-gcc mingw-w64-x86_64-meson mingw-w64-x86_64-python \
+              mingw-w64-x86_64-pkgconf mingw-w64-x86_64-glib2 mingw-w64-x86_64-pixman \
+              mingw-w64-x86_64-gtk3 mingw-w64-x86_64-SDL2 mingw-w64-x86_64-libpng \
+              mingw-w64-x86_64-zstd mingw-w64-x86_64-ccache ninja
+          } > build/qemu-build-inputs.txt
+          cat build/qemu-build-inputs.txt
+          deps="$(git hash-object build/qemu-build-inputs.txt | cut -c1-16)"
+          prefix="${RUNNER_OS}-${RUNNER_ARCH}-${deps}"
+          echo "bin-key=qemu-bin-${prefix}-${INPUTS_HASH}" >> "$GITHUB_OUTPUT"
+          echo "ccache-prefix=ccache-${prefix}-" >> "$GITHUB_OUTPUT"
+
+      - name: Restore a QEMU build for these exact inputs
+        id: qemu-bin
+        uses: actions/cache/restore@v4
+        with:
+          path: qemu/build/qemu-system-arm.exe
+          key: ${{ steps.qemu-key.outputs.bin-key }}
+
+      - name: Restore the compiler cache
+        if: steps.qemu-bin.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ${{ steps.qemu-key.outputs.ccache-prefix }}${{ github.run_id }}
+          restore-keys: ${{ steps.qemu-key.outputs.ccache-prefix }}
+
       - name: Bootstrap QEMU submodule
+        if: steps.qemu-bin.outputs.cache-hit != 'true'
         run: ./scripts/bootstrap.sh
 
       - name: Integrate device models
+        if: steps.qemu-bin.outputs.cache-hit != 'true'
         run: ./scripts/integrate.sh
 
       - name: Build
-        run: ./scripts/build.sh
+        if: steps.qemu-bin.outputs.cache-hit != 'true'
+        env:
+          CC: ccache gcc
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_BASEDIR: ${{ github.workspace }}
+          CCACHE_MAXSIZE: 600M
+        run: |
+          ccache --zero-stats
+          ./scripts/build.sh
+          ccache --show-stats
+
+      - name: Save the QEMU build
+        if: steps.qemu-bin.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: qemu/build/qemu-system-arm.exe
+          key: ${{ steps.qemu-key.outputs.bin-key }}
+
+      - name: Save the compiler cache
+        if: steps.qemu-bin.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ${{ steps.qemu-key.outputs.ccache-prefix }}${{ github.run_id }}
 
       - name: Fetch firmware
         uses: ./.github/actions/test-assets
