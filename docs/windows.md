@@ -14,7 +14,7 @@ Windows `qemu-system-arm.exe` with a native GUI window.
 ## Installer (no MSYS2 needed)
 
 Tagged releases publish a `DelugEmu-windows-*.msi` installer on the
-[Releases page](https://github.com/gramster/delugemu/releases). It installs
+[Releases page](https://github.com/SynthstromAudible/delugemu/releases). It installs
 per-user (no admin prompt) into `%LOCALAPPDATA%\Programs\DelugEmu` and creates
 a **DelugEmu** Start Menu group with the app plus shortcuts to the **SD Card
 Folder**, **Help**, and the **Repository**. The installed app keeps its state

@@ -106,9 +106,15 @@ See [docs/architecture.md](docs/architecture.md) for details.
 
 If you just want to run firmware without setting up a build toolchain, grab a
 prebuilt bundle for your OS from the
-[Releases](https://github.com/gramster/delugemu/releases) page. Each bundle is
+[Releases](https://github.com/SynthstromAudible/delugemu/releases) page. Each bundle is
 self-contained — the required libraries are vendored alongside the binary — so
 no Homebrew / QEMU / MSYS2 install is needed.
+
+Versioned releases (`v*` tags) are the stable downloads. For the latest `main`,
+use the [**Nightly build**](https://github.com/SynthstromAudible/delugemu/releases/tag/nightly)
+prerelease: it is rebuilt every night that `main` has changed (same bundles,
+same file names, version shown as `nightly-YYYYMMDD-<commit>`), so it picks up
+fixes before the next release but may also carry regressions.
 
 **macOS** (`DelugEmu-macos-<arch>.dmg`):
 

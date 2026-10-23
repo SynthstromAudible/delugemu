@@ -51,6 +51,7 @@ printf '  booting with USB-MIDI device attached for %ss...\n' "${RUN_SECONDS}"
 # RZA1L_USB_DEBUG makes the model trace control-transfer milestones to stderr;
 # -d int -D captures the exception stream for the abort/IRQ assertions.
 RZA1L_USB_DEBUG=1 "${BIN}" -M deluge -kernel "${FIRMWARE}" -nographic \
+    -audiodev none,id=deluge0 -global rza1l-ssif.audiodev=deluge0 \
     -global rza1l-usb.midi=on -d int -D "${INT_LOG}" >/dev/null 2>"${DBG_LOG}" &
 pid=$!
 sleep "${RUN_SECONDS}"
