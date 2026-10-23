@@ -3,10 +3,13 @@
 #
 # Automated pad-click input test.
 #
-# Starts the Deluge emulator with a QMP socket, injects absolute-pointer and
-# left-button events via a single persistent QMP connection to simulate clicking
-# six pads, and verifies the input handler and PIC both logged the expected
-# events.
+# Launches a headless emulator through the `delugemu` Python package, taps a
+# handful of pads with DelugeSession.pad() (QMP absolute-pointer + left-button
+# events at the geometry the emulator itself hit-tests against), and verifies
+# from the input/PIC trace that each click hit the intended pad and was
+# delivered to the firmware as a press + release.
+#
+# Skips cleanly (exit 0) when no firmware is available, like tests/scenario.sh.
 #
 # Usage:
 #   ./tests/pad-click.sh
@@ -15,145 +18,80 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN="${REPO_ROOT}/qemu/build/qemu-system-arm"
-
-QMP_SOCK="/tmp/deluge_pad_click_qmp.sock"
-TRACE_FILE="/tmp/deluge_pad_click_trace.log"
+case "$(uname -s 2>/dev/null || echo unknown)" in
+    MINGW*|MSYS*|CYGWIN*) EXE_SUFFIX=".exe" ;;
+    *)                    EXE_SUFFIX="" ;;
+esac
+BIN="${REPO_ROOT}/qemu/build/qemu-system-arm${EXE_SUFFIX}"
 
 BOOT_SECONDS="${BOOT_SECONDS:-12}"
+RUN_LOG="${TMPDIR:-/tmp}/deluge_pad_click_run.log"
 
 fail() { printf 'PAD-CLICK FAIL: %s\n' "$*" >&2; exit 1; }
 skip() { printf 'PAD-CLICK SKIP: %s\n' "$*"; exit 0; }
 
-[ -x "${BIN}" ] || fail "qemu-system-arm not built"
+[ -x "${BIN}" ] || fail "qemu-system-arm not built at ${BIN} (run scripts/build.sh)"
+command -v python3 >/dev/null 2>&1 || skip "python3 not available"
 
-FIRMWARE="${DELUGE_FIRMWARE:-}"
-if [ -z "${FIRMWARE}" ]; then
-    for cand in "${REPO_ROOT}/firmware2/deluge.elf" "${REPO_ROOT}/firmware/deluge.elf"; do
-        [ -f "${cand}" ] && FIRMWARE="${cand}" && break
-    done
+# Resolve firmware the same way run.sh does, to decide up front whether to run.
+FIRMWARE="${DELUGEMU_FIRMWARE:-${DELUGE_FIRMWARE:-}}"
+FIRMWARE_DIR="${DELUGEMU_FIRMWARE_DIR:-${REPO_ROOT}/firmware}"
+if [ -z "${FIRMWARE}" ] && [ -d "${FIRMWARE_DIR}" ]; then
+    FIRMWARE="$(find "${FIRMWARE_DIR}" -type f -iname '*.bin' 2>/dev/null \
+                | LC_ALL=C sort | head -n1 || true)"
 fi
 [ -n "${FIRMWARE}" ] && [ -f "${FIRMWARE}" ] \
     || skip "no firmware image found (set DELUGE_FIRMWARE=path to run)"
 
-SD_ARGS=()
-for cand in "${REPO_ROOT}/build/deluge_sd.img"; do
-    [ -f "${cand}" ] && SD_ARGS=(-drive "if=sd,format=raw,file=${cand}") && break
-done
+printf '  firmware=%s, waiting %ss for boot...\n' "${FIRMWARE}" "${BOOT_SECONDS}"
 
-rm -f "${QMP_SOCK}" "${TRACE_FILE}"
+PYTHONPATH="${REPO_ROOT}/pylib" python3 - "${FIRMWARE}" "${BOOT_SECONDS}" "${RUN_LOG}" << 'PYEOF'
+import re, sys
 
-# Start QEMU with a display console so QMP input-send-event has a console to route to.
-"${BIN}" \
-    -M deluge \
-    -kernel "${FIRMWARE}" \
-    "${SD_ARGS[@]+"${SD_ARGS[@]}"}" \
-    -display cocoa,zoom-to-fit=off,show-cursor=on \
-    -serial mon:stdio \
-    -qmp "unix:${QMP_SOCK},server,nowait" \
-    >/dev/null 2>"${TRACE_FILE}" &
-QEMU_PID=$!
-printf '  started qemu pid=%d, waiting %ss for boot...\n' "${QEMU_PID}" "${BOOT_SECONDS}"
+from delugemu import DelugeSession
 
-cleanup() {
-    kill -KILL "${QEMU_PID}" 2>/dev/null || true
-    wait "${QEMU_PID}" 2>/dev/null || true
-    rm -f "${QMP_SOCK}"
-}
-trap cleanup EXIT
+firmware, boot_wait, run_log = sys.argv[1], float(sys.argv[2]), sys.argv[3]
 
-sleep "${BOOT_SECONDS}"
-kill -0 "${QEMU_PID}" 2>/dev/null || fail "qemu exited before we could inject events"
+# (col, row) in delugemu coordinates: row 0 is the bottom row, columns 16/17
+# are the sidebar.
+pads = [(0, 7), (2, 7), (0, 5), (4, 5), (3, 2), (7, 1), (15, 0), (16, 3)]
 
-for i in $(seq 1 20); do
-    [ -S "${QMP_SOCK}" ] && break
-    sleep 0.2
-done
-[ -S "${QMP_SOCK}" ] || fail "QMP socket never appeared"
+# The input/PIC tracing we assert on is opt-in (it's costly on hot guest paths).
+with DelugeSession.launch(firmware=firmware, boot_wait=boot_wait, run_log=run_log,
+                          env={"DELUGE_INPUT_DEBUG": "1",
+                               "DELUGE_PIC_DEBUG": "1"}) as dz:
+    for x, y in pads:
+        print(f"  tapping pad({x},{y})")
+        dz.pad(x, y)
+        dz.wait(0.2)
+    dz.wait(0.5)
 
-# Inject 6 pad clicks over a single persistent Python QMP connection and verify.
-python3 - "${QMP_SOCK}" "${TRACE_FILE}" << 'PYEOF'
-import sys, socket, json, time
-
-sock_path  = sys.argv[1]
-trace_file = sys.argv[2]
-
-W, H    = 2256, 1584
-ABS_MAX = 0x7fff
-
-def to_abs(sx, sy):
-    return round(sx * ABS_MAX / (W - 1)), round(sy * ABS_MAX / (H - 1))
-
-# Pad centres: X = 98 + col*119, Y = 632 + row*119
-pads = [
-    (0, 0, "pad(0,0)"), (2, 0, "pad(2,0)"), (0, 2, "pad(0,2)"),
-    (4, 2, "pad(4,2)"), (3, 5, "pad(3,5)"), (7, 6, "pad(7,6)"),
-]
-
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.connect(sock_path)
-s.settimeout(10)
-
-def recv_line():
-    buf = b""
-    while True:
-        c = s.recv(1)
-        if not c:
-            break
-        buf += c
-        if c == b"\n":
-            break
-    return buf.decode().strip()
-
-def send_cmd(obj):
-    s.sendall((json.dumps(obj) + "\n").encode())
-    return recv_line()
-
-recv_line()  # greeting
-send_cmd({"execute": "qmp_capabilities"})
-
-for col, row, label in pads:
-    sx = 98  + col * 119
-    sy = 632 + row * 119
-    ax, ay = to_abs(sx, sy)
-    print(f"  injecting click: {label} skin=({sx},{sy}) abs=({ax},{ay})")
-    r = send_cmd({"execute": "input-send-event", "arguments": {"events": [
-        {"type": "abs", "data": {"axis": "x", "value": ax}},
-        {"type": "abs", "data": {"axis": "y", "value": ay}},
-        {"type": "btn", "data": {"down": True,  "button": "left"}},
-        {"type": "btn", "data": {"down": False, "button": "left"}},
-    ]}})
-    if "error" in r:
-        print(f"  QMP error for {label}: {r}", file=sys.stderr)
-    time.sleep(0.35)
-
-s.close()
-time.sleep(0.5)
-
-with open(trace_file) as f:
+with open(run_log, errors="replace") as f:
     lines = f.readlines()
 
-taps  = sum(1 for l in lines if "deluge_input: tap "     in l)
-hits  = sum(1 for l in lines if "deluge_input: tap hit"  in l)
-miss  = sum(1 for l in lines if "deluge_input: tap miss" in l)
-pic_e = sum(1 for l in lines if "deluge_pic: send_event" in l)
-pic_c = sum(1 for l in lines if "deluge_pic: SET_COLOUR" in l)
+presses  = sum(1 for l in lines if "deluge_input: pointer press at" in l)
+hit_pads = [tuple(map(int, m.groups())) for l in lines
+            for m in [re.search(r"deluge_input: press hit pad \((\d+),(\d+)\)", l)] if m]
+miss     = sum(1 for l in lines if "deluge_input: press miss" in l)
+pic_down = sum(1 for l in lines if re.search(r"deluge_pic: send_event .*pressed=1", l))
+pic_up   = sum(1 for l in lines if re.search(r"deluge_pic: send_event .*pressed=0", l))
 
-print(f"  taps={taps} hits={hits} misses={miss} pic_events={pic_e} set_colour={pic_c}")
+n = len(pads)
+print(f"  presses={presses} hits={len(hit_pads)} misses={miss} "
+      f"pic_press={pic_down} pic_release={pic_up}")
 for l in lines:
-    if any(t in l for t in ["deluge_input: tap", "deluge_pic: send_event", "deluge_pic: SET_COLOUR"]):
+    if "deluge_input: p" in l or "deluge_pic: send_event" in l:
         print(" ", l.rstrip())
 
 ok = True
-if taps < 6:
-    print(f"FAIL: only {taps}/6 taps reached handler", file=sys.stderr); ok = False
-if hits < 6:
-    print(f"FAIL: only {hits}/6 hits (miss={miss})", file=sys.stderr); ok = False
-if pic_e < 12:
-    print(f"FAIL: only {pic_e}/12 PIC events (expected press+release x6)", file=sys.stderr); ok = False
-if ok:
-    print("PAD-CLICK OK: all 6 clicks registered and delivered to firmware")
-    sys.exit(0)
-else:
+if presses != n:
+    print(f"FAIL: {presses}/{n} presses reached the input handler", file=sys.stderr); ok = False
+if hit_pads != pads:
+    print(f"FAIL: hit pads {hit_pads}, expected {pads} (misses={miss})", file=sys.stderr); ok = False
+if pic_down != n or pic_up != n:
+    print(f"FAIL: PIC saw {pic_down} press / {pic_up} release events, expected {n} each",
+          file=sys.stderr); ok = False
+if not ok:
     sys.exit(1)
+print(f"PAD-CLICK OK: all {n} clicks hit the intended pad and reached the firmware")
 PYEOF
