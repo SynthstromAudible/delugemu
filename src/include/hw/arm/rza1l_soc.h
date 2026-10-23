@@ -168,6 +168,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RzA1lSocState, RZA1L_SOC)
 #define RZA1L_SDHI_INTC_ID   305
 #define RZA1L_SDHI_SPI       (RZA1L_SDHI_INTC_ID - 32)
 
+/* DMA channel the firmware moves SD card data on (SD1_DMA_CHANNEL). */
+#define RZA1L_SD_DMA_CH      2
 /* DMA channel the firmware reads PIC input from (PIC_RX_DMA_CHANNEL). */
 #define RZA1L_PIC_RX_DMA_CH  12
 /* DMA channel the firmware reads MIDI input from (MIDI_RX_DMA_CHANNEL). */

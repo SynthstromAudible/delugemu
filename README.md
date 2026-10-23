@@ -10,8 +10,47 @@ The goal is to boot unmodified Deluge firmware (the open-source
 fully software-simulated environment so that development, debugging, automated
 testing and CI can happen without physical hardware.
 
-> Status: **essentially complete**. USB device/host support is not wired in to the host due to technical complexity. Because the OLED display can emulate a 7-seg, the 7-seg device is just a stub. Outgoing MIDI works well; triggering notes on the Deluge emulator can be a bit laggy due to an intermediate audio buffer; you can trade that off for a small amount of audio artifacts; see the --audio-buffer command-line option. Under heavy synthesis load the emulated Cortex-A9 can't always render audio at real time (a TCG throughput limit, not a buffering one), which can cause occasional breakup during dense playback; the render-head clamp (`run.sh --tx-render-head`, **on by default** as `auto`: exact from an .elf's symbol table, otherwise a guest-RAM scan whose lock is logged and cross-checkable via `DELUGEMU_RH_VERIFY_AUTO=1`) keeps that graceful (brief gaps rather than distortion), and `run.sh --icount` eliminates the artifacts entirely at the cost of running slower-than-real-time under load (best for offline capture, not live play).
+## AI disclosure
 
+This is mostly vibes with some oversight. The goal is to reproduce bugs and speed up development so that's probably fine
+
+## Status
+
+Functional, accuracy of peripherals (cv/oled bus contention, sdram bus contention etc.) in progress. SD card access is timed like a real card (bus clock, access latency, write busy — see [docs/register-coverage.md](docs/register-coverage.md#sdhi--sd-host--rza1l-sdhi)); most other peripherals still respond instantly.
+
+## Testing Deluge issues programmatically (agents: read this first)
+
+**Use the Python interface, [`pylib/delugemu`](pylib/README.md), for any
+programmatic interaction with the emulator** — reproducing a bug, loading a
+song, pressing controls, reading the OLED/LEDs/pads, checking for crashes. Do not
+hand-roll QMP key sequences or scrape logs: `DelugeSession` drives the same
+firmware input paths a real press does and reads back deterministic display
+state. Full API: [docs/scripting.md](docs/scripting.md).
+
+```python
+import sys; sys.path.insert(0, "pylib")        # or: pip install -e pylib
+from delugemu import DelugeSession, Control
+
+with DelugeSession.launch(firmware="path/to/deluge.elf", sd="build/deluge_sd.img",
+                          int_log="/tmp/int.log", boot_wait=8.0) as dz:
+    dz.load_song("/SONGS/problem_songs/Ring 7.XML")   # navigates the browser for you
+    dz.press(Control.PLAY)
+    dz.wait(10)
+    dz.assert_no_aborts()                              # no Data/Prefetch Abort
+    print(dz.oled_text())                              # OLED as #/. rows
+```
+
+- `load_song(path)` opens the song browser and walks the path by typing each
+  name on the pad-grid QWERTY keyboard (`type_text`), the way a user would.
+- `wait_sd_idle()` waits for a load to finish; `read_leds()`, `read_pads()`,
+  `read_oled()` read state; `press`/`turn`/`pad`/`key` give input.
+- The default SD image (`build/deluge_sd.img`, built from `./sdcard` by
+  `scripts/mksd.sh`) carries `SONGS/problem_songs/` — songs from real bug
+  reports (load crashes, voice drops, noise bugs) to reproduce against.
+  **Work on a copy** if the firmware will write (saving, settings).
+- `DELUGEMU_SDHI_STATS=1` / `DELUGEMU_SSIF_STATS=1` print per-second SD and
+  audio-throughput stats; `--icount` makes runs deterministic. See
+  [docs/firmware-perf.md](docs/firmware-perf.md).
 
 ## Target hardware
 

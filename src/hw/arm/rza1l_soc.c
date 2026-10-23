@@ -526,6 +526,17 @@ static void rza1l_soc_realize(DeviceState *dev, Error **errp)
                        qdev_get_gpio_in(DEVICE(&s->gic), RZA1L_SDHI_SPI));
 
     /*
+     * The SD data DMA channel is paced by the SDHI's buffer-ready request, so
+     * a multi-block transfer takes as long as the modelled card and bus do
+     * rather than completing the moment the firmware enables the channel.
+     */
+    rza1l_dmac_register_dreq(&s->dmac, RZA1L_SD_DMA_CH);
+    qdev_connect_gpio_out_named(DEVICE(&s->sdhi), RZA1L_SDHI_DREQ, 0,
+                                qdev_get_gpio_in_named(DEVICE(&s->dmac),
+                                                       RZA1L_DMAC_DREQ,
+                                                       RZA1L_SD_DMA_CH));
+
+    /*
      * ADC (supply-voltage sense) and RTC (wall clock) stubs. The firmware
      * polls the ADC for the battery LED; the RTC is presented for completeness.
      * Both overlay their respective I/O catch-all so accesses get plausible

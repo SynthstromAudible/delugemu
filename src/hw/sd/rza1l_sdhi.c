@@ -18,6 +18,21 @@
  * the controller also exposes the data FIFO at that single offset while a DMA
  * transfer is in progress; see the SD_CMD handling in the read/write paths.
  *
+ * Timing. SD access is the Deluge's usual bottleneck (sample streaming), so the
+ * controller models how long the bus is busy rather than completing everything
+ * instantly. Every command, response and data block takes its bit count in SD
+ * clocks, at the clock the firmware programs into SD_CLK_CTRL (IMCLK = P1 =
+ * 66.67 MHz, divided) and the bus width in SD_OPTION; a flash read (CMD17/18)
+ * first waits the card's access latency, and a flash write (CMD24/25) adds the
+ * card's per-block programming time and a final busy period. The buffer holds
+ * one block, as on the hardware: the next block only crosses the bus once the
+ * previous one has been drained (or, writing, once the card is ready again), so
+ * DMA is paced by a level-sensitive request line (`dreq`) that is high while a
+ * block is waiting. All delays run on the virtual clock, so they are
+ * deterministic under -icount. The latencies are properties (timing, and
+ * read-latency-us / write-block-us / write-busy-us); timing=off restores the
+ * old instant behaviour.
+ *
  * Copyright (c) 2026 delugemu contributors
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -28,9 +43,11 @@
 #include "qemu/bswap.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/sd/sd.h"
 #include "migration/vmstate.h"
 #include "hw/sd/rza1l_sdhi.h"
+#include "hw/misc/deluge_vcpu_tick.h"
 
 /* Register offsets (16-bit registers, natural byte offsets). */
 #define SD_CMD          0x00
@@ -93,6 +110,49 @@
 /* CC_EXT_MODE bits. */
 #define CC_EXT_MODE_DMASDRW 0x0002  /* SD buffer accesses are driven by DMA */
 
+/* SD_CLK_CTRL bits. */
+#define SD_CLK_CTRL_DIV_MASK 0x00ff
+#define SD_CLK_CTRL_DIV_1    0x00ff  /* SDCLK = IMCLK */
+
+/* SD_OPTION bits. */
+#define SD_OPTION_WIDTH_1BIT 0x8000  /* data bus is 1 bit wide (else 4) */
+
+/* SDHI module clock (IMCLK = P1 clock) the SD clock is divided from. */
+#define SDHI_IMCLK_HZ 66666667u
+
+/*
+ * SD bus framing, in SD clocks. A command is 48 bits; the card answers after
+ * NCR (2..64) clocks with a 48-bit (R1/R3/R6/R7) or 136-bit (R2) response, and
+ * a command with no response still needs NCC (8) clocks before the next. A data
+ * block is a start bit, the data on each line, a CRC16 per line and an end bit.
+ */
+#define SD_CMD_BITS      48
+#define SD_NCR_CLOCKS    8
+#define SD_NCR_MAX       64
+#define SD_RESP_BITS     48
+#define SD_RESP_R2_BITS  136
+#define SD_BLOCK_FRAMING (1 + 16 + 1)
+
+/*
+ * Controller phases. Each non-idle phase ends when s->timer fires (or at once
+ * with timing off); see rza1l_sdhi_advance.
+ */
+enum {
+    SDHI_IDLE,        /* bus free */
+    SDHI_CMD,         /* command + response on the CMD line */
+    SDHI_READ_WAIT,   /* card fetching / sending the next block */
+    SDHI_READ_BUF,    /* block in the buffer, waiting for the host to drain it */
+    SDHI_WRITE_BUF,   /* buffer free, waiting for the host to fill it */
+    SDHI_WRITE_WAIT,  /* block crossing the bus, then the card programming it */
+    SDHI_END,         /* auto CMD12 after the last block */
+};
+
+/* Standard SD commands whose data comes from / goes to the flash array. */
+#define SD_CMD_READ_SINGLE   17
+#define SD_CMD_READ_MULTIPLE 18
+#define SD_CMD_WRITE_SINGLE  24
+#define SD_CMD_WRITE_MULTIPLE 25
+
 /*
  * Standard SD/MMC commands that complete without any response. For these a
  * zero-length result from the card is normal and must not be reported as a
@@ -116,26 +176,177 @@ static void rza1l_sdhi_update_irq(RzA1lSdhiState *s)
     qemu_set_irq(s->irq, (i1 || i2) ? 1 : 0);
 }
 
+/* ---- DELUGEMU_SDHI_STATS probe ---- */
+
+static bool rza1l_sdhi_stats_enabled(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        v = getenv("DELUGEMU_SDHI_STATS") != NULL;
+    }
+    return v;
+}
+
+/*
+ * Once per virtual second, report how hard the SD bus worked: commands issued,
+ * data moved and the fraction of the second the controller was busy (command,
+ * card latency, transfer or programming). A busy figure near 100% means the
+ * firmware is SD-bound.
+ */
+static void rza1l_sdhi_stats_tick(void *opaque)
+{
+    RzA1lSdhiState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t busy = s->stats_busy_ns;
+
+    if (s->phase != SDHI_IDLE) {
+        busy += now - s->busy_since_ns;
+        s->busy_since_ns = now;
+    }
+    if (s->stats_cmds) {
+        fprintf(stderr, "sdhi: t=%.1fs cmds=%u read=%uKiB write=%uKiB "
+                "busy=%.1f%%\n", now / 1e9, s->stats_cmds,
+                s->stats_rd_blocks / 2, s->stats_wr_blocks / 2,
+                busy * 100.0 / NANOSECONDS_PER_SECOND);
+    }
+    s->stats_busy_ns = 0;
+    s->stats_cmds = 0;
+    s->stats_rd_blocks = 0;
+    s->stats_wr_blocks = 0;
+    timer_mod(s->stats_timer, now + NANOSECONDS_PER_SECOND);
+}
+
+/* ---- Bus timing ---- */
+
+/* Duration of `clocks` SD clock cycles at the programmed divider. */
+static int64_t rza1l_sdhi_clocks_ns(RzA1lSdhiState *s, uint64_t clocks)
+{
+    unsigned div = s->clk_ctrl & SD_CLK_CTRL_DIV_MASK;
+
+    /* DIV field: 0x00 = /2, single bit 2^n = /(4 << n), 0xFF = /1. */
+    if (div == SD_CLK_CTRL_DIV_1) {
+        div = 1;
+    } else if (div == 0) {
+        div = 2;
+    } else {
+        div = 4 * div;
+    }
+    return muldiv64(clocks * div, NANOSECONDS_PER_SECOND, SDHI_IMCLK_HZ);
+}
+
+/* Time one data block of s->blocklen bytes spends on the DAT lines. */
+static int64_t rza1l_sdhi_block_ns(RzA1lSdhiState *s)
+{
+    unsigned width = (s->option & SD_OPTION_WIDTH_1BIT) ? 1 : 4;
+
+    return rza1l_sdhi_clocks_ns(s, (uint64_t)s->blocklen * 8 / width +
+                                   SD_BLOCK_FRAMING);
+}
+
+/* A full no-data command with an R1 response, as for the auto CMD12. */
+static int64_t rza1l_sdhi_cmd12_ns(RzA1lSdhiState *s)
+{
+    return rza1l_sdhi_clocks_ns(s, SD_CMD_BITS + SD_NCR_CLOCKS + SD_RESP_BITS);
+}
+
+static void rza1l_sdhi_set_phase(RzA1lSdhiState *s, uint8_t phase)
+{
+    if (rza1l_sdhi_stats_enabled() && (s->phase == SDHI_IDLE) !=
+                                      (phase == SDHI_IDLE)) {
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+        if (phase == SDHI_IDLE) {
+            s->stats_busy_ns += now - s->busy_since_ns;
+        } else {
+            s->busy_since_ns = now;
+        }
+    }
+    s->phase = phase;
+}
+
+static void rza1l_sdhi_advance(RzA1lSdhiState *s);
+
+/*
+ * End the current phase after `ns` of bus activity. With timing disabled every
+ * phase ends immediately, which reproduces the original instant model.
+ */
+static void rza1l_sdhi_schedule(RzA1lSdhiState *s, int64_t ns)
+{
+    if (!s->timing || ns <= 0) {
+        rza1l_sdhi_advance(s);
+        return;
+    }
+    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ns);
+}
+
+static void rza1l_sdhi_timer_cb(void *opaque)
+{
+    rza1l_sdhi_advance(opaque);
+}
+
+/*
+ * vCPU-side catch-up (see deluge_vcpu_tick.h): end the current phase as soon
+ * as its deadline has passed, rather than when the main loop next wakes, which
+ * without -icount can be up to a millisecond late on every phase.
+ */
+static void rza1l_sdhi_vcpu_tick(void *opaque)
+{
+    RzA1lSdhiState *s = opaque;
+
+    if (timer_pending(s->timer) &&
+        timer_expired(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL))) {
+        timer_del(s->timer);
+        rza1l_sdhi_advance(s);
+    }
+}
+
+static void rza1l_sdhi_update_dreq(RzA1lSdhiState *s)
+{
+    /*
+     * The DMAC request is level-detected: hold it while a block is waiting to
+     * be read from, or room is waiting to be written to, the buffer — but only
+     * once the firmware has handed buffer accesses to DMA.
+     */
+    qemu_set_irq(s->dreq, s->buf_ready &&
+                          (s->cc_ext_mode & CC_EXT_MODE_DMASDRW));
+}
+
+/* Drop any in-flight transfer (soft reset or a new command). */
+static void rza1l_sdhi_abort(RzA1lSdhiState *s)
+{
+    timer_del(s->timer);
+    rza1l_sdhi_set_phase(s, SDHI_IDLE);
+    s->data_dir = 0;
+    s->datacnt = 0;
+    s->blockcnt = 0;
+    s->buf_ready = false;
+    s->info2 &= ~(INFO2_RE | INFO2_WE);
+    rza1l_sdhi_update_dreq(s);
+}
+
 static void rza1l_sdhi_command(RzA1lSdhiState *s, uint16_t cmdreg)
 {
     SDRequest req;
     uint8_t rsp[16];
     size_t rlen;
+    uint64_t clocks;
 
     req.cmd = cmdreg & SD_CMD_INDEX_MASK;
     req.arg = ((uint32_t)s->arg1 << 16) | s->arg0;
     req.crc = 0;
 
     /* Clear status from any previous command. */
+    rza1l_sdhi_abort(s);
     s->info1 &= ~(INFO1_RESP | INFO1_DATA_TRNS);
     s->info2 &= ~(INFO2_ERR_MASK | INFO2_RE | INFO2_WE);
     memset(s->resp, 0, sizeof(s->resp));
-    s->data_dir = 0;
-    s->datacnt = 0;
-    s->blockcnt = 0;
+    s->pending_info2 = 0;
+    s->stats_cmds++;
+    s->total_cmds++;
 
     rlen = sdbus_do_command(&s->sdbus, &req, rsp, sizeof(rsp));
 
+    clocks = SD_CMD_BITS + SD_NCR_CLOCKS;
     if (rlen == 0) {
         /*
          * No response. For commands that genuinely return none this is the
@@ -143,13 +354,15 @@ static void rza1l_sdhi_command(RzA1lSdhiState *s, uint16_t cmdreg)
          * the controller reports as a response timeout.
          */
         if (!rza1l_sdhi_cmd_has_no_response(req.cmd)) {
-            s->info2 |= INFO2_ERR6;
+            s->pending_info2 |= INFO2_ERR6;
+            clocks = SD_CMD_BITS + SD_NCR_MAX;
         }
     } else if (rlen == 4) {
         /* Short response (R1/R1b/R3/R6/R7): RESP1:RESP0 = 32-bit content. */
         uint32_t v = ldl_be_p(&rsp[0]);
         s->resp[0] = v & 0xffff;
         s->resp[1] = (v >> 16) & 0xffff;
+        clocks += SD_RESP_BITS;
     } else if (rlen == 16) {
         /*
          * Long response (R2, CID/CSD). The SDHI exposes the 136-bit response
@@ -168,10 +381,8 @@ static void rza1l_sdhi_command(RzA1lSdhiState *s, uint16_t cmdreg)
         for (k = 0; k < 8; k++) {
             s->resp[7 - k] = ((uint16_t)frame[2 * k] << 8) | frame[2 * k + 1];
         }
+        clocks += SD_RESP_R2_BITS;
     }
-
-    /* Response phase complete. */
-    s->info1 |= INFO1_RESP;
 
     /*
      * Determine whether a data phase follows from the card's resulting state,
@@ -188,49 +399,145 @@ static void rza1l_sdhi_command(RzA1lSdhiState *s, uint16_t cmdreg)
      */
     if (sdbus_data_ready(&s->sdbus)) {
         s->data_dir = 1;
-        s->blocklen = s->size ? s->size : 512;
-        s->blockcnt = (s->stop & SD_STOP_SEC_ENABLE) && s->seccnt ?
-                      s->seccnt : 1;
-        s->datacnt = s->blocklen;
-        s->info2 |= INFO2_RE;
     } else if (sdbus_receive_ready(&s->sdbus)) {
         s->data_dir = 2;
+    }
+    if (s->data_dir) {
         s->blocklen = s->size ? s->size : 512;
         s->blockcnt = (s->stop & SD_STOP_SEC_ENABLE) && s->seccnt ?
                       s->seccnt : 1;
         s->datacnt = s->blocklen;
-        s->info2 |= INFO2_WE;
     }
 
+    /* The response arrives once the command has crossed the bus. */
+    rza1l_sdhi_set_phase(s, SDHI_CMD);
+    rza1l_sdhi_schedule(s, rza1l_sdhi_clocks_ns(s, clocks));
+}
+
+/*
+ * Data phase finished (all blocks moved, auto CMD12 issued): raise access end
+ * and free the bus.
+ */
+static void rza1l_sdhi_finish(RzA1lSdhiState *s)
+{
+    /*
+     * A block-count-enabled (SD_STOP.SEC) transfer is an open-ended
+     * CMD18/CMD25 sequence: the card keeps streaming until it is told to
+     * stop. The hardware automatically issues CMD12 once SD_SECCNT blocks
+     * have moved, returning the card to the transfer state. Mirror that so
+     * the subsequent CMD13 status poll sees STATE_TRAN rather than a card
+     * still stuck in the data state (which the driver reports as an error).
+     */
+    if (s->stop & SD_STOP_SEC_ENABLE) {
+        SDRequest stop = { .cmd = 12, .arg = 0, .crc = 0 };
+        uint8_t rsp[16];
+
+        sdbus_do_command(&s->sdbus, &stop, rsp, sizeof(rsp));
+    }
+    s->info2 &= ~(INFO2_RE | INFO2_WE);
+    s->info1 |= INFO1_DATA_TRNS;
+    s->data_dir = 0;
+    rza1l_sdhi_set_phase(s, SDHI_IDLE);
+}
+
+/* The current phase's bus activity is over: move to the next phase. */
+static void rza1l_sdhi_advance(RzA1lSdhiState *s)
+{
+    uint8_t cmd = s->cmd & SD_CMD_INDEX_MASK;
+    bool flash = cmd == SD_CMD_READ_SINGLE || cmd == SD_CMD_READ_MULTIPLE;
+
+    switch (s->phase) {
+    case SDHI_CMD:
+        s->info1 |= INFO1_RESP;
+        s->info2 |= s->pending_info2;
+        if (s->data_dir == 1) {
+            /* The card fetches the first block from flash, then sends it. */
+            int64_t ns = rza1l_sdhi_block_ns(s);
+
+            if (flash) {
+                ns += (int64_t)s->read_latency_us * SCALE_US;
+            }
+            rza1l_sdhi_set_phase(s, SDHI_READ_WAIT);
+            rza1l_sdhi_schedule(s, ns);
+        } else if (s->data_dir == 2) {
+            /* The (empty) buffer is ready to take the first block. */
+            rza1l_sdhi_set_phase(s, SDHI_WRITE_BUF);
+            s->buf_ready = true;
+            s->info2 |= INFO2_WE;
+        } else {
+            rza1l_sdhi_set_phase(s, SDHI_IDLE);
+        }
+        break;
+    case SDHI_READ_WAIT:
+        rza1l_sdhi_set_phase(s, SDHI_READ_BUF);
+        s->buf_ready = true;
+        s->info2 |= INFO2_RE;
+        break;
+    case SDHI_WRITE_WAIT:
+        if (s->blockcnt > 0) {
+            rza1l_sdhi_set_phase(s, SDHI_WRITE_BUF);
+            s->buf_ready = true;
+            s->info2 |= INFO2_WE;
+        } else {
+            rza1l_sdhi_finish(s);
+        }
+        break;
+    case SDHI_END:
+        rza1l_sdhi_finish(s);
+        break;
+    default:
+        break;
+    }
+    rza1l_sdhi_update_dreq(s);
     rza1l_sdhi_update_irq(s);
 }
 
-static void rza1l_sdhi_data_block_done(RzA1lSdhiState *s, uint16_t ready_bit)
+/* The host has drained (read) or filled (write) the buffered block. */
+static void rza1l_sdhi_data_block_done(RzA1lSdhiState *s)
 {
+    uint8_t cmd = s->cmd & SD_CMD_INDEX_MASK;
+    bool flash = cmd == SD_CMD_WRITE_SINGLE || cmd == SD_CMD_WRITE_MULTIPLE;
+
+    s->buf_ready = false;
     if (s->blockcnt) {
         s->blockcnt--;
     }
-    if (s->blockcnt > 0) {
-        /* More blocks: keep the buffer-ready flag set for the next block. */
-        s->datacnt = s->blocklen;
-    } else {
-        s->info2 &= ~ready_bit;
-        s->info1 |= INFO1_DATA_TRNS;
-        s->data_dir = 0;
-        /*
-         * A block-count-enabled (SD_STOP.SEC) transfer is an open-ended
-         * CMD18/CMD25 sequence: the card keeps streaming until it is told to
-         * stop. The hardware automatically issues CMD12 once SD_SECCNT blocks
-         * have moved, returning the card to the transfer state. Mirror that so
-         * the subsequent CMD13 status poll sees STATE_TRAN rather than a card
-         * still stuck in the data state (which the driver reports as an error).
-         */
-        if (s->stop & SD_STOP_SEC_ENABLE) {
-            SDRequest stop = { .cmd = 12, .arg = 0, .crc = 0 };
-            uint8_t rsp[16];
+    s->datacnt = s->blocklen;
 
-            sdbus_do_command(&s->sdbus, &stop, rsp, sizeof(rsp));
+    if (s->data_dir == 1) {
+        s->stats_rd_blocks++;
+        if (s->blockcnt > 0) {
+            /* The card streams the next block straight after. */
+            rza1l_sdhi_set_phase(s, SDHI_READ_WAIT);
+            rza1l_sdhi_update_dreq(s);
+            rza1l_sdhi_schedule(s, rza1l_sdhi_block_ns(s));
+        } else {
+            rza1l_sdhi_set_phase(s, SDHI_END);
+            rza1l_sdhi_update_dreq(s);
+            rza1l_sdhi_schedule(s, (s->stop & SD_STOP_SEC_ENABLE) ?
+                                   rza1l_sdhi_cmd12_ns(s) : 0);
         }
+    } else {
+        /*
+         * The block crosses the bus, then the card programs it (busy on DAT0)
+         * before accepting the next. After the last block the card also
+         * finishes programming before access end.
+         */
+        int64_t ns = rza1l_sdhi_block_ns(s);
+
+        s->stats_wr_blocks++;
+        if (flash) {
+            ns += (int64_t)s->write_block_us * SCALE_US;
+            if (s->blockcnt == 0) {
+                ns += (int64_t)s->write_busy_us * SCALE_US;
+            }
+        }
+        if (s->blockcnt == 0 && (s->stop & SD_STOP_SEC_ENABLE)) {
+            ns += rza1l_sdhi_cmd12_ns(s);
+        }
+        rza1l_sdhi_set_phase(s, SDHI_WRITE_WAIT);
+        rza1l_sdhi_update_dreq(s);
+        rza1l_sdhi_schedule(s, ns);
     }
     rza1l_sdhi_update_irq(s);
 }
@@ -240,18 +547,17 @@ static uint32_t rza1l_sdhi_read_buf(RzA1lSdhiState *s, unsigned size)
     uint32_t val = 0;
     unsigned i;
 
-    if (s->data_dir != 1) {
+    /* Only a block that has fully arrived in the buffer can be read. */
+    if (s->phase != SDHI_READ_BUF) {
         return 0;
     }
-    for (i = 0; i < size; i++) {
+    for (i = 0; i < size && s->datacnt; i++) {
         uint8_t b = sdbus_read_byte(&s->sdbus);
         val |= (uint32_t)b << (8 * i);
-        if (s->datacnt) {
-            s->datacnt--;
-        }
+        s->datacnt--;
     }
     if (s->datacnt == 0) {
-        rza1l_sdhi_data_block_done(s, INFO2_RE);
+        rza1l_sdhi_data_block_done(s);
     }
     return val;
 }
@@ -260,23 +566,24 @@ static void rza1l_sdhi_write_buf(RzA1lSdhiState *s, uint32_t val, unsigned size)
 {
     unsigned i;
 
-    if (s->data_dir != 2) {
+    if (s->phase != SDHI_WRITE_BUF) {
         return;
     }
-    for (i = 0; i < size; i++) {
+    for (i = 0; i < size && s->datacnt; i++) {
         sdbus_write_byte(&s->sdbus, (val >> (8 * i)) & 0xff);
-        if (s->datacnt) {
-            s->datacnt--;
-        }
+        s->datacnt--;
     }
     if (s->datacnt == 0) {
-        rza1l_sdhi_data_block_done(s, INFO2_WE);
+        rza1l_sdhi_data_block_done(s);
     }
 }
 
 static uint64_t rza1l_sdhi_read(void *opaque, hwaddr offset, unsigned size)
 {
     RzA1lSdhiState *s = opaque;
+
+    /* A status poll should see a phase that has already ended as ended. */
+    rza1l_sdhi_vcpu_tick(s);
 
     /*
      * During a 64-byte DMA-driven read the DMAC pulls bytes from the register
@@ -320,8 +627,13 @@ static uint64_t rza1l_sdhi_read(void *opaque, hwaddr offset, unsigned size)
         return (s->info1 & ~(INFO1_CD_LEVEL | INFO1_DAT3_LEVEL)) |
                INFO1_WP_LEVEL;
     case SD_INFO2:
-        /* SCLKDIVEN is always reported set: the SD bus is never busy. */
-        return s->info2 | INFO2_SCLKDIVEN;
+        /*
+         * CBSY is set from command issue until the bus is free again (access
+         * end, for a data command). SCLKDIVEN reads clear while a command is on
+         * the CMD line, when the SD clock may not be changed.
+         */
+        return s->info2 | (s->phase != SDHI_IDLE ? INFO2_CBSY : 0) |
+               (s->phase != SDHI_CMD ? INFO2_SCLKDIVEN : 0);
     case SD_INFO1_MASK:
         return s->info1_mask;
     case SD_INFO2_MASK:
@@ -444,15 +756,13 @@ static void rza1l_sdhi_write(void *opaque, hwaddr offset, uint64_t value,
         break;
     case CC_EXT_MODE:
         s->cc_ext_mode = val;
+        rza1l_sdhi_update_dreq(s);
         break;
     case SOFT_RST:
         s->soft_rst = val;
         /* Asserting reset (bit 0 clear) aborts any in-flight transfer. */
         if (!(val & 0x0001)) {
-            s->data_dir = 0;
-            s->datacnt = 0;
-            s->blockcnt = 0;
-            s->info2 &= ~(INFO2_RE | INFO2_WE);
+            rza1l_sdhi_abort(s);
             rza1l_sdhi_update_irq(s);
         }
         break;
@@ -490,6 +800,26 @@ static void rza1l_sdhi_init(Object *obj)
                           TYPE_RZA1L_SDHI, RZA1L_SDHI_MMIO_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
+    qdev_init_gpio_out_named(DEVICE(s), &s->dreq, RZA1L_SDHI_DREQ, 1);
+
+    s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rza1l_sdhi_timer_cb, s);
+
+    object_property_add_uint64_ptr(obj, "dz-cmd-count", &s->total_cmds,
+                                   OBJ_PROP_FLAG_READ);
+}
+
+static void rza1l_sdhi_realize(DeviceState *dev, Error **errp)
+{
+    RzA1lSdhiState *s = RZA1L_SDHI(dev);
+
+    deluge_vcpu_tick_register(rza1l_sdhi_vcpu_tick, s);
+
+    if (rza1l_sdhi_stats_enabled() && !s->stats_timer) {
+        s->stats_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                      rza1l_sdhi_stats_tick, s);
+        timer_mod(s->stats_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                                  NANOSECONDS_PER_SECOND);
+    }
 }
 
 static void rza1l_sdhi_reset(DeviceState *dev)
@@ -518,18 +848,17 @@ static void rza1l_sdhi_reset(DeviceState *dev)
     s->cc_ext_mode = 0;
     s->soft_rst = 0;
     s->ext_swap = 0;
-    s->data_dir = 0;
     s->blocklen = 0;
-    s->blockcnt = 0;
-    s->datacnt = 0;
+    rza1l_sdhi_abort(s);
+    s->pending_info2 = 0;
 
     qemu_set_irq(s->irq, 0);
 }
 
 static const VMStateDescription vmstate_rza1l_sdhi = {
     .name = TYPE_RZA1L_SDHI,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT16(cmd, RzA1lSdhiState),
         VMSTATE_UINT16(arg0, RzA1lSdhiState),
@@ -556,8 +885,26 @@ static const VMStateDescription vmstate_rza1l_sdhi = {
         VMSTATE_UINT32(blocklen, RzA1lSdhiState),
         VMSTATE_UINT32(blockcnt, RzA1lSdhiState),
         VMSTATE_UINT32(datacnt, RzA1lSdhiState),
+        VMSTATE_TIMER_PTR(timer, RzA1lSdhiState),
+        VMSTATE_UINT8(phase, RzA1lSdhiState),
+        VMSTATE_BOOL(buf_ready, RzA1lSdhiState),
+        VMSTATE_UINT16(pending_info2, RzA1lSdhiState),
         VMSTATE_END_OF_LIST()
     }
+};
+
+/*
+ * Card timing defaults, typical of a class-10 SDHC card: ~300 us to fetch the
+ * first block of a read from flash; for writes ~20 us of programming per block
+ * of a multi-block write and ~1 ms of busy to commit the write at the end
+ * (small random writes, e.g. FAT updates, are dominated by the latter).
+ */
+static const Property rza1l_sdhi_props[] = {
+    DEFINE_PROP_BOOL("timing", RzA1lSdhiState, timing, true),
+    DEFINE_PROP_UINT32("read-latency-us", RzA1lSdhiState, read_latency_us,
+                       300),
+    DEFINE_PROP_UINT32("write-block-us", RzA1lSdhiState, write_block_us, 20),
+    DEFINE_PROP_UINT32("write-busy-us", RzA1lSdhiState, write_busy_us, 1000),
 };
 
 static void rza1l_sdhi_class_init(ObjectClass *klass, const void *data)
@@ -565,7 +912,9 @@ static void rza1l_sdhi_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     device_class_set_legacy_reset(dc, rza1l_sdhi_reset);
+    dc->realize = rza1l_sdhi_realize;
     dc->vmsd = &vmstate_rza1l_sdhi;
+    device_class_set_props(dc, rza1l_sdhi_props);
     dc->user_creatable = false;
 }
 

@@ -11,10 +11,14 @@
 
 #include "hw/core/sysbus.h"
 #include "hw/sd/sd.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
 
 #define TYPE_RZA1L_SDHI "rza1l-sdhi"
 OBJECT_DECLARE_SIMPLE_TYPE(RzA1lSdhiState, RZA1L_SDHI)
+
+/* Named GPIO output: the DMA request line, high while the buffer is ready. */
+#define RZA1L_SDHI_DREQ "dreq"
 
 /* MMIO window: registers span SD_CMD (0x00) .. EXT_SWAP (0xF0). */
 #define RZA1L_SDHI_MMIO_SIZE 0x100
@@ -62,6 +66,42 @@ struct RzA1lSdhiState {
     uint32_t blocklen;   /* bytes per block (from SD_SIZE) */
     uint32_t blockcnt;   /* blocks still to transfer (from SD_SECCNT) */
     uint32_t datacnt;    /* bytes left in the current block */
+
+    /*
+     * Bus timing model. Each command and data block occupies the SD bus for
+     * as long as it would on hardware at the programmed SD clock and bus
+     * width, plus the card's access latency (reads) and programming busy time
+     * (writes). `phase` is the step the controller is in; `timer` fires when
+     * that step's bus activity ends. `buf_ready` means the data buffer holds a
+     * block to read (or has room for one to write); it drives `dreq`, the DMA
+     * request line to the DMAC's SDHI channel.
+     */
+    QEMUTimer *timer;
+    qemu_irq dreq;
+    uint8_t  phase;
+    bool     buf_ready;
+    uint16_t pending_info2;  /* error bits to report with the response */
+
+    /* Properties. */
+    bool     timing;         /* false: every step completes instantly */
+    uint32_t read_latency_us;
+    uint32_t write_block_us;
+    uint32_t write_busy_us;
+
+    /*
+     * Commands issued since power-on, exported read-only as the QOM property
+     * dz-cmd-count so scripts can wait for the card to go quiet (e.g. for a
+     * song load to finish).
+     */
+    uint64_t total_cmds;
+
+    /* DELUGEMU_SDHI_STATS probe (per virtual-second activity summary). */
+    QEMUTimer *stats_timer;
+    int64_t  busy_since_ns;
+    int64_t  stats_busy_ns;
+    uint32_t stats_cmds;
+    uint32_t stats_rd_blocks;
+    uint32_t stats_wr_blocks;
 };
 
 #endif /* HW_SD_RZA1L_SDHI_H */
