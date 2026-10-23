@@ -32,12 +32,12 @@ SONG_EXTENSION = ".XML"
 
 # (x, y) pad and shift state for every typeable character, built once so
 # key_for is O(1). The firmware's unassigned home-row pad (the \0 slot in the
-# row strings below) is skipped.
+# row strings above) is skipped.
 _KEYS = {" ": SPACE_PAD + (False,)}
 for y, keys in _ROWS:
     for x, ch in enumerate(keys):
         if ch != "\0":
-            _KEYS[ch] = (FIRST_COL + x, y, False)
+            _KEYS[ch] = (_FIRST_COL + x, y, False)
 for shifted, base in _SHIFTED.items():
     x, y, _ = _KEYS[base]
     _KEYS[shifted] = (x, y, True)
