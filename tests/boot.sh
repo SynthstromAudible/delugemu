@@ -61,10 +61,11 @@ fi
 # background, let it boot for BOOT_SECONDS, then SIGINT it for a clean shutdown
 # (which flushes the -D log) before falling back to SIGKILL.
 #
-# No stdio is used (-serial null -monitor none rather than -nographic): a
-# backgrounded native process on Windows can't be given the console, and the
-# firmware's serial output isn't needed. QEMU's own stderr is kept so a run
-# that dies early says why.
+# Headless throughout: no stdio (-serial null -monitor none) and a silent
+# audio sink, since without an -audiodev the SSIF opens the host's default
+# output and QEMU exits on a machine with no audio device (Windows CI runners:
+# "WASAPI can't find requested audio endpoint"). QEMU's own stderr is kept so a
+# run that dies early says why.
 run_boot() {
     local label="$1"; shift
     local log="$1"; shift
@@ -72,6 +73,7 @@ run_boot() {
     printf '  booting (%s) for %ss...\n' "${label}" "${BOOT_SECONDS}"
     "${BIN}" -M deluge -kernel "${FIRMWARE}" \
         -display none -serial null -monitor none \
+        -audiodev none,id=deluge0 -global rza1l-ssif.audiodev=deluge0 \
         -d int -D "${log}" "$@" </dev/null >/dev/null 2>"${log}.stderr" &
     local pid=$!
     sleep "${BOOT_SECONDS}"
