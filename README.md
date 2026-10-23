@@ -337,9 +337,16 @@ the terminal is interactive, `run.sh` offers to download the Synthstrom factory
 card contents into `./sdcard` and uses that (set `DELUGEMU_SD_DIR` to change the
 folder).
 
-QEMU's SD device requires the image to be **a power-of-two size** (e.g. 128 MiB,
-256 MiB, 512 MiB, 1 GiB); a non-power-of-two image is rejected with
-`Invalid SD card size`.
+QEMU's SD device requires the image to be **a power-of-two size** (e.g. 4 GiB,
+8 GiB); a non-power-of-two image is rejected with `Invalid SD card size`.
+
+Format it FAT32 with **32 KiB clusters**, the allocation unit Synthstrom
+recommends for Deluge cards. The firmware streams samples a cluster at a time,
+so the cluster size shapes its SD access pattern: with format-tool defaults for
+small volumes (4 KiB) it issues about eight times as many card reads for the
+same audio, which the [SD timing model](docs/register-coverage.md#sdhi--sd-host--rza1l-sdhi)
+then (correctly) makes slow. FAT32 at 32 KiB clusters needs a volume of just
+over 2 GiB, so the smallest such image is 4 GiB.
 
 The easiest way is the helper script, which sizes the image correctly for you:
 
@@ -352,8 +359,9 @@ The easiest way is the helper script, which sizes the image correctly for you:
 ```
 
 `mksd.sh` measures the content, adds slack, **rounds the capacity up to the next
-power of two** (minimum 128 MiB), formats it FAT32 with volume label `DELUGE`,
-and copies the directory contents to the root of the card. On macOS it uses the
+power of two** (minimum 4 GiB), formats it FAT32 with 32 KiB clusters and volume
+label `DELUGE`, and copies the directory contents to the root of the card. The
+image is created sparse, so a 4 GiB card only takes as much disk as its content. On macOS it uses the
 built-in `hdiutil` / `newfs_msdos`; on Linux it needs `dosfstools` (`mkfs.fat`)
 and `mtools` (`mcopy`) — install them with your package manager first.
 
@@ -368,20 +376,20 @@ SAMPLES/    Audio samples (.wav)
 ```
 
 To build an image by hand instead, create a power-of-two raw image, format it
-FAT32, and copy your content in:
+FAT32 with 32 KiB clusters (64 × 512-byte sectors), and copy your content in:
 
 ```sh
-# 256 MiB (= 2^28 bytes) raw image, FAT32, label DELUGE
-dd if=/dev/zero of=build/deluge_sd.img bs=1m count=256
+# 4 GiB (= 2^32 bytes) sparse raw image, FAT32, 32 KiB clusters, label DELUGE
+dd if=/dev/zero of=build/deluge_sd.img bs=1m count=0 seek=4096
 
 # macOS
 dev=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage build/deluge_sd.img | head -1 | awk '{print $1}')
-newfs_msdos -F 32 -v DELUGE "$dev"
+newfs_msdos -F 32 -S 512 -c 64 -v DELUGE "$dev"
 diskutil mount "$dev"            # then copy SONGS/ SYNTHS/ KITS/ SAMPLES/ into the mounted volume
 diskutil unmount "$dev"; hdiutil detach "$dev"
 
 # Linux (needs dosfstools + mtools)
-mkfs.fat -F 32 -n DELUGE build/deluge_sd.img
+mkfs.fat -F 32 -S 512 -s 64 -n DELUGE build/deluge_sd.img
 mcopy -i build/deluge_sd.img -s SONGS SYNTHS KITS SAMPLES ::/
 ```
 
