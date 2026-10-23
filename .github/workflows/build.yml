@@ -6,6 +6,13 @@ on:
     branches: [main]
     tags: ['v*']
   pull_request:
+  # The merge queue builds each group on a temporary gh-readonly-queue/* ref;
+  # without this trigger no checks ever report there, so required checks would
+  # hold every queued PR until the queue's response timeout.
+  merge_group:
+  # Dispatched on the `nightly` tag by nightly.yml (a tag pushed with the
+  # workflow token cannot trigger a push run), and available for manual runs.
+  workflow_dispatch:
 
 # Building QEMU is expensive; let newer pushes cancel in-flight runs.
 concurrency:
@@ -171,9 +178,14 @@ jobs:
   # On a version tag (v*), build a self-contained, relocatable bundle for each
   # OS and attach it to the GitHub Release so users can download and run without
   # a build toolchain. See scripts/package.sh.
+  #
+  # The same jobs publish the rolling `nightly` prerelease when nightly.yml
+  # dispatches this workflow on the `nightly` tag: version-stamped
+  # nightly-YYYYMMDD-<sha>, overwriting the previous night's assets (asset
+  # names carry no version), and never marked as the latest release.
   release-macos:
     name: Package + publish macOS bundle
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/tags/nightly'
     needs: build-and-test
     runs-on: macos-latest
     permissions:
@@ -196,22 +208,37 @@ jobs:
       - name: Build
         run: ./scripts/build.sh
 
+      - name: Resolve release version
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF}" = "refs/tags/nightly" ]; then
+            echo "RELEASE_VERSION=nightly-$(date -u +%Y%m%d)-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          else
+            echo "RELEASE_VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          fi
+
       - name: Package relocatable bundle
         run: ./scripts/package.sh
         env:
           # Release tag stamped into the bundle (window title / About box).
-          DELUGEMU_VERSION: ${{ github.ref_name }}
+          DELUGEMU_VERSION: ${{ env.RELEASE_VERSION }}
 
       - name: Upload bundle to the release
         uses: softprops/action-gh-release@v2
         with:
+          # Nightly-only settings; each is '' on a version tag, which the action
+          # treats as unset, so versioned releases publish exactly as before.
+          prerelease: ${{ github.ref == 'refs/tags/nightly' && 'true' || '' }}
+          make_latest: ${{ github.ref == 'refs/tags/nightly' && 'false' || '' }}
+          name: ${{ github.ref == 'refs/tags/nightly' && 'Nightly build' || '' }}
+          body: ${{ github.ref == 'refs/tags/nightly' && format('Automated build of main at {0} ({1}). Replaced every night when main changes; use a versioned release for anything you need to keep.', github.sha, env.RELEASE_VERSION) || '' }}
           files: |
             build/release/DelugEmu-macos-*.dmg
             build/release/DelugEmu-macos-*.tar.gz
 
   release-linux:
     name: Package + publish Linux bundle
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/tags/nightly'
     needs: build-and-test
     runs-on: ubuntu-latest
     permissions:
@@ -238,19 +265,34 @@ jobs:
       - name: Build
         run: ./scripts/build.sh
 
+      - name: Resolve release version
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF}" = "refs/tags/nightly" ]; then
+            echo "RELEASE_VERSION=nightly-$(date -u +%Y%m%d)-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          else
+            echo "RELEASE_VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          fi
+
       - name: Package relocatable bundle
         run: ./scripts/package.sh
         env:
-          DELUGEMU_VERSION: ${{ github.ref_name }}
+          DELUGEMU_VERSION: ${{ env.RELEASE_VERSION }}
 
       - name: Upload bundle to the release
         uses: softprops/action-gh-release@v2
         with:
+          # Nightly-only settings; each is '' on a version tag, which the action
+          # treats as unset, so versioned releases publish exactly as before.
+          prerelease: ${{ github.ref == 'refs/tags/nightly' && 'true' || '' }}
+          make_latest: ${{ github.ref == 'refs/tags/nightly' && 'false' || '' }}
+          name: ${{ github.ref == 'refs/tags/nightly' && 'Nightly build' || '' }}
+          body: ${{ github.ref == 'refs/tags/nightly' && format('Automated build of main at {0} ({1}). Replaced every night when main changes; use a versioned release for anything you need to keep.', github.sha, env.RELEASE_VERSION) || '' }}
           files: build/release/DelugEmu-linux-*.tar.gz
 
   release-windows:
     name: Package + publish Windows bundle
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/tags/nightly'
     needs: build-and-test
     runs-on: windows-latest
     permissions:
@@ -313,17 +355,32 @@ jobs:
           & $wix --version
           & $wix extension add --global WixToolset.Util.wixext/5.0.2
 
+      - name: Resolve release version
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF}" = "refs/tags/nightly" ]; then
+            echo "RELEASE_VERSION=nightly-$(date -u +%Y%m%d)-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          else
+            echo "RELEASE_VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          fi
+
       - name: Package relocatable bundle + MSI installer
         run: ./scripts/package.sh
         env:
           # MSI versions must grow monotonically for upgrades; the shallow CI
           # clone can't use the commit count, so use the workflow run number.
           DELUGEMU_MSI_VERSION: 1.0.${{ github.run_number }}
-          DELUGEMU_VERSION: ${{ github.ref_name }}
+          DELUGEMU_VERSION: ${{ env.RELEASE_VERSION }}
 
       - name: Upload bundle to the release
         uses: softprops/action-gh-release@v2
         with:
+          # Nightly-only settings; each is '' on a version tag, which the action
+          # treats as unset, so versioned releases publish exactly as before.
+          prerelease: ${{ github.ref == 'refs/tags/nightly' && 'true' || '' }}
+          make_latest: ${{ github.ref == 'refs/tags/nightly' && 'false' || '' }}
+          name: ${{ github.ref == 'refs/tags/nightly' && 'Nightly build' || '' }}
+          body: ${{ github.ref == 'refs/tags/nightly' && format('Automated build of main at {0} ({1}). Replaced every night when main changes; use a versioned release for anything you need to keep.', github.sha, env.RELEASE_VERSION) || '' }}
           files: |
             build/release/DelugEmu-windows-*.zip
             build/release/DelugEmu-windows-*.msi
