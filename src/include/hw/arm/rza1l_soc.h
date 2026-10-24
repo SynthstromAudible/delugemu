@@ -120,6 +120,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(RzA1lSocState, RZA1L_SOC)
  * (SSIRXI0 = 173) and transmit-empty (SSITXI0 = 174); GIC SPI line = ID - 32.
  */
 #define RZA1L_SSIF_SSII0_SPI  (172 - 32)
+/* MTU2 compare-match-A interrupts TGI0A..TGI4A: IDs 139, 146, 150, 154, 159. */
+#define RZA1L_MTU2_TGI0A_SPI  (139 - 32)
+#define RZA1L_MTU2_TGI1A_SPI  (146 - 32)
+#define RZA1L_MTU2_TGI2A_SPI  (150 - 32)
+#define RZA1L_MTU2_TGI3A_SPI  (154 - 32)
+#define RZA1L_MTU2_TGI4A_SPI  (159 - 32)
 #define RZA1L_SSIF_RXI0_SPI   (173 - 32)
 #define RZA1L_SSIF_TXI0_SPI   (174 - 32)
 
