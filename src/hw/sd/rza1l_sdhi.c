@@ -172,8 +172,15 @@ static void rza1l_sdhi_update_irq(RzA1lSdhiState *s)
      */
     uint16_t i1 = s->info1 & (uint16_t)~s->info1_mask & INFO1_IRQ_BITS;
     uint16_t i2 = s->info2 & (uint16_t)~s->info2_mask & INFO2_IRQ_BITS;
+    bool level = i1 || i2;
 
-    qemu_set_irq(s->irq, (i1 || i2) ? 1 : 0);
+    /* Note when the line rises, to time how long the firmware takes to look. */
+    if (level && !s->irq_level) {
+        s->irq_raised_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        s->irq_unacked = true;
+    }
+    s->irq_level = level;
+    qemu_set_irq(s->irq, level);
 }
 
 /* ---- DELUGEMU_SDHI_STATS probe ---- */
@@ -187,29 +194,71 @@ static bool rza1l_sdhi_stats_enabled(void)
     return v;
 }
 
+/* Charge the time since the current phase began, up to `now`, to the stats. */
+static void rza1l_sdhi_stats_charge(RzA1lSdhiState *s, int64_t now)
+{
+    int64_t ns = now - s->phase_since_ns;
+
+    if (ns > 0) {
+        if (s->phase == SDHI_READ_BUF || s->phase == SDHI_WRITE_BUF) {
+            s->stats_buf_ns += ns;
+        } else if (s->phase != SDHI_IDLE) {
+            s->stats_bus_ns += ns;
+        }
+        s->phase_since_ns = now;
+    }
+}
+
+/*
+ * The firmware read a status register: if the interrupt line was up, that's
+ * the interrupt being serviced (or a poll noticing the event).
+ */
+static void rza1l_sdhi_irq_ack(RzA1lSdhiState *s)
+{
+    if (s->irq_unacked && rza1l_sdhi_stats_enabled()) {
+        int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->irq_raised_ns;
+
+        s->stats_irqs++;
+        s->stats_irq_sum_ns += ns;
+        s->stats_irq_max_ns = MAX(s->stats_irq_max_ns, ns);
+    }
+    s->irq_unacked = false;
+}
+
 /*
  * Once per virtual second, report how hard the SD bus worked: commands issued,
- * data moved and the fraction of the second the controller was busy (command,
- * card latency, transfer or programming). A busy figure near 100% means the
- * firmware is SD-bound.
+ * data moved, and the fraction of the second the controller was busy. Busy is
+ * split into bus time (command, card latency, transfer or programming), which
+ * near 100% means the card is the bottleneck, and buffer wait (a block sat in
+ * the one-block buffer waiting for the firmware or DMA to drain or fill it),
+ * which is the firmware holding up the card. irq is how long the firmware took
+ * to read the status registers after the controller raised its interrupt:
+ * under -icount this tracks how long the firmware runs with interrupts masked
+ * (guest instruction count, not real A9 timing: no cache or memory stalls).
  */
 static void rza1l_sdhi_stats_tick(void *opaque)
 {
     RzA1lSdhiState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    int64_t busy = s->stats_busy_ns;
 
-    if (s->phase != SDHI_IDLE) {
-        busy += now - s->busy_since_ns;
-        s->busy_since_ns = now;
-    }
+    rza1l_sdhi_stats_charge(s, now);
     if (s->stats_cmds) {
+        double bus = s->stats_bus_ns * 100.0 / NANOSECONDS_PER_SECOND;
+        double buf = s->stats_buf_ns * 100.0 / NANOSECONDS_PER_SECOND;
+
         fprintf(stderr, "sdhi: t=%.1fs cmds=%u read=%uKiB write=%uKiB "
-                "busy=%.1f%%\n", now / 1e9, s->stats_cmds,
+                "busy=%.1f%% (bus=%.1f%% bufwait=%.1f%%) "
+                "irq=%u avg=%.0fus max=%.0fus\n", now / 1e9, s->stats_cmds,
                 s->stats_rd_blocks / 2, s->stats_wr_blocks / 2,
-                busy * 100.0 / NANOSECONDS_PER_SECOND);
+                bus + buf, bus, buf, s->stats_irqs,
+                s->stats_irqs ? s->stats_irq_sum_ns / 1e3 / s->stats_irqs : 0,
+                s->stats_irq_max_ns / 1e3);
     }
-    s->stats_busy_ns = 0;
+    s->stats_bus_ns = 0;
+    s->stats_buf_ns = 0;
+    s->stats_irqs = 0;
+    s->stats_irq_sum_ns = 0;
+    s->stats_irq_max_ns = 0;
     s->stats_cmds = 0;
     s->stats_rd_blocks = 0;
     s->stats_wr_blocks = 0;
@@ -249,39 +298,57 @@ static int64_t rza1l_sdhi_cmd12_ns(RzA1lSdhiState *s)
     return rza1l_sdhi_clocks_ns(s, SD_CMD_BITS + SD_NCR_CLOCKS + SD_RESP_BITS);
 }
 
+/*
+ * The time the controller is acting at: the deadline of the phase end being
+ * handled, or now for something the firmware did.
+ */
+static int64_t rza1l_sdhi_now(RzA1lSdhiState *s)
+{
+    return s->on_deadline ? s->deadline_ns
+                          : qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+}
+
 static void rza1l_sdhi_set_phase(RzA1lSdhiState *s, uint8_t phase)
 {
-    if (rza1l_sdhi_stats_enabled() && (s->phase == SDHI_IDLE) !=
-                                      (phase == SDHI_IDLE)) {
-        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-
-        if (phase == SDHI_IDLE) {
-            s->stats_busy_ns += now - s->busy_since_ns;
-        } else {
-            s->busy_since_ns = now;
-        }
+    if (rza1l_sdhi_stats_enabled()) {
+        rza1l_sdhi_stats_charge(s, rza1l_sdhi_now(s));
     }
     s->phase = phase;
 }
 
 static void rza1l_sdhi_advance(RzA1lSdhiState *s);
 
+/* The current phase's deadline has passed: handle its end, at the deadline. */
+static void rza1l_sdhi_phase_due(RzA1lSdhiState *s)
+{
+    bool was = s->on_deadline;
+
+    s->on_deadline = true;
+    rza1l_sdhi_advance(s);
+    s->on_deadline = was;
+}
+
 /*
- * End the current phase after `ns` of bus activity. With timing disabled every
- * phase ends immediately, which reproduces the original instant model.
+ * End the current phase after `ns` of bus activity, timed from when the
+ * controller acted rather than from when it got round to it. If that deadline
+ * has already passed (the previous phase's timer fired late), end the phase
+ * straight away so the transfer catches up. With timing disabled every phase
+ * ends immediately, which reproduces the original instant model.
  */
 static void rza1l_sdhi_schedule(RzA1lSdhiState *s, int64_t ns)
 {
-    if (!s->timing || ns <= 0) {
-        rza1l_sdhi_advance(s);
+    s->deadline_ns = rza1l_sdhi_now(s) + MAX(ns, 0);
+    if (!s->timing ||
+        s->deadline_ns <= qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
+        rza1l_sdhi_phase_due(s);
         return;
     }
-    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ns);
+    timer_mod(s->timer, s->deadline_ns);
 }
 
 static void rza1l_sdhi_timer_cb(void *opaque)
 {
-    rza1l_sdhi_advance(opaque);
+    rza1l_sdhi_phase_due(opaque);
 }
 
 /*
@@ -296,7 +363,7 @@ static void rza1l_sdhi_vcpu_tick(void *opaque)
     if (timer_pending(s->timer) &&
         timer_expired(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL))) {
         timer_del(s->timer);
-        rza1l_sdhi_advance(s);
+        rza1l_sdhi_phase_due(s);
     }
 }
 
@@ -567,6 +634,24 @@ static uint32_t rza1l_sdhi_read_buf(RzA1lSdhiState *s, unsigned size)
     return val;
 }
 
+uint32_t rza1l_sdhi_dma_pull(void *opaque, uint8_t *buf, uint32_t len)
+{
+    RzA1lSdhiState *s = opaque;
+    uint32_t n;
+
+    /* As for rza1l_sdhi_read_buf: only a block that has fully arrived. */
+    if (s->phase != SDHI_READ_BUF || s->data_dir != 1) {
+        return 0;
+    }
+    n = MIN(len, s->datacnt);
+    sdbus_read_data(&s->sdbus, buf, n);
+    s->datacnt -= n;
+    if (s->datacnt == 0) {
+        rza1l_sdhi_data_block_done(s);
+    }
+    return n;
+}
+
 static void rza1l_sdhi_write_buf(RzA1lSdhiState *s, uint32_t val, unsigned size)
 {
     unsigned i;
@@ -605,6 +690,9 @@ static uint64_t rza1l_sdhi_read(void *opaque, hwaddr offset, unsigned size)
 
     if (offset >= SD_RESP0 && offset <= SD_RESP7) {
         return s->resp[(offset - SD_RESP0) / 2];
+    }
+    if (offset == SD_INFO1 || offset == SD_INFO2) {
+        rza1l_sdhi_irq_ack(s);
     }
 
     switch (offset) {
@@ -856,14 +944,17 @@ static void rza1l_sdhi_reset(DeviceState *dev)
     s->blocklen = 0;
     rza1l_sdhi_abort(s);
     s->pending_info2 = 0;
+    s->on_deadline = false;
 
+    s->irq_level = false;
+    s->irq_unacked = false;
     qemu_set_irq(s->irq, 0);
 }
 
 static const VMStateDescription vmstate_rza1l_sdhi = {
     .name = TYPE_RZA1L_SDHI,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT16(cmd, RzA1lSdhiState),
         VMSTATE_UINT16(arg0, RzA1lSdhiState),
@@ -894,6 +985,7 @@ static const VMStateDescription vmstate_rza1l_sdhi = {
         VMSTATE_UINT8(phase, RzA1lSdhiState),
         VMSTATE_BOOL(buf_ready, RzA1lSdhiState),
         VMSTATE_UINT16(pending_info2, RzA1lSdhiState),
+        VMSTATE_INT64(deadline_ns, RzA1lSdhiState),
         VMSTATE_END_OF_LIST()
     }
 };

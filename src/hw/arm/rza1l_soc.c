@@ -559,6 +559,9 @@ static void rza1l_soc_realize(DeviceState *dev, Error **errp)
      * firmware's SD channel, whose card bring-up never writes it.
      */
     rza1l_dmac_register_dreq(&s->dmac, RZA1L_STOCK_SD_DMA_CH);
+    rza1l_dmac_register_dreq_pull(&s->dmac, RZA1L_STOCK_SD_DMA_CH,
+                                  rza1l_sdhi_dma_pull, &s->sdhi);
+    rza1l_dmac_register_sdhi_pull(&s->dmac, rza1l_sdhi_dma_pull, &s->sdhi);
     qdev_connect_gpio_out_named(DEVICE(&s->sdhi), RZA1L_SDHI_DREQ, 0,
                                 qdev_get_gpio_in_named(DEVICE(&s->dmac),
                                                        RZA1L_DMAC_SDHI_DREQ, 0));

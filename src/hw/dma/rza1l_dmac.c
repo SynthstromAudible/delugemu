@@ -252,9 +252,13 @@ static void rza1l_dmac_do_transfer(RzA1lDmacState *s, int ch)
  * buffer emptied or filled) stops the transfer at exactly that point. Completes
  * the channel once CRTB reaches zero.
  */
+static bool rza1l_dmac_dmars_is_sdhi(uint16_t dmars);
+
 static void rza1l_dmac_dreq_service(RzA1lDmacState *s, int ch)
 {
     RzA1lDmacChannel *c = &s->ch[ch];
+    RzA1lDmacPullFn *pull = c->pull;
+    void *pull_opaque = c->pull_opaque;
     bool sad_fixed = c->chcfg & CHCFG_SAD;
     bool dad_fixed = c->chcfg & CHCFG_DAD;
     unsigned unit = rza1l_dmac_unit(c);
@@ -269,6 +273,30 @@ static void rza1l_dmac_dreq_service(RzA1lDmacState *s, int ch)
         return;
     }
     c->dreq_servicing = true;
+
+    /*
+     * A peripheral that can hand over its buffered data in one go (the SDHI)
+     * is read a buffer at a time: the same bytes in the same order as reading
+     * its data register a unit at a time, without a memory-API round trip for
+     * each one.
+     */
+    if (!pull && rza1l_dmac_dmars_is_sdhi(c->dmars)) {
+        pull = s->sdhi_pull;
+        pull_opaque = s->sdhi_pull_opaque;
+    }
+    while (pull && sad_fixed && !dad_fixed &&
+           c->dreq_level && (c->chstat & CHSTAT_EN) && c->crtb) {
+        uint8_t blk[RZA1L_DMAC_PULL_MAX];
+        uint32_t got = pull(pull_opaque, blk, MIN(c->crtb, sizeof(blk)));
+
+        if (!got) {
+            break;
+        }
+        dma_memory_write(&address_space_memory, c->crda, blk, got,
+                         MEMTXATTRS_UNSPECIFIED);
+        c->crda += got;
+        c->crtb -= got;
+    }
 
     while (c->dreq_level && (c->chstat & CHSTAT_EN) && c->crtb) {
         unsigned n = MIN(unit, c->crtb);
@@ -476,6 +504,22 @@ void rza1l_dmac_register_dreq(RzA1lDmacState *s, int ch)
     if (ch >= 0 && ch < RZA1L_DMAC_NUM_CH) {
         s->ch[ch].dreq_paced = true;
     }
+}
+
+void rza1l_dmac_register_dreq_pull(RzA1lDmacState *s, int ch,
+                                   RzA1lDmacPullFn *fn, void *opaque)
+{
+    if (ch >= 0 && ch < RZA1L_DMAC_NUM_CH) {
+        s->ch[ch].pull = fn;
+        s->ch[ch].pull_opaque = opaque;
+    }
+}
+
+void rza1l_dmac_register_sdhi_pull(RzA1lDmacState *s, RzA1lDmacPullFn *fn,
+                                   void *opaque)
+{
+    s->sdhi_pull = fn;
+    s->sdhi_pull_opaque = opaque;
 }
 
 void rza1l_dmac_register_rx_ring(RzA1lDmacState *s, int ch)
@@ -803,10 +847,12 @@ static void rza1l_dmac_reset(DeviceState *dev)
     int timing_capture_src_ch[RZA1L_DMAC_NUM_CH];
     bool dreq_paced[RZA1L_DMAC_NUM_CH];
     bool dreq_level[RZA1L_DMAC_NUM_CH];
+    RzA1lDmacPullFn *pull[RZA1L_DMAC_NUM_CH];
+    void *pull_opaque[RZA1L_DMAC_NUM_CH];
 
     /*
-     * rx_ring_peripheral, tx_audio_ring, rx_audio_ring and the timing-capture
-     * wiring are static wiring properties (set once at machine construction by
+     * rx_ring_peripheral, tx_audio_ring, rx_audio_ring, the timing-capture
+     * wiring and the DREQ pull hooks are static wiring properties (set once at machine construction by
      * rza1l_dmac_register_*), not transfer state, so they must survive a device
      * reset. Preserve them across the memset that clears the per-channel
      * registers. So must each DREQ input's level: it mirrors the peripheral's
@@ -822,6 +868,8 @@ static void rza1l_dmac_reset(DeviceState *dev)
         timing_capture_src_ch[i] = s->ch[i].timing_capture_src_ch;
         dreq_paced[i] = s->ch[i].dreq_paced;
         dreq_level[i] = s->ch[i].dreq_level;
+        pull[i] = s->ch[i].pull;
+        pull_opaque[i] = s->ch[i].pull_opaque;
     }
 
     memset(s->ch, 0, sizeof(s->ch));
@@ -837,6 +885,8 @@ static void rza1l_dmac_reset(DeviceState *dev)
         s->ch[i].timing_capture_src_ch = timing_capture_src_ch[i];
         s->ch[i].dreq_paced = dreq_paced[i];
         s->ch[i].dreq_level = dreq_level[i];
+        s->ch[i].pull = pull[i];
+        s->ch[i].pull_opaque = pull_opaque[i];
     }
 
     /*

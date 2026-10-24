@@ -2,6 +2,30 @@
 
 Emulation and regression tests for delugemu.
 
+## Running everything: `run-all.sh`
+
+```sh
+./tests/run-all.sh                      # every test, PASS / SKIP / FAIL each
+./tests/run-all.sh boot scenario        # a subset
+./tests/run-all.sh --require-firmware   # what CI runs
+```
+
+Each test skips cleanly (exit 0) when something it needs is missing, which
+makes a bare run safe anywhere but means "all green" can hide tests that never
+ran. `run-all.sh` lists every outcome (logs in `build/test-logs/`, and a table
+in the GitHub Actions job summary), and `--require-firmware` turns a skip into a
+failure for the tests that only skip for want of firmware or an SD image (boot,
+scenario, pad-click, usb-midi, usb-midi-bridge, audio-bench).
+
+**CI** (`.github/workflows/build.yml`) builds the emulator and runs the suite
+against real firmware fetched by `.github/actions/test-assets`: the latest
+stable DelugeFirmware community release on Linux and macOS, plus the rolling
+`beta` prerelease on Linux (non-blocking — it changes daily). The Linux and
+macOS legs also build an SD image from the Synthstrom factory card. Windows runs
+`smoke unit geometry-sync boot` (the other emulator tests use UNIX sockets).
+Expected skips: `usb-peripheral` (no published firmware has peripheral USB
+yet) and `midi-coremidi` off macOS.
+
 ## `smoke.sh`
 
 The M0 acceptance check. After building (`scripts/build.sh`) it verifies that:
@@ -146,6 +170,12 @@ re-run (`scripts/gen_control_map.py`). Skips cleanly without `python3`.
 Keep tests runnable standalone and CI-friendly: exit non-zero on failure, avoid
 interactive prompts, and don't depend on a real Deluge firmware image unless the
 test explicitly fetches/locates one and skips cleanly when it is absent.
+
+To have CI run a new test, add it to `ALL_TESTS` in `run-all.sh`, report a skip
+as `<NAME> SKIP: <reason>` (the format `run-all.sh` detects), and add it to
+`NEEDS_FIRMWARE` if firmware is the only thing it ever skips for. Prefer
+locating firmware via `DELUGE_FIRMWARE` and an SD image via `DELUGE_SD_IMG`,
+which is what CI exports.
 
 ## Driving the panel: the `delugemu` scripting interface
 

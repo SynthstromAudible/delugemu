@@ -84,6 +84,17 @@ struct RzA1lSdhiState {
     bool     buf_ready;
     uint16_t pending_info2;  /* error bits to report with the response */
 
+    /*
+     * When the current phase is due to end. Phases are timed from the
+     * previous phase's deadline rather than from when it was serviced, so a
+     * late timer doesn't stretch the rest of a transfer. `on_deadline` is set
+     * while the controller handles a phase end, so anything that follows
+     * within the same step (a DMA drain of the block just made ready, the
+     * next block, the stats) happens at the deadline.
+     */
+    int64_t  deadline_ns;
+    bool     on_deadline;
+
     /* Properties. */
     bool     timing;         /* false: every step completes instantly */
     uint32_t read_latency_us;
@@ -99,11 +110,24 @@ struct RzA1lSdhiState {
 
     /* DELUGEMU_SDHI_STATS probe (per virtual-second activity summary). */
     QEMUTimer *stats_timer;
-    int64_t  busy_since_ns;
-    int64_t  stats_busy_ns;
+    int64_t  phase_since_ns;   /* when the current phase began */
+    int64_t  stats_bus_ns;     /* time the bus or card was working */
+    int64_t  stats_buf_ns;     /* time a block waited on the host */
+    bool     irq_level;
+    bool     irq_unacked;      /* raised, status not read yet */
+    int64_t  irq_raised_ns;
+    uint32_t stats_irqs;
+    int64_t  stats_irq_sum_ns;
+    int64_t  stats_irq_max_ns;
     uint32_t stats_cmds;
     uint32_t stats_rd_blocks;
     uint32_t stats_wr_blocks;
 };
+
+/*
+ * DMA bulk read (an RzA1lDmacPullFn): copy up to `len` bytes of the block
+ * waiting in the data buffer, as that many reads of the data register would.
+ */
+uint32_t rza1l_sdhi_dma_pull(void *opaque, uint8_t *buf, uint32_t len);
 
 #endif /* HW_SD_RZA1L_SDHI_H */

@@ -21,6 +21,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(RzA1lDmacState, RZA1L_DMAC)
 /* MMIO window covers both channel groups and their common registers. */
 #define RZA1L_DMAC_MMIO_SIZE 0x800
 
+/*
+ * Bulk read from a DREQ-paced peripheral: copy up to `len` bytes of the data it
+ * has ready into `buf`, consuming them as the same number of FIFO reads would,
+ * and return how many were copied (0 if none are ready).
+ */
+typedef uint32_t RzA1lDmacPullFn(void *opaque, uint8_t *buf, uint32_t len);
+
+/* Most a pull is asked for at once: one SD block. */
+#define RZA1L_DMAC_PULL_MAX 512
+
 typedef struct RzA1lDmacChannel {
     uint32_t n0sa;   /* next-0 source address */
     uint32_t n0da;   /* next-0 destination address */
@@ -128,6 +138,9 @@ typedef struct RzA1lDmacChannel {
      * a channel number (the SD data channel, the MIDI timing ring) key on it.
      */
     uint16_t dmars;
+    /* Optional bulk read from the peripheral (rza1l_dmac_register_dreq_pull). */
+    RzA1lDmacPullFn *pull;
+    void    *pull_opaque;
 } RzA1lDmacChannel;
 
 struct RzA1lDmacState {
@@ -143,6 +156,9 @@ struct RzA1lDmacState {
 
     /* The SD host's buffer-ready request, which paces any SDHI-selected channel. */
     bool sdhi_dreq_level;
+    /* The SD host's bulk read, for channels selecting it (register_sdhi_pull). */
+    RzA1lDmacPullFn *sdhi_pull;
+    void *sdhi_pull_opaque;
 
     /*
      * Per-channel transfer-end interrupt lines (DMAINT0..DMAINT15). Pulsed
@@ -271,5 +287,21 @@ void rza1l_dmac_register_dreq(RzA1lDmacState *s, int ch);
 /* The DMARS register block (DMARS0..7), a separate MMIO window. */
 #define RZA1L_DMARS_BASE      0xFCFE1000
 #define RZA1L_DMARS_MMIO_SIZE 0x20
+
+/*
+ * Let a DREQ-paced channel whose source is the peripheral's fixed data register
+ * fetch the peripheral's buffered data with `fn` a buffer at a time, instead of
+ * reading the register through the memory API a unit at a time.
+ */
+void rza1l_dmac_register_dreq_pull(RzA1lDmacState *s, int ch,
+                                   RzA1lDmacPullFn *fn, void *opaque);
+
+/*
+ * Give every channel whose DMARS selects the SD host the SD host's bulk read,
+ * as rza1l_dmac_register_dreq_pull gives one channel: the firmware picks those
+ * channels at run time.
+ */
+void rza1l_dmac_register_sdhi_pull(RzA1lDmacState *s, RzA1lDmacPullFn *fn,
+                                   void *opaque);
 
 #endif /* HW_DMA_RZA1L_DMAC_H */

@@ -63,13 +63,16 @@ class DelugeSession:
     def launch(cls, firmware=None, sd=None, icount=None, headless=True,
                sock=None, int_log=None, extra_qemu=(), repo_root=None,
                boot_wait=0.0, connect_timeout=90.0, env=None, artifacts_dir=None,
-               run_log=None):
+               run_log=None, audio=None):
         """Start the emulator via scripts/run.sh and connect to it.
 
         ``firmware`` None lets run.sh resolve one (local image, or a download
-        when DELUGEMU_FETCH_FIRMWARE=1). Returns a connected DelugeSession, or
-        raises QmpError if run.sh exits before the QMP socket appears (e.g. no
-        firmware available)."""
+        when DELUGEMU_FETCH_FIRMWARE=1). ``audio`` is run.sh's ``--audio``
+        backend; None means silent (``none``) when headless, since a test
+        needs no speakers and a host with no sound device (a CI runner) would
+        otherwise fail to open one, and the OS default with a display.
+        Returns a connected DelugeSession, or raises QmpError if run.sh exits
+        before the QMP socket appears (e.g. no firmware available)."""
         repo_root = repo_root or find_repo_root()
         run_sh = os.path.join(repo_root, "scripts", "run.sh")
         if sock is None:
@@ -87,6 +90,10 @@ class DelugeSession:
         if sd:
             cmd += ["--sd", sd]
         cmd += ["--display", "console" if not headless else "none"]
+        if audio is None and headless:
+            audio = "none"
+        if audio is not None:
+            cmd += ["--audio", audio]
         if icount is not None:
             cmd += ["--icount", str(icount)]
         qemu_args = ["-qmp", "unix:%s,server,nowait" % sock]
@@ -121,7 +128,20 @@ class DelugeSession:
                 raise QmpError("timed out waiting for QMP socket %s" % sock)
             time.sleep(0.1)
 
-        client = QmpClient(sock, connect_timeout=15.0)
+        try:
+            client = QmpClient(sock, connect_timeout=15.0)
+        except QmpError as exc:
+            # QEMU creates the socket early in startup, so a later startup
+            # failure (an unusable -audiodev, say) leaves it behind refusing
+            # connections. Show why QEMU stopped rather than just the refusal.
+            exited = proc.poll() is not None
+            if not exited:
+                _terminate(proc)
+            log_fh.close()
+            raise QmpError("%s\n(run.sh %s)\n--- run.sh output ---\n%s"
+                           % (exc, "exited with code %s" % proc.returncode
+                              if exited else "was still running",
+                              _tail(run_log, 40)))
         session = cls(client, proc=proc, int_log=int_log, repo_root=repo_root,
                       artifacts_dir=artifacts_dir, run_log=run_log)
         if boot_wait:

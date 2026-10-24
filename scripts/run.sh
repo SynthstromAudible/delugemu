@@ -64,7 +64,9 @@
 #   --audio <driver>        Select a non-default host audio backend for the
 #                           SSIF (I2S) output (-audiodev <driver>). Audio is on
 #                           by default using the OS default backend (coreaudio
-#                           on macOS, pa on Linux, dsound on Windows), so this
+#                           on macOS, pa on Linux, dsound on Windows; if this
+#                           QEMU build lacks it, the next available of
+#                           pipewire/alsa/sdl/oss, else silent), so this
 #                           flag is only needed to override it, e.g. --audio
 #                           sdl / wav / none. Use 'auto' to force the OS
 #                           default explicitly. Play a note in an instrument
@@ -979,20 +981,36 @@ fi
 # (or unset) resolves to the recommended host driver for this OS; 'none' wires a
 # silent sink.
 AUDIO_ARGS=()
+if [ -z "${AUDIO}" ] || [ "${AUDIO}" = "auto" ]; then
+    # Preferred drivers for this OS, best first. Pick the first one this QEMU
+    # build actually has: a build configured without, say, PulseAudio
+    # headers (as on a bare CI runner) would otherwise refuse to start.
+    case "$(uname -s)" in
+        Darwin)  audio_prefs="coreaudio sdl" ;;
+        Linux)   audio_prefs="pa pipewire alsa sdl oss" ;;
+        MINGW*|MSYS*|CYGWIN*) audio_prefs="dsound sdl" ;;
+        *)       audio_prefs="sdl" ;;
+    esac
+    audio_have="$("${QEMU_SYSTEM_BIN}" -audiodev help 2>/dev/null | tr -d '\r' || true)"
+    AUDIO=""
+    for drv in ${audio_prefs}; do
+        if [ -z "${audio_have}" ] || printf '%s\n' "${audio_have}" | grep -qx "${drv}"; then
+            AUDIO="${drv}"   # (no driver list at all: keep the old first choice)
+            break
+        fi
+    done
+    if [ -z "${AUDIO}" ]; then
+        warn "this QEMU build has none of the audio drivers ${audio_prefs// /, }; audio will be silent"
+        AUDIO="none"
+    else
+        log "Audio backend auto-selected for $(uname -s): ${AUDIO}"
+    fi
+fi
 if [ "${AUDIO}" = "none" ]; then
     AUDIO_ARGS=(-audiodev "none,id=deluge0"
                 -global "rza1l-ssif.audiodev=deluge0")
     log "Routing SSIF audio to backend: none"
 else
-    if [ -z "${AUDIO}" ] || [ "${AUDIO}" = "auto" ]; then
-        case "$(uname -s)" in
-            Darwin)  AUDIO="coreaudio" ;;
-            Linux)   AUDIO="pa" ;;
-            MINGW*|MSYS*|CYGWIN*) AUDIO="dsound" ;;
-            *)       AUDIO="sdl" ;;
-        esac
-        log "Audio backend auto-selected for $(uname -s): ${AUDIO}"
-    fi
     AUDIO_ARGS=(-audiodev "${AUDIO},id=deluge0,out.buffer-length=${AUDIO_HOST_BUFFER_US}"
                 -global "rza1l-ssif.audiodev=deluge0")
     log "Routing SSIF audio to backend: ${AUDIO} (host buffer ${AUDIO_HOST_BUFFER_US} us)"

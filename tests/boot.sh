@@ -60,20 +60,32 @@ fi
 # are extra qemu args. The firmware never exits on its own, so we run it in the
 # background, let it boot for BOOT_SECONDS, then SIGINT it for a clean shutdown
 # (which flushes the -D log) before falling back to SIGKILL.
+#
+# Headless throughout: no stdio (-serial null -monitor none) and a silent
+# audio sink, since without an -audiodev the SSIF opens the host's default
+# output and QEMU exits on a machine with no audio device (Windows CI runners:
+# "WASAPI can't find requested audio endpoint"). QEMU's own stderr is kept so a
+# run that dies early says why.
 run_boot() {
     local label="$1"; shift
     local log="$1"; shift
-    rm -f "${log}"
+    rm -f "${log}" "${log}.stderr"
     printf '  booting (%s) for %ss...\n' "${label}" "${BOOT_SECONDS}"
-    "${BIN}" -M deluge -kernel "${FIRMWARE}" -nographic \
-        -d int -D "${log}" "$@" >/dev/null 2>&1 &
+    "${BIN}" -M deluge -kernel "${FIRMWARE}" \
+        -display none -serial null -monitor none \
+        -audiodev none,id=deluge0 -global rza1l-ssif.audiodev=deluge0 \
+        -d int -D "${log}" "$@" </dev/null >/dev/null 2>"${log}.stderr" &
     local pid=$!
     sleep "${BOOT_SECONDS}"
     kill -INT "${pid}" 2>/dev/null || true
     sleep 1
     kill -KILL "${pid}" 2>/dev/null || true
     wait "${pid}" 2>/dev/null || true
-    [ -s "${log}" ] || fail "${label}: qemu produced no interrupt log"
+    if [ ! -s "${log}" ]; then
+        printf '  --- qemu stderr ---\n'
+        tail -n 20 "${log}.stderr" 2>/dev/null || true
+        fail "${label}: qemu produced no interrupt log"
+    fi
 }
 
 # Assert health on an interrupt log produced by run_boot.

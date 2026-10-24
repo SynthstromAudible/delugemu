@@ -290,9 +290,8 @@ $script:SdWriteback = $false
 $script:SdSnapTime  = $null
 
 # Compute the power-of-two image size (MiB) for a content folder, mirroring
-# mksd.sh: content + 30% slack + 64 MiB, floor 256 MiB (128 MiB sits at
-# FAT32's minimum-cluster boundary, where mkfs.fat builds marginal volumes),
-# rounded up to 2^n.
+# mksd.sh: content + 30% slack + 64 MiB, floor 4 GiB (FAT32 with the
+# recommended 32 KiB clusters needs over 2 GiB of data area), rounded up to 2^n.
 function Get-SdImageSizeMiB {
     param([string]$Folder)
     $bytes = (Get-ChildItem -LiteralPath $Folder -Recurse -File -ErrorAction SilentlyContinue |
@@ -300,8 +299,8 @@ function Get-SdImageSizeMiB {
     if (-not $bytes) { $bytes = 0 }
     $kib = [math]::Ceiling($bytes / 1024)
     $needMiB = [int]([math]::Floor(($kib * 13 / 10) / 1024) + 64)
-    if ($needMiB -lt 256) { $needMiB = 256 }
-    $imgMiB = 256
+    if ($needMiB -lt 4096) { $needMiB = 4096 }
+    $imgMiB = 4096
     while ($imgMiB -lt $needMiB) { $imgMiB *= 2 }
     return $imgMiB
 }
@@ -320,11 +319,16 @@ function New-SdImageFromFolder {
     $img = Join-Path ([System.IO.Path]::GetTempPath()) ("delugemu-sd-" + [System.IO.Path]::GetRandomFileName() + '.img')
     Notify "Preparing the SD card image ($imgMiB MiB - this can take a minute)..."
 
-    # Pre-size the image, then format and populate it.
+    # Pre-size the image, then format and populate it. Mark it sparse first
+    # (best effort) so the unused part of the 4 GiB minimum takes no disk.
     $fs = [System.IO.File]::Open($img, 'Create', 'Write')
+    $fs.Close()
+    & fsutil sparse setflag $img 2>&1 | Out-Null
+    $fs = [System.IO.File]::Open($img, 'Open', 'Write')
     try { $fs.SetLength([int64]$imgMiB * 1MB) } finally { $fs.Close() }
 
-    & $mkfs '-F' '32' '-n' 'DELUGE' $img | Out-Null
+    # 32 KiB clusters (64 x 512-byte sectors), as recommended for Deluge cards.
+    & $mkfs '-F' '32' '-S' '512' '-s' '64' '-n' 'DELUGE' $img | Out-Null
     if ($LASTEXITCODE -ne 0) { Remove-Item -LiteralPath $img -Force -EA SilentlyContinue; Die 'mkfs.fat failed' }
 
     $children = Get-ChildItem -LiteralPath $Folder -Force | ForEach-Object { $_.FullName }
