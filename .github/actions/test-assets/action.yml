@@ -1,0 +1,119 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+name: Fetch delugemu test assets
+description: >-
+  Download (and cache) what the firmware-driven tests need but the repo does
+  not ship: the latest Deluge community firmware release, and optionally the
+  Synthstrom factory SD-card contents built into build/deluge_sd.img. Exports
+  DELUGE_FIRMWARE (and DELUGE_SD_IMG) so tests/*.sh run instead of skipping.
+  Run from the repo root; paths are exported relative to it so they work in
+  every shell, MSYS2 included.
+
+inputs:
+  sd-card:
+    description: If "true", also build build/deluge_sd.img from the factory card.
+    required: false
+    default: "false"
+  firmware-repo:
+    description: owner/repo whose release provides the firmware.
+    required: false
+    default: SynthstromAudible/DelugeFirmware
+  firmware-release:
+    description: >-
+      Release tag to test against, or "latest" for the newest stable release.
+      DelugeFirmware's rolling "beta" prerelease carries the newest features
+      (e.g. peripheral USB audio) and ships an .elf with symbols.
+    required: false
+    default: latest
+
+outputs:
+  firmware-tag:
+    description: Release tag of the firmware under test.
+    value: ${{ steps.release.outputs.tag }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve the firmware release
+      id: release
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        # Windows runners' Git Bash may only have `python`.
+        py="$(command -v python3 || command -v python)"
+        echo "PYTHON=${py}" >> "$GITHUB_ENV"
+        rel='${{ inputs.firmware-release }}'
+        [ "${rel}" = "latest" ] && rel=""
+        json="$(gh release view ${rel:+"${rel}"} -R '${{ inputs.firmware-repo }}' --json tagName,assets)"
+        # tag, URL and upload time of the first .zip/.bin asset. The upload
+        # time keys the cache, since a rolling tag (beta) keeps its asset name.
+        read -r tag url updated < <(printf '%s' "${json}" | "${py}" -c '
+        import json, sys
+        d = json.load(sys.stdin)
+        pick = [a for a in d["assets"] if a["name"].lower().endswith((".zip", ".bin"))]
+        a = pick[0] if pick else {"url": "", "updatedAt": ""}
+        print(d["tagName"], a["url"] or "-", a["updatedAt"] or "-")')
+        [ "${url}" != "-" ] || { echo "::error::no .zip/.bin asset in ${tag}"; exit 1; }
+        echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+        echo "url=${url}" >> "$GITHUB_OUTPUT"
+        echo "updated=${updated}" >> "$GITHUB_OUTPUT"
+        echo "Firmware under test: ${{ inputs.firmware-repo }} ${tag} (${url##*/}, ${updated})"
+
+    - name: Cache firmware
+      id: fw-cache
+      uses: actions/cache@v4
+      with:
+        path: firmware
+        key: deluge-firmware-${{ inputs.firmware-repo }}-${{ steps.release.outputs.tag }}-${{ steps.release.outputs.updated }}
+
+    - name: Download firmware
+      if: steps.fw-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        mkdir -p firmware
+        url='${{ steps.release.outputs.url }}'
+        curl -fsSL -o "firmware/${url##*/}" "${url}"
+        case "${url}" in
+          *.zip) (cd firmware && "${PYTHON}" -m zipfile -e "${url##*/}" . && rm -f "${url##*/}") ;;
+        esac
+
+    - name: Export DELUGE_FIRMWARE
+      shell: bash
+      run: |
+        # Prefer an .elf (its symbols let the audio tests find the render head),
+        # else the OLED .bin, else the 7-segment .bin.
+        fw="$(find firmware -type f -iname '*.elf' | LC_ALL=C sort | head -n1)"
+        [ -n "${fw}" ] || fw="$(find firmware -type f -iname '*.bin' ! -iname '*7seg*' | LC_ALL=C sort | head -n1)"
+        [ -n "${fw}" ] || fw="$(find firmware -type f -iname '*.bin' | LC_ALL=C sort | head -n1)"
+        [ -n "${fw}" ] || { echo "::error::no firmware image after download"; exit 1; }
+        echo "DELUGE_FIRMWARE=${fw}" >> "$GITHUB_ENV"
+        echo "DELUGE_FIRMWARE=${fw}"
+
+    - name: Cache factory SD-card contents
+      if: inputs.sd-card == 'true'
+      id: sd-cache
+      uses: actions/cache@v4
+      with:
+        path: build/factory-card.zip
+        key: deluge-factory-card-oled-v4p1p0
+
+    - name: Download factory SD-card contents
+      if: inputs.sd-card == 'true' && steps.sd-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        mkdir -p build
+        curl -fsSL -o build/factory-card.zip \
+          'https://synthstrom-audible-deluge.s3.us-east-2.amazonaws.com/Deluge+OLED+V4p1p0+factory+card+contents.zip'
+
+    - name: Build the SD image
+      if: inputs.sd-card == 'true'
+      shell: bash
+      run: |
+        rm -rf build/factory-card
+        "${PYTHON}" -m zipfile -e build/factory-card.zip build/factory-card
+        # Finder metadata in the zip would otherwise land on the card.
+        rm -rf build/factory-card/__MACOSX
+        find build/factory-card -name '._*' -delete
+        ./scripts/mksd.sh build/factory-card build/deluge_sd.img
+        rm -rf build/factory-card
+        echo "DELUGE_SD_IMG=build/deluge_sd.img" >> "$GITHUB_ENV"

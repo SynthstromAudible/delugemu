@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+name: nightly
+
+# Refresh the rolling `nightly` prerelease from main once a day.
+#
+# Moves the `nightly` tag to main's head and dispatches build.yml on it; build.yml's
+# release jobs then build, test and package every OS and replace the nightly
+# release's assets. A tag pushed with the workflow token cannot itself trigger a
+# workflow run, but a workflow_dispatch can, hence the explicit dispatch.
+#
+# Nights where main has not moved since a nightly that built successfully are
+# skipped, so an idle repo costs one short job rather than three full builds.
+on:
+  schedule:
+    - cron: '17 6 * * *'   # 06:17 UTC daily (off the hour, when runners are busiest)
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if main has not changed since the last nightly
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # move the nightly tag
+  actions: write    # dispatch build.yml
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  trigger:
+    name: Move the nightly tag and dispatch the release build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          submodules: false
+
+      - name: Decide whether main needs a new nightly
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          head="$(git rev-parse HEAD)"
+          tagged="$(git rev-parse -q --verify 'refs/tags/nightly^{commit}' || true)"
+          last="$(gh run list --workflow build.yml --branch nightly --limit 1 \
+                    --json headSha,conclusion --jq '.[0] | "\(.headSha) \(.conclusion)"' || true)"
+          echo "main=${head} nightly-tag=${tagged:-none} last-nightly-run=${last:-none}"
+          if [ "${FORCE}" = "true" ]; then
+            echo "Forced rebuild."
+          elif [ "${head}" = "${tagged}" ] && [ "${last}" = "${head} success" ]; then
+            echo "main is unchanged since a successful nightly; nothing to do."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "build=true" >> "$GITHUB_OUTPUT"
+
+      - name: Move the nightly tag to main
+        if: steps.check.outputs.build == 'true'
+        run: |
+          git tag -f nightly HEAD
+          git push -f origin refs/tags/nightly
+
+      - name: Dispatch the release build on the nightly tag
+        if: steps.check.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run build.yml --ref nightly

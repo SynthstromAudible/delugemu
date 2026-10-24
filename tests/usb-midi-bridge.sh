@@ -77,6 +77,7 @@ except FileNotFoundError:
     pass
 
 cmd = [binp, "-M", "deluge", "-kernel", fw, "-display", "none",
+       "-audiodev", "none,id=deluge0", "-global", "rza1l-ssif.audiodev=deluge0",
        "-global", "rza1l-usb.midi=on",
        "-serial", "null",
        "-chardev", f"socket,id=um,path={sock},server=on,wait=off",

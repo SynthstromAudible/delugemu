@@ -21,6 +21,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(RzA1lDmacState, RZA1L_DMAC)
 /* MMIO window covers both channel groups and their common registers. */
 #define RZA1L_DMAC_MMIO_SIZE 0x800
 
+/*
+ * Bulk read from a DREQ-paced peripheral: copy up to `len` bytes of the data it
+ * has ready into `buf`, consuming them as the same number of FIFO reads would,
+ * and return how many were copied (0 if none are ready).
+ */
+typedef uint32_t RzA1lDmacPullFn(void *opaque, uint8_t *buf, uint32_t len);
+
+/* Most a pull is asked for at once: one SD block. */
+#define RZA1L_DMAC_PULL_MAX 512
+
 typedef struct RzA1lDmacChannel {
     uint32_t n0sa;   /* next-0 source address */
     uint32_t n0da;   /* next-0 destination address */
@@ -121,6 +131,9 @@ typedef struct RzA1lDmacChannel {
     bool     dreq_paced;
     bool     dreq_level;
     bool     dreq_servicing;
+    /* Optional bulk read from the peripheral (rza1l_dmac_register_dreq_pull). */
+    RzA1lDmacPullFn *pull;
+    void    *pull_opaque;
 } RzA1lDmacChannel;
 
 struct RzA1lDmacState {
@@ -248,5 +261,13 @@ void rza1l_dmac_register_timing_capture(RzA1lDmacState *s, int timing_ch,
  * RZA1L_DMAC_DREQ input line is high, completing when N0TB bytes have moved.
  */
 void rza1l_dmac_register_dreq(RzA1lDmacState *s, int ch);
+
+/*
+ * Let a DREQ-paced channel whose source is the peripheral's fixed data register
+ * fetch the peripheral's buffered data with `fn` a buffer at a time, instead of
+ * reading the register through the memory API a unit at a time.
+ */
+void rza1l_dmac_register_dreq_pull(RzA1lDmacState *s, int ch,
+                                   RzA1lDmacPullFn *fn, void *opaque);
 
 #endif /* HW_DMA_RZA1L_DMAC_H */

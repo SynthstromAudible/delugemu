@@ -6,6 +6,13 @@ on:
     branches: [main]
     tags: ['v*']
   pull_request:
+  # The merge queue builds each group on a temporary gh-readonly-queue/* ref;
+  # without this trigger no checks ever report there, so required checks would
+  # hold every queued PR until the queue's response timeout.
+  merge_group:
+  # Dispatched on the `nightly` tag by nightly.yml (a tag pushed with the
+  # workflow token cannot trigger a push run), and available for manual runs.
+  workflow_dispatch:
 
 # Building QEMU is expensive; let newer pushes cancel in-flight runs.
 concurrency:
@@ -13,13 +20,27 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Build the emulator, then run the whole suite (tests/run-all.sh) against real
+  # firmware: the latest stable community release, plus the rolling beta on
+  # Linux so firmware-side changes surface early. The beta leg is
+  # continue-on-error -- it moves daily outside this repo, so it reports but does
+  # not block merges. --require-firmware fails the job if a firmware-driven test
+  # skips, so a broken asset download can't pass silently; each test's outcome
+  # is listed in the job summary.
   build-and-test:
-    name: Build qemu-system-arm + smoke + regression
+    name: Build + tests (${{ matrix.os }}, ${{ matrix.firmware }} firmware)
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.firmware == 'beta' }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            firmware: latest
+          - os: macos-latest
+            firmware: latest
+          - os: ubuntu-latest
+            firmware: beta
     steps:
       - name: Checkout (without submodules; we fetch QEMU shallowly)
         uses: actions/checkout@v4
@@ -32,92 +53,127 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             git ninja-build pkg-config python3-venv \
-            libglib2.0-dev libpixman-1-dev libpng-dev flex bison
+            libglib2.0-dev libpixman-1-dev libpng-dev flex bison \
+            dosfstools mtools ccache
 
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install ninja pkg-config glib pixman libpng meson
+          brew install ninja pkg-config glib pixman libpng meson ccache
 
-      - name: Bootstrap QEMU submodule
-        run: ./scripts/bootstrap.sh
-
-      - name: Integrate device models
-        run: ./scripts/integrate.sh
-
-      - name: Build
-        run: ./scripts/build.sh
-
-      - name: Smoke test
-        run: ./tests/smoke.sh
-
-      - name: Firmware-boot regression test
-        # Firmware is not shipped with the repo, so this skips cleanly (exit 0)
-        # when no image is present. To exercise the full boot in CI, fetch an
-        # image in a prior step and point DELUGE_FIRMWARE at it.
-        run: ./tests/boot.sh
-
-  # Scripting-interface checks: the stdlib-only delugemu package unit tests, the
-  # control-map drift guard, and the scenario harness. Firmware is not shipped,
-  # so the scenario step skips cleanly (exit 0). To drive real firmware in CI,
-  # set DELUGEMU_FETCH_FIRMWARE=1 (downloads the latest release) or point
-  # DELUGE_FIRMWARE at an image fetched in a prior step.
-  scenarios:
-    name: Scripting interface (unit + scenarios)
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    steps:
-      - name: Checkout (without submodules; we fetch QEMU shallowly)
-        uses: actions/checkout@v4
-        with:
-          submodules: false
-
-      - name: Install build dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            git ninja-build pkg-config python3-venv \
-            libglib2.0-dev libpixman-1-dev libpng-dev flex bison
-
-      - name: Install build dependencies (macOS)
+      - name: Install python-rtmidi for the CoreMIDI bridge test (macOS)
         if: runner.os == 'macOS'
-        run: brew install ninja pkg-config glib pixman libpng meson
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/venv"
+          "${RUNNER_TEMP}/venv/bin/pip" install --quiet python-rtmidi
+          echo "${RUNNER_TEMP}/venv/bin" >> "$GITHUB_PATH"
 
-      - name: Package unit tests (stdlib only, no emulator)
-        run: PYTHONPATH=pylib python3 -m unittest discover -s pylib/tests -v
+      # Reuse the emulator when nothing that feeds its build has changed: the
+      # pinned QEMU commit, our device models, patches and build scripts, and
+      # the installed toolchain/library versions. On an exact hit the QEMU
+      # checkout and build are skipped (run.sh and the tests need only the
+      # binary). On a miss, ccache keeps the rebuild incremental: a restored
+      # ninja tree would not, as a fresh checkout gives every source file a new
+      # mtime. Saving right after the build means a later test failure still
+      # leaves the binary cached for the re-run.
+      - name: Fingerprint the QEMU build inputs
+        id: qemu-key
+        env:
+          INPUTS_HASH: ${{ hashFiles('src/**', 'qemu-patches/**', 'scripts/bootstrap.sh', 'scripts/integrate.sh', 'scripts/build.sh', 'scripts/common.sh', '.gitmodules') }}
+        run: |
+          mkdir -p build
+          {
+            git rev-parse HEAD:qemu
+            if [ "${RUNNER_OS}" = "Linux" ]; then
+              dpkg-query -W ninja-build pkg-config libglib2.0-dev libpixman-1-dev libpng-dev flex bison ccache
+            else
+              brew list --versions ninja pkg-config glib pixman libpng meson ccache
+              xcrun --show-sdk-version
+            fi
+            cc --version | head -n1
+            python3 --version
+          } > build/qemu-build-inputs.txt
+          cat build/qemu-build-inputs.txt
+          deps="$(git hash-object build/qemu-build-inputs.txt | cut -c1-16)"
+          prefix="${RUNNER_OS}-${RUNNER_ARCH}-${deps}"
+          echo "bin-key=qemu-bin-${prefix}-${INPUTS_HASH}" >> "$GITHUB_OUTPUT"
+          echo "ccache-prefix=ccache-${prefix}-" >> "$GITHUB_OUTPUT"
+
+      - name: Restore a QEMU build for these exact inputs
+        id: qemu-bin
+        uses: actions/cache/restore@v4
+        with:
+          path: qemu/build/qemu-system-arm
+          key: ${{ steps.qemu-key.outputs.bin-key }}
+
+      - name: Restore the compiler cache
+        if: steps.qemu-bin.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ${{ steps.qemu-key.outputs.ccache-prefix }}${{ github.run_id }}
+          restore-keys: ${{ steps.qemu-key.outputs.ccache-prefix }}
 
       - name: Bootstrap QEMU submodule
+        if: steps.qemu-bin.outputs.cache-hit != 'true'
         run: ./scripts/bootstrap.sh
 
       - name: Integrate device models
+        if: steps.qemu-bin.outputs.cache-hit != 'true'
         run: ./scripts/integrate.sh
 
       - name: Build
-        run: ./scripts/build.sh
+        if: steps.qemu-bin.outputs.cache-hit != 'true'
+        env:
+          CC: ccache cc
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_BASEDIR: ${{ github.workspace }}
+          CCACHE_MAXSIZE: 600M
+        run: |
+          ccache --zero-stats
+          ./scripts/build.sh
+          ccache --show-stats
 
-      - name: Run scenarios (skips cleanly without firmware)
-        uses: ./.github/actions/run-scenario
+      - name: Save the QEMU build
+        if: steps.qemu-bin.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
         with:
-          # Flip to 'true' to drive the latest published firmware release.
-          fetch-latest: "false"
+          path: qemu/build/qemu-system-arm
+          key: ${{ steps.qemu-key.outputs.bin-key }}
 
-      - name: Upload scenario artifacts
+      - name: Save the compiler cache
+        if: steps.qemu-bin.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ${{ steps.qemu-key.outputs.ccache-prefix }}${{ github.run_id }}
+
+      - name: Fetch firmware and build the SD image
+        uses: ./.github/actions/test-assets
+        with:
+          firmware-release: ${{ matrix.firmware }}
+          sd-card: "true"
+
+      - name: Run the test suite
+        run: ./tests/run-all.sh --require-firmware
+        env:
+          DELUGEMU_ARTIFACTS: build/scenario-artifacts
+
+      - name: Upload test logs and scenario artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: scenario-artifacts-${{ matrix.os }}
-          path: build/scenario-artifacts
+          name: test-results-${{ matrix.os }}-${{ matrix.firmware }}
+          path: |
+            build/test-logs
+            build/scenario-artifacts
           if-no-files-found: ignore
 
   # Windows build runs under MSYS2/MinGW -- the same toolchain QEMU itself uses
   # for its official Windows binaries. The Bash build scripts run unmodified in
   # the MINGW64 shell (see docs/windows.md).
   build-windows:
-    name: Build qemu-system-arm.exe + smoke + regression (Windows/MSYS2)
+    name: Build + tests (Windows/MSYS2, latest firmware)
     runs-on: windows-latest
     defaults:
       run:
@@ -147,33 +203,113 @@ jobs:
             mingw-w64-x86_64-SDL2
             mingw-w64-x86_64-libpng
             mingw-w64-x86_64-zstd
+            mingw-w64-x86_64-ccache
             dosfstools
             mingw-w64-x86_64-mtools
 
+      # Reuse the emulator when nothing that feeds its build has changed: the
+      # pinned QEMU commit, our device models, patches and build scripts, and
+      # the installed toolchain/library versions. On an exact hit the QEMU
+      # checkout and build are skipped (run.sh and the tests need only the
+      # binary). On a miss, ccache keeps the rebuild incremental: a restored
+      # ninja tree would not, as a fresh checkout gives every source file a new
+      # mtime. Saving right after the build means a later test failure still
+      # leaves the binary cached for the re-run.
+      - name: Fingerprint the QEMU build inputs
+        id: qemu-key
+        env:
+          INPUTS_HASH: ${{ hashFiles('src/**', 'qemu-patches/**', 'scripts/bootstrap.sh', 'scripts/integrate.sh', 'scripts/build.sh', 'scripts/common.sh', '.gitmodules') }}
+        run: |
+          mkdir -p build
+          {
+            git rev-parse HEAD:qemu
+            pacman -Q mingw-w64-x86_64-gcc mingw-w64-x86_64-meson mingw-w64-x86_64-python \
+              mingw-w64-x86_64-pkgconf mingw-w64-x86_64-glib2 mingw-w64-x86_64-pixman \
+              mingw-w64-x86_64-gtk3 mingw-w64-x86_64-SDL2 mingw-w64-x86_64-libpng \
+              mingw-w64-x86_64-zstd mingw-w64-x86_64-ccache ninja
+          } > build/qemu-build-inputs.txt
+          cat build/qemu-build-inputs.txt
+          deps="$(git hash-object build/qemu-build-inputs.txt | cut -c1-16)"
+          prefix="${RUNNER_OS}-${RUNNER_ARCH}-${deps}"
+          echo "bin-key=qemu-bin-${prefix}-${INPUTS_HASH}" >> "$GITHUB_OUTPUT"
+          echo "ccache-prefix=ccache-${prefix}-" >> "$GITHUB_OUTPUT"
+
+      - name: Restore a QEMU build for these exact inputs
+        id: qemu-bin
+        uses: actions/cache/restore@v4
+        with:
+          path: qemu/build/qemu-system-arm.exe
+          key: ${{ steps.qemu-key.outputs.bin-key }}
+
+      - name: Restore the compiler cache
+        if: steps.qemu-bin.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ${{ steps.qemu-key.outputs.ccache-prefix }}${{ github.run_id }}
+          restore-keys: ${{ steps.qemu-key.outputs.ccache-prefix }}
+
       - name: Bootstrap QEMU submodule
+        if: steps.qemu-bin.outputs.cache-hit != 'true'
         run: ./scripts/bootstrap.sh
 
       - name: Integrate device models
+        if: steps.qemu-bin.outputs.cache-hit != 'true'
         run: ./scripts/integrate.sh
 
       - name: Build
-        run: ./scripts/build.sh
+        if: steps.qemu-bin.outputs.cache-hit != 'true'
+        env:
+          CC: ccache gcc
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_BASEDIR: ${{ github.workspace }}
+          CCACHE_MAXSIZE: 600M
+        run: |
+          ccache --zero-stats
+          ./scripts/build.sh
+          ccache --show-stats
 
-      - name: Smoke test
-        run: ./tests/smoke.sh
+      - name: Save the QEMU build
+        if: steps.qemu-bin.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: qemu/build/qemu-system-arm.exe
+          key: ${{ steps.qemu-key.outputs.bin-key }}
 
-      - name: Firmware-boot regression test
-        # Firmware is not shipped with the repo, so this skips cleanly (exit 0)
-        # when no image is present. To exercise the full boot in CI, fetch an
-        # image in a prior step and point DELUGE_FIRMWARE at it.
-        run: ./tests/boot.sh
+      - name: Save the compiler cache
+        if: steps.qemu-bin.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ${{ steps.qemu-key.outputs.ccache-prefix }}${{ github.run_id }}
+
+      - name: Fetch firmware
+        uses: ./.github/actions/test-assets
+
+      # The emulator-driving tests beyond boot use UNIX sockets and are not yet
+      # run on Windows; the unit tests and control-map guard are host-neutral.
+      - name: Run the test suite (Windows subset)
+        run: ./tests/run-all.sh --require-firmware smoke unit geometry-sync boot
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-windows
+          path: build/test-logs
+          if-no-files-found: ignore
 
   # On a version tag (v*), build a self-contained, relocatable bundle for each
   # OS and attach it to the GitHub Release so users can download and run without
   # a build toolchain. See scripts/package.sh.
+  #
+  # The same jobs publish the rolling `nightly` prerelease when nightly.yml
+  # dispatches this workflow on the `nightly` tag: version-stamped
+  # nightly-YYYYMMDD-<sha>, overwriting the previous night's assets (asset
+  # names carry no version), and never marked as the latest release.
   release-macos:
     name: Package + publish macOS bundle
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/tags/nightly'
     needs: build-and-test
     runs-on: macos-latest
     permissions:
@@ -196,22 +332,37 @@ jobs:
       - name: Build
         run: ./scripts/build.sh
 
+      - name: Resolve release version
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF}" = "refs/tags/nightly" ]; then
+            echo "RELEASE_VERSION=nightly-$(date -u +%Y%m%d)-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          else
+            echo "RELEASE_VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          fi
+
       - name: Package relocatable bundle
         run: ./scripts/package.sh
         env:
           # Release tag stamped into the bundle (window title / About box).
-          DELUGEMU_VERSION: ${{ github.ref_name }}
+          DELUGEMU_VERSION: ${{ env.RELEASE_VERSION }}
 
       - name: Upload bundle to the release
         uses: softprops/action-gh-release@v2
         with:
+          # Nightly-only settings; each is '' on a version tag, which the action
+          # treats as unset, so versioned releases publish exactly as before.
+          prerelease: ${{ github.ref == 'refs/tags/nightly' && 'true' || '' }}
+          make_latest: ${{ github.ref == 'refs/tags/nightly' && 'false' || '' }}
+          name: ${{ github.ref == 'refs/tags/nightly' && 'Nightly build' || '' }}
+          body: ${{ github.ref == 'refs/tags/nightly' && format('Automated build of main at {0} ({1}). Replaced every night when main changes; use a versioned release for anything you need to keep.', github.sha, env.RELEASE_VERSION) || '' }}
           files: |
             build/release/DelugEmu-macos-*.dmg
             build/release/DelugEmu-macos-*.tar.gz
 
   release-linux:
     name: Package + publish Linux bundle
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/tags/nightly'
     needs: build-and-test
     runs-on: ubuntu-latest
     permissions:
@@ -238,19 +389,34 @@ jobs:
       - name: Build
         run: ./scripts/build.sh
 
+      - name: Resolve release version
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF}" = "refs/tags/nightly" ]; then
+            echo "RELEASE_VERSION=nightly-$(date -u +%Y%m%d)-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          else
+            echo "RELEASE_VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          fi
+
       - name: Package relocatable bundle
         run: ./scripts/package.sh
         env:
-          DELUGEMU_VERSION: ${{ github.ref_name }}
+          DELUGEMU_VERSION: ${{ env.RELEASE_VERSION }}
 
       - name: Upload bundle to the release
         uses: softprops/action-gh-release@v2
         with:
+          # Nightly-only settings; each is '' on a version tag, which the action
+          # treats as unset, so versioned releases publish exactly as before.
+          prerelease: ${{ github.ref == 'refs/tags/nightly' && 'true' || '' }}
+          make_latest: ${{ github.ref == 'refs/tags/nightly' && 'false' || '' }}
+          name: ${{ github.ref == 'refs/tags/nightly' && 'Nightly build' || '' }}
+          body: ${{ github.ref == 'refs/tags/nightly' && format('Automated build of main at {0} ({1}). Replaced every night when main changes; use a versioned release for anything you need to keep.', github.sha, env.RELEASE_VERSION) || '' }}
           files: build/release/DelugEmu-linux-*.tar.gz
 
   release-windows:
     name: Package + publish Windows bundle
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/tags/nightly'
     needs: build-and-test
     runs-on: windows-latest
     permissions:
@@ -313,17 +479,32 @@ jobs:
           & $wix --version
           & $wix extension add --global WixToolset.Util.wixext/5.0.2
 
+      - name: Resolve release version
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF}" = "refs/tags/nightly" ]; then
+            echo "RELEASE_VERSION=nightly-$(date -u +%Y%m%d)-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          else
+            echo "RELEASE_VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          fi
+
       - name: Package relocatable bundle + MSI installer
         run: ./scripts/package.sh
         env:
           # MSI versions must grow monotonically for upgrades; the shallow CI
           # clone can't use the commit count, so use the workflow run number.
           DELUGEMU_MSI_VERSION: 1.0.${{ github.run_number }}
-          DELUGEMU_VERSION: ${{ github.ref_name }}
+          DELUGEMU_VERSION: ${{ env.RELEASE_VERSION }}
 
       - name: Upload bundle to the release
         uses: softprops/action-gh-release@v2
         with:
+          # Nightly-only settings; each is '' on a version tag, which the action
+          # treats as unset, so versioned releases publish exactly as before.
+          prerelease: ${{ github.ref == 'refs/tags/nightly' && 'true' || '' }}
+          make_latest: ${{ github.ref == 'refs/tags/nightly' && 'false' || '' }}
+          name: ${{ github.ref == 'refs/tags/nightly' && 'Nightly build' || '' }}
+          body: ${{ github.ref == 'refs/tags/nightly' && format('Automated build of main at {0} ({1}). Replaced every night when main changes; use a versioned release for anything you need to keep.', github.sha, env.RELEASE_VERSION) || '' }}
           files: |
             build/release/DelugEmu-windows-*.zip
             build/release/DelugEmu-windows-*.msi

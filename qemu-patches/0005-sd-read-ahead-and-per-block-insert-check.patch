@@ -1,0 +1,132 @@
+diff --git a/hw/sd/sd.c b/hw/sd/sd.c
+index 37f6e0702b..4ae9f19a7b 100644
+--- a/hw/sd/sd.c
++++ b/hw/sd/sd.c
+@@ -196,6 +196,16 @@ struct SDState {
+     uint32_t data_offset;
+     size_t data_size;
+     uint8_t data[512];
++    /*
++     * delugemu: read-ahead. Each blk_pread() costs ~70 us of host time however
++     * little it reads, and the card reads a block per call, so streaming 32 KiB
++     * cost ~5 ms of host time on the vCPU thread. Without -icount that shows up
++     * in the guest as time passing mid-instruction. Read SD_RA_SIZE at once and
++     * serve the following blocks from it; any write drops it.
++     */
++    uint8_t *ra_buf;
++    uint64_t ra_addr;
++    uint32_t ra_len;
+     struct {
+         uint32_t write_counter;
+         uint8_t key[RPMB_KEY_MAC_LEN];
+@@ -209,6 +219,11 @@ struct SDState {
+ 
+ static void sd_realize(DeviceState *dev, Error **errp);
+ 
++static void sd_ra_invalidate(SDState *sd)
++{
++    sd->ra_len = 0;
++}
++
+ static const SDProto sd_proto_spi;
+ static const SDProto sd_proto_emmc;
+ 
+@@ -918,6 +933,7 @@ static void sd_reset(DeviceState *dev)
+     uint64_t sect;
+ 
+     trace_sdcard_reset();
++    sd_ra_invalidate(sd);
+     if (sd->blk) {
+         blk_get_geometry(sd->blk, &sect);
+     } else {
+@@ -975,6 +991,8 @@ static void sd_cardchange(void *opaque, bool load, Error **errp)
+     bool inserted = sd_get_inserted(sd);
+     bool readonly = sd_get_readonly(sd);
+ 
++    sd_ra_invalidate(sd);
++
+     if (inserted) {
+         trace_sdcard_inserted(readonly);
+         sd_reset(dev);
+@@ -1112,10 +1130,43 @@ static const VMStateDescription sd_vmstate = {
+     },
+ };
+ 
++#define SD_RA_SIZE (64 * KiB)
++
++/* Fill the read-ahead buffer from addr. Returns false if that fails. */
++static bool sd_ra_fill(SDState *sd, uint64_t addr, uint32_t len)
++{
++    int64_t end = blk_getlength(sd->blk);
++    uint32_t ra_len;
++
++    if (end <= 0 || addr + len > end) {
++        return false;
++    }
++    ra_len = MIN(SD_RA_SIZE, end - addr);
++    if (!sd->ra_buf) {
++        sd->ra_buf = g_malloc(SD_RA_SIZE);
++    }
++    sd->ra_len = 0;
++    if (blk_pread(sd->blk, addr, ra_len, sd->ra_buf, 0) < 0) {
++        return false;
++    }
++    sd->ra_addr = addr;
++    sd->ra_len = ra_len;
++    return true;
++}
++
+ static void sd_blk_read(SDState *sd, uint64_t addr, uint32_t len)
+ {
+     trace_sdcard_read_block(addr, len);
+     addr += sd_part_offset(sd);
++    if (sd->blk && len <= SD_RA_SIZE) {
++        bool hit = sd->ra_len && addr >= sd->ra_addr &&
++                   addr + len <= sd->ra_addr + sd->ra_len;
++
++        if (hit || sd_ra_fill(sd, addr, len)) {
++            memcpy(sd->data, sd->ra_buf + (addr - sd->ra_addr), len);
++            return;
++        }
++    }
+     if (!sd->blk || blk_pread(sd->blk, addr, len, sd->data, 0) < 0) {
+         fprintf(stderr, "sd_blk_read: read error on host side\n");
+     }
+@@ -1124,6 +1175,7 @@ static void sd_blk_read(SDState *sd, uint64_t addr, uint32_t len)
+ static void sd_blk_write(SDState *sd, uint64_t addr, uint32_t len)
+ {
+     trace_sdcard_write_block(addr, len);
++    sd_ra_invalidate(sd);
+     addr += sd_part_offset(sd);
+     if (!sd->blk || blk_pwrite(sd->blk, addr, len, sd->data, 0) < 0) {
+         fprintf(stderr, "sd_blk_write: write error on host side\n");
+@@ -1291,6 +1343,7 @@ static void emmc_rpmb_blk_write(SDState *sd, uint64_t addr, uint32_t len)
+         }
+         sd->rpmb.result.address = frame->address;
+         addr = lduw_be_p(&frame->address) * RPMB_DATA_LEN + sd_part_offset(sd);
++        sd_ra_invalidate(sd);
+         if (blk_pwrite(sd->blk, addr, RPMB_DATA_LEN, frame->data, 0) < 0) {
+             error_report("sd_blk_write: write error on host side");
+             stw_be_p(&sd->rpmb.result.result, RPMB_RESULT_WRITE_FAILURE);
+@@ -2783,7 +2836,12 @@ static uint8_t sd_read_byte(SDState *sd)
+     uint8_t ret;
+     uint32_t io_len;
+ 
+-    if (!sd->blk || !blk_is_inserted(sd->blk)) {
++    /*
++     * delugemu: blk_is_inserted() walks the block graph, which per byte was
++     * most of the cost of streaming from the card. Check it as each block
++     * starts; a card pulled mid-block finishes sending that block.
++     */
++    if (!sd->blk || (sd->data_offset == 0 && !blk_is_inserted(sd->blk))) {
+         return dummy_byte;
+     }
+ 
+@@ -3033,6 +3091,7 @@ static void sd_instance_finalize(Object *obj)
+     SDState *sd = SDMMC_COMMON(obj);
+ 
+     timer_free(sd->ocr_power_timer);
++    g_free(sd->ra_buf);
+ }
+ 
+ static void sd_blk_size_error(SDState *sd, int64_t blk_size,
