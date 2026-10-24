@@ -123,6 +123,15 @@ struct DelugePicState {
     bool oled_enabled;
     bool oled_selected;
     bool oled_dc_high;
+
+    /*
+     * Horizontal-scroll setup (message 236 + flags), applied by each following
+     * scroll-row message: hscroll_right — the row's pads move toward column 0
+     * and the new pad enters at the far end; hscroll_full — the scrolled area
+     * is all 18 columns (main grid and sidebar) rather than the 16 main ones.
+     */
+    bool hscroll_right;
+    bool hscroll_full;
 };
 
 /*

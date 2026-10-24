@@ -165,6 +165,23 @@ generated from. If a control's geometry changes in C without regenerating, the
 scripting interface would click the wrong pixels; this fails so the generator is
 re-run (`scripts/gen_control_map.py`). Skips cleanly without `python3`.
 
+## `pad-scroll.sh`
+
+The PIC pad-scroll model test. It boots a firmware image with an SD card,
+presses LOAD to open the song browser (which the firmware animates with the
+PIC's vertical scroll commands rather than full column sends), polls the pad
+readout (`dz-pad-leds`) while it opens, and asserts that the PIC received
+vertical scroll commands and that the reported pads stepped through the scroll:
+successive frames each shifted by exactly one row.
+
+```sh
+DELUGE_FIRMWARE=path DELUGE_SD=path ./tests/pad-scroll.sh
+```
+
+Polling is wall-clock, so it requires only a couple of the scroll's steps to be
+seen. It **skips cleanly** (exit 0) when no firmware or SD image is present
+(the SD image defaults to `build/deluge_sd.img`).
+
 ## Adding tests
 
 Keep tests runnable standalone and CI-friendly: exit non-zero on failure, avoid
