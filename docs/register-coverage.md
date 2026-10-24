@@ -62,7 +62,10 @@ addr modes, then sets `END|TC` and pulses the per-channel DMAINT (if `DEM` clear
 Channel 6 is a self-advancing audio TX ring; channel 12 is the PIC RX ring.
 Channel 2 (SD data) is **DREQ-paced**: `SETEN` only arms it (`EN` set,
 `CRSA/CRDA/CRTB` loaded); it moves data while the SDHI holds its level request
-(`dreq` GPIO input) high and completes when `CRTB` reaches zero.
+(`dreq` GPIO input) high and completes when `CRTB` reaches zero. Reads from
+the SDHI's fixed data register take the whole buffered block at once
+(`rza1l_dmac_register_dreq_pull`) rather than a byte per memory-API access:
+the same data, ~10x less host time per block.
 
 ### SDHI — SD host · `rza1l-sdhi`
 
@@ -109,8 +112,19 @@ single-sector read costs ~335 µs and a streamed 32 KiB cluster ~2.3 ms.
 Without `-icount`, QEMU's main loop only fires virtual timers to the
 millisecond on macOS (no `ppoll`), so the MTU2/OSTM counter reads the firmware
 makes constantly also run due SD deadlines on the vCPU thread
-(`deluge_vcpu_tick`). Set `DELUGEMU_SDHI_STATS=1` to print, per virtual second,
-commands issued, KiB read/written and the fraction of time the bus was busy.
+(`deluge_vcpu_tick`). Each phase is timed from the previous phase's deadline,
+not from when its timer was serviced, and a phase already overdue ends at once,
+so a late timer doesn't stretch the rest of a transfer: a block DMA drains as
+soon as it's ready counts as drained at its deadline.
+
+Set `DELUGEMU_SDHI_STATS=1` to print, per virtual second, commands issued,
+KiB read/written, the fraction of time busy split into `bus` (command, card
+latency, transfer, programming) and `bufwait` (a block waiting in the buffer
+for the firmware or DMA), and `irq`: how many interrupts were raised and how
+long the firmware took to read SD_INFO1/2 after each (avg/max). Under
+`-icount` the latter follows how long the firmware runs with interrupts
+masked, in guest instructions; there are no cache or memory stalls, so treat
+it as a comparison between builds rather than a hardware figure.
 
 ### OSTM — OS timer · `rza1l-ostm`
 
