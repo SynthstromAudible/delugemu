@@ -213,7 +213,12 @@ static void rza1l_mtu2_match(RzA1lMtu2State *s, int n, int64_t now)
     rza1l_mtu2_schedule(s, n, now);
 }
 
-/* Take a compare match that has fallen due but whose timer has not yet run. */
+/*
+ * Take a compare match that has fallen due but whose timer has not yet run,
+ * before a write changes how the channel counts. This is not hooked into
+ * deluge_vcpu_tick(): taking matches from there made -icount runs of the
+ * stock firmware diverge between otherwise identical runs.
+ */
 static void rza1l_mtu2_catch_up(RzA1lMtu2State *s, int n, int64_t now)
 {
     QEMUTimer *t = s->ch[n].timer;
@@ -221,16 +226,6 @@ static void rza1l_mtu2_catch_up(RzA1lMtu2State *s, int n, int64_t now)
     if (timer_pending(t) && timer_expire_time_ns(t) <= now) {
         timer_del(t);
         rza1l_mtu2_match(s, n, now);
-    }
-}
-
-static void rza1l_mtu2_vcpu_tick(void *opaque)
-{
-    RzA1lMtu2State *s = opaque;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-
-    for (int n = 0; n < RZA1L_MTU2_NUM_CH; n++) {
-        rza1l_mtu2_catch_up(s, n, now);
     }
 }
 
@@ -407,7 +402,6 @@ static void rza1l_mtu2_realize(DeviceState *dev, Error **errp)
                                       &s->ch[n]);
         sysbus_init_irq(sbd, &s->ch[n].irq);
     }
-    deluge_vcpu_tick_register(rza1l_mtu2_vcpu_tick, s);
 }
 
 static const VMStateDescription vmstate_rza1l_mtu2_channel = {
