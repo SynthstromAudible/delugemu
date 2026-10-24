@@ -122,4 +122,10 @@ struct RzA1lSdhiState {
     uint32_t stats_wr_blocks;
 };
 
+/*
+ * DMA bulk read (an RzA1lDmacPullFn): copy up to `len` bytes of the block
+ * waiting in the data buffer, as that many reads of the data register would.
+ */
+uint32_t rza1l_sdhi_dma_pull(void *opaque, uint8_t *buf, uint32_t len);
+
 #endif /* HW_SD_RZA1L_SDHI_H */

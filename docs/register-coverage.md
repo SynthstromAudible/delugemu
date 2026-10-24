@@ -62,7 +62,10 @@ addr modes, then sets `END|TC` and pulses the per-channel DMAINT (if `DEM` clear
 Channel 6 is a self-advancing audio TX ring; channel 12 is the PIC RX ring.
 Channel 2 (SD data) is **DREQ-paced**: `SETEN` only arms it (`EN` set,
 `CRSA/CRDA/CRTB` loaded); it moves data while the SDHI holds its level request
-(`dreq` GPIO input) high and completes when `CRTB` reaches zero.
+(`dreq` GPIO input) high and completes when `CRTB` reaches zero. Reads from
+the SDHI's fixed data register take the whole buffered block at once
+(`rza1l_dmac_register_dreq_pull`) rather than a byte per memory-API access:
+the same data, ~10x less host time per block.
 
 ### SDHI — SD host · `rza1l-sdhi`
 

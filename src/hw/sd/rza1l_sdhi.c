@@ -629,6 +629,24 @@ static uint32_t rza1l_sdhi_read_buf(RzA1lSdhiState *s, unsigned size)
     return val;
 }
 
+uint32_t rza1l_sdhi_dma_pull(void *opaque, uint8_t *buf, uint32_t len)
+{
+    RzA1lSdhiState *s = opaque;
+    uint32_t n;
+
+    /* As for rza1l_sdhi_read_buf: only a block that has fully arrived. */
+    if (s->phase != SDHI_READ_BUF || s->data_dir != 1) {
+        return 0;
+    }
+    n = MIN(len, s->datacnt);
+    sdbus_read_data(&s->sdbus, buf, n);
+    s->datacnt -= n;
+    if (s->datacnt == 0) {
+        rza1l_sdhi_data_block_done(s);
+    }
+    return n;
+}
+
 static void rza1l_sdhi_write_buf(RzA1lSdhiState *s, uint32_t val, unsigned size)
 {
     unsigned i;
