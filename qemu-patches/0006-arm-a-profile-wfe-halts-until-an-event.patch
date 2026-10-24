@@ -1,0 +1,353 @@
+diff --git a/target/arm/cpu-irq.c b/target/arm/cpu-irq.c
+index fe514cc..d93c08b 100644
+--- a/target/arm/cpu-irq.c
++++ b/target/arm/cpu-irq.c
+@@ -168,7 +168,13 @@ static inline bool arm_excp_unmasked(CPUState *cs, unsigned int excp_idx,
+     return unmasked || pstate_unmasked;
+ }
+ 
+-bool arm_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
++/*
++ * Pick the interrupt in @interrupt_request that the CPU would take now, if
++ * any, without taking it. Returns false when every pending interrupt is
++ * masked (or targets a lower EL).
++ */
++static bool arm_cpu_select_interrupt(CPUState *cs, int interrupt_request,
++                                     uint32_t *excp_out, uint32_t *el_out)
+ {
+     CPUARMState *env = cpu_env(cs);
+     uint32_t cur_el = arm_current_el(env);
+@@ -258,20 +264,52 @@ bool arm_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
+         target_el = 1;
+         if (arm_excp_unmasked(cs, excp_idx, target_el,
+                               cur_el, secure, hcr_el2)) {
+-            /* Taking a virtual abort clears HCR_EL2.VSE */
+-            env->cp15.hcr_el2 &= ~HCR_VSE;
+-            cpu_reset_interrupt(cs, CPU_INTERRUPT_VSERR);
+             goto found;
+         }
+     }
+     return false;
+ 
+  found:
++    *excp_out = excp_idx;
++    *el_out = target_el;
++    return true;
++}
++
++bool arm_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
++{
++    CPUARMState *env = cpu_env(cs);
++    uint32_t excp_idx;
++    uint32_t target_el;
++
++    if (!arm_cpu_select_interrupt(cs, interrupt_request,
++                                  &excp_idx, &target_el)) {
++        return false;
++    }
++    if (excp_idx == EXCP_VSERR) {
++        /* Taking a virtual abort clears HCR_EL2.VSE */
++        env->cp15.hcr_el2 &= ~HCR_VSE;
++        cpu_reset_interrupt(cs, CPU_INTERRUPT_VSERR);
++    }
+     cs->exception_index = excp_idx;
+     env->exception.target_el = target_el;
+     cs->cc->tcg_ops->do_interrupt(cs);
+     return true;
+ }
++
++bool arm_cpu_wfe_wakeup_pending(CPUState *cs)
++{
++    /*
++     * A pending IRQ, FIQ or asynchronous abort is a WFE wake-up event
++     * only when the CPSR (with the SCR/HCR routing overrides) does not
++     * mask it, which is exactly the set of interrupts the CPU would take.
++     */
++    uint32_t excp_idx;
++    uint32_t target_el;
++
++    int request = qatomic_load_acquire(&cs->interrupt_request);
++
++    return arm_cpu_select_interrupt(cs, request, &excp_idx, &target_el);
++}
+ #endif /* CONFIG_TCG */
+ 
+ void arm_cpu_update_virq(ARMCPU *cpu)
+diff --git a/target/arm/cpu.c b/target/arm/cpu.c
+index ccc47c8..9224b6e 100644
+--- a/target/arm/cpu.c
++++ b/target/arm/cpu.c
+@@ -150,6 +150,19 @@ static bool arm_cpu_has_work(CPUState *cs)
+         }
+     }
+ 
++#ifdef CONFIG_TCG
++    if (cpu->env.wfe_halted) {
++        /*
++         * WFE wake-up events (ARMv7 ARM B1.8.13): the event register being
++         * set (SEV on any processor), or an IRQ, FIQ or asynchronous abort
++         * that the CPSR does not mask. Unlike WFI, a masked interrupt does
++         * not end the wait.
++         */
++        return (cpu->power_state != PSCI_OFF)
++            && (cpu->env.event_register || arm_cpu_wfe_wakeup_pending(cs));
++    }
++#endif
++
+     return (cpu->power_state != PSCI_OFF)
+         && cpu_test_interrupt(cs,
+                CPU_INTERRUPT_FIQ | CPU_INTERRUPT_HARD
+@@ -776,6 +789,7 @@ bool arm_cpu_exec_halt(CPUState *cs)
+         if (cpu->wfxt_timer) {
+             timer_del(cpu->wfxt_timer);
+         }
++        cpu->env.wfe_halted = false;
+     }
+     return leave_halt;
+ }
+diff --git a/target/arm/cpu.h b/target/arm/cpu.h
+index 657ff4a..c7eee21 100644
+--- a/target/arm/cpu.h
++++ b/target/arm/cpu.h
+@@ -763,9 +763,15 @@ typedef struct CPUArchState {
+     /*
+      * The event register is shared by all ARM profiles (A/R/M),
+      * so it is stored in the top-level CPU state.
+-     * WFE/SEV handling is currently implemented only for M-profile.
++     * WFE consumes it for M-profile and for ARMv7-A/R (arm_wfe_can_halt());
++     * other cores treat WFE as a yield.
+      */
+     bool event_register;
++    /*
++     * True while halted by an A/R-profile WFE (as opposed to WFI): such a
++     * CPU wakes on a set event register or an unmasked interrupt only.
++     */
++    bool wfe_halted;
+ 
+     /* Fields up to this point are cleared by a CPU reset */
+     struct {} end_reset_fields;
+diff --git a/target/arm/internals.h b/target/arm/internals.h
+index 85980f0..078e788 100644
+--- a/target/arm/internals.h
++++ b/target/arm/internals.h
+@@ -1207,6 +1207,32 @@ static inline const char *aarch32_mode_name(uint32_t psr)
+  */
+ bool arm_cpu_exec_interrupt(CPUState *cs, int interrupt_request);
+ 
++/**
++ * arm_cpu_wfe_wakeup_pending(): True if an interrupt is pending that is a
++ * WFE wake-up event: one the CPU would take now, i.e. not masked by the
++ * CPSR/PSTATE bits (allowing for the SCR/HCR overrides that make a mask bit
++ * ineffective).
++ */
++bool arm_cpu_wfe_wakeup_pending(CPUState *cs);
++
++/**
++ * arm_wfe_can_halt(): True if WFE on this CPU suspends execution until a
++ * WFE wake-up event, as the architecture describes, rather than yielding.
++ *
++ * This is the ARMv7-A/R model (event register set by SEV and by exception
++ * return; woken by SEV or an unmasked IRQ/FIQ/asynchronous abort).
++ * M-profile has its own handling. ARMv8 is excluded because it also sets
++ * the event register when the global exclusive monitor is cleared, which
++ * QEMU does not model; halting there could sleep through a release that
++ * software (e.g. Linux's LDAXR/WFE wait loops) relies on to wake it.
++ */
++static inline bool arm_wfe_can_halt(CPUARMState *env)
++{
++    return arm_feature(env, ARM_FEATURE_V7)
++        && !arm_feature(env, ARM_FEATURE_V8)
++        && !arm_feature(env, ARM_FEATURE_M);
++}
++
+ /**
+  * arm_cpu_update_virq: Update CPU_INTERRUPT_VIRQ bit in cs->interrupt_request
+  *
+diff --git a/target/arm/machine.c b/target/arm/machine.c
+index b0e4995..9878f6a 100644
+--- a/target/arm/machine.c
++++ b/target/arm/machine.c
+@@ -528,6 +528,24 @@ static const VMStateDescription vmstate_event = {
+     }
+ };
+ 
++static bool wfe_halted_needed(void *opaque)
++{
++    ARMCPU *cpu = opaque;
++
++    return cpu->env.wfe_halted;
++}
++
++static const VMStateDescription vmstate_wfe_halted = {
++    .name = "cpu/wfe_halted",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .needed = wfe_halted_needed,
++    .fields = (const VMStateField[]) {
++        VMSTATE_BOOL(env.wfe_halted, ARMCPU),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
+ static const VMStateDescription vmstate_m = {
+     .name = "cpu/m",
+     .version_id = 4,
+@@ -1310,6 +1328,7 @@ const VMStateDescription vmstate_arm_cpu = {
+         &vmstate_syndrome64,
+         &vmstate_pstate64,
+         &vmstate_event,
++        &vmstate_wfe_halted,
+         NULL
+     }
+ };
+diff --git a/target/arm/tcg/a32.decode b/target/arm/tcg/a32.decode
+index f2ca480..584866c 100644
+--- a/target/arm/tcg/a32.decode
++++ b/target/arm/tcg/a32.decode
+@@ -192,8 +192,8 @@ SMULTT           .... 0001 0110 .... 0000 .... 1110 ....      @rd0mn
+       WFE        ---- 0011 0010 0000 1111 ---- 0000 0010
+       WFI        ---- 0011 0010 0000 1111 ---- 0000 0011
+ 
+-      # TODO: Implement SEV, SEVL; may help SMP performance.
+-      # SEV      ---- 0011 0010 0000 1111 ---- 0000 0100
++      SEV        ---- 0011 0010 0000 1111 ---- 0000 0100
++      # TODO: Implement SEVL; may help SMP performance.
+       # SEVL     ---- 0011 0010 0000 1111 ---- 0000 0101
+ 
+       ESB        ---- 0011 0010 0000 1111 ---- 0001 0000
+diff --git a/target/arm/tcg/op_helper.c b/target/arm/tcg/op_helper.c
+index aa14f15..b589d71 100644
+--- a/target/arm/tcg/op_helper.c
++++ b/target/arm/tcg/op_helper.c
+@@ -474,9 +474,8 @@ void HELPER(sev)(CPUARMState *env)
+     CPUState *cs = env_cpu(env);
+     CPU_FOREACH(cs) {
+         ARMCPU *target_cpu = ARM_CPU(cs);
+-        if (arm_feature(&target_cpu->env, ARM_FEATURE_M)) {
+-            target_cpu->env.event_register = true;
+-        }
++        /* SEV sets the event register of every processor (B1.8.13). */
++        target_cpu->env.event_register = true;
+         if (!qemu_cpu_is_self(cs)) {
+             qemu_cpu_kick(cs);
+         }
+@@ -507,12 +506,43 @@ void HELPER(wfe)(CPUARMState *env)
+             return;
+         }
+ 
++        cs->exception_index = EXCP_HLT;
++        cs->halted = 1;
++        cpu_loop_exit(cs);
++    } else if (arm_wfe_can_halt(env)) {
++        /*
++         * ARMv7-A/R (ARM DDI 0406C.b B1.8.13): if the event register is set,
++         * clear it and complete; otherwise suspend until a WFE wake-up event
++         * (arm_cpu_has_work() while wfe_halted is set: SEV, or an IRQ, FIQ
++         * or asynchronous abort the CPSR does not mask).
++         */
++        CPUState *cs = env_cpu(env);
++        uint32_t excp;
++
++        if (env->event_register) {
++            env->event_register = false;
++            return;
++        }
++        if (check_wfx_trap(env, true, &excp)) {
++            /*
++             * HCR.TWE would trap this WFE to Hyp mode; that trap is not
++             * modelled, so keep the old behaviour of yielding.
++             */
++            HELPER(yield)(env);
++        }
++
++        env->wfe_halted = true;
++        if (cpu_has_work(cs)) {
++            /* A wake-up event is already pending: don't bother halting. */
++            env->wfe_halted = false;
++            return;
++        }
+         cs->exception_index = EXCP_HLT;
+         cs->halted = 1;
+         cpu_loop_exit(cs);
+     } else {
+         /*
+-         * For A-profile and others, we rely on the existing "yield" behavior.
++         * For ARMv8 A-profile and older cores, rely on the "yield" behavior.
+          * Don't actually halt the CPU, just yield back to top
+          * level loop. This is not going into a "low power state"
+          * (ie halting until some event occurs), so we never take
+@@ -591,6 +621,9 @@ void HELPER(cpsr_write_eret)(CPUARMState *env, uint32_t val)
+     mask = aarch32_cpsr_valid_mask(env->features, &env_archcpu(env)->isar);
+     cpsr_write(env, val, mask, CPSRWriteExceptionReturn);
+ 
++    /* An exception return sets the event register (B1.8.13). */
++    env->event_register = true;
++
+     /* Generated code has already stored the new PC value, but
+      * without masking out its low bits, because which bits need
+      * masking depends on whether we're returning to Thumb or ARM
+diff --git a/target/arm/tcg/t16.decode b/target/arm/tcg/t16.decode
+index 778fbf1..8e9158f 100644
+--- a/target/arm/tcg/t16.decode
++++ b/target/arm/tcg/t16.decode
+@@ -228,8 +228,7 @@ REVSH           1011 1010 11 ... ...            @rdm
+     WFE         1011 1111 0010 0000
+     WFI         1011 1111 0011 0000
+ 
+-    # M-profile SEV is implemented.
+-    # TODO: Implement SEV for other profiles, and SEVL for all profiles; may help SMP performance.
++    # TODO: Implement SEVL; may help SMP performance.
+     SEV         1011 1111 0100 0000
+     # SEVL      1011 1111 0101 0000
+ 
+diff --git a/target/arm/tcg/t32.decode b/target/arm/tcg/t32.decode
+index 49b8d00..f5a084d 100644
+--- a/target/arm/tcg/t32.decode
++++ b/target/arm/tcg/t32.decode
+@@ -369,8 +369,7 @@ CLZ              1111 1010 1011 ---- 1111 .... 1000 ....      @rdm
+         WFE      1111 0011 1010 1111 1000 0000 0000 0010
+         WFI      1111 0011 1010 1111 1000 0000 0000 0011
+ 
+-        # M-profile SEV is implemented.
+-        # TODO: Implement SEV for other profiles, and SEVL for all profiles; may help SMP performance.
++        # TODO: Implement SEVL; may help SMP performance.
+         SEV      1111 0011 1010 1111 1000 0000 0000 0100
+         # SEVL   1111 0011 1010 1111 1000 0000 0000 0101
+ 
+diff --git a/target/arm/tcg/translate.c b/target/arm/tcg/translate.c
+index c57d1a6..e653017 100644
+--- a/target/arm/tcg/translate.c
++++ b/target/arm/tcg/translate.c
+@@ -3244,13 +3244,12 @@ static bool trans_YIELD(DisasContext *s, arg_YIELD *a)
+ static bool trans_SEV(DisasContext *s, arg_SEV *a)
+ {
+     /*
+-     * Currently SEV is a NOP for non-M-profile and in user-mode emulation.
+-     * For system-mode M-profile, it sets the event register.
++     * SEV is a NOP in user-mode emulation. In system mode it sets the
++     * event register of every CPU, which M-profile and ARMv7-A/R WFE
++     * consume.
+      */
+ #ifndef CONFIG_USER_ONLY
+-    if (arm_dc_feature(s, ARM_FEATURE_M)) {
+-        gen_helper_sev(tcg_env);
+-    }
++    gen_helper_sev(tcg_env);
+ #endif
+     return true;
+ }
+@@ -3261,10 +3260,10 @@ static bool trans_WFE(DisasContext *s, arg_WFE *a)
+      * When running single-threaded TCG code, use the helper to ensure that
+      * the next round-robin scheduled vCPU gets a crack.
+      *
+-     * For Cortex-M, we implement the architectural WFE behavior (sleeping
+-     * until an event occurs or the Event Register is set).
+-     * For other profiles, we currently treat this as a NOP or yield,
+-     * to preserve existing performance characteristics.
++     * For Cortex-M and ARMv7-A/R, the helper implements the architectural
++     * WFE behavior (sleeping until an event occurs or the Event Register
++     * is set). For other profiles, it is a NOP or yield, to preserve
++     * existing performance characteristics.
+      */
+     if (!(tb_cflags(s->base.tb) & CF_PARALLEL)) {
+         gen_update_pc(s, curr_insn_len(s));
