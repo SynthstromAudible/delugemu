@@ -121,6 +121,13 @@ typedef struct RzA1lDmacChannel {
     bool     dreq_paced;
     bool     dreq_level;
     bool     dreq_servicing;
+
+    /*
+     * The channel's DMA expansion resource selector (its half of DMARSn): which
+     * peripheral request drives it. Roles that follow a peripheral rather than
+     * a channel number (the SD data channel, the MIDI timing ring) key on it.
+     */
+    uint16_t dmars;
 } RzA1lDmacChannel;
 
 struct RzA1lDmacState {
@@ -129,8 +136,13 @@ struct RzA1lDmacState {
 
     /*< public >*/
     MemoryRegion iomem;
+    /* DMARS0..7 at RZA1L_DMARS_BASE: two 16-bit channel selectors per word. */
+    MemoryRegion dmars_iomem;
 
     RzA1lDmacChannel ch[RZA1L_DMAC_NUM_CH];
+
+    /* The SD host's buffer-ready request, which paces any SDHI-selected channel. */
+    bool sdhi_dreq_level;
 
     /*
      * Per-channel transfer-end interrupt lines (DMAINT0..DMAINT15). Pulsed
@@ -248,5 +260,16 @@ void rza1l_dmac_register_timing_capture(RzA1lDmacState *s, int timing_ch,
  * RZA1L_DMAC_DREQ input line is high, completing when N0TB bytes have moved.
  */
 void rza1l_dmac_register_dreq(RzA1lDmacState *s, int ch);
+
+/*
+ * Named GPIO input (one line) carrying the SD host's DMA request. It paces
+ * whichever channels have an SDHI transmit or receive DMARS selector, however
+ * the firmware allocated them.
+ */
+#define RZA1L_DMAC_SDHI_DREQ "sdhi-dreq"
+
+/* The DMARS register block (DMARS0..7), a separate MMIO window. */
+#define RZA1L_DMARS_BASE      0xFCFE1000
+#define RZA1L_DMARS_MMIO_SIZE 0x20
 
 #endif /* HW_DMA_RZA1L_DMAC_H */

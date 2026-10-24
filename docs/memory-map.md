@@ -38,7 +38,7 @@ registers are real vs. shadow/stub — is documented in
 | MTU2 (timer)                  | `0xFCFF0000` | `0x400`  | `rza1l-mtu2` | free-running counters |
 | GPIO ports                    | `0xFCFE3004` | `0x4F00` | `rza1l-gpio` | shadow + PPR loopback |
 | RSPI0 (SPI)                   | `0xE800C800` | `0x100`  | `rza1l-rspi` | OLED + CV/gate DAC link |
-| SPIBSC (SPI flash)            | `0x3FEFA000` | `0x100`  | `rza1l-spibsc` | stub; no backing flash |
+| SPIBSC (SPI flash)            | `0x3FEFA000` | `0x100`  | `rza1l-spibsc` | 4 MB flash; window `0x18000000` + mirror `0x58000000` |
 | SD host interface (SDHI)      | `0xE804E800` | `0x100`  | `rza1l-sdhi` | full SD host controller |
 | ADC (S12AD)                   | `0xE8005800` | `0x100`  | `rza1l-adc` | battery-sense stub |
 | RTC                           | `0xFCFF1000` | `0x40`   | `rza1l-rtc` | fixed-time stub |

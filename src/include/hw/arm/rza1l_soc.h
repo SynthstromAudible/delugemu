@@ -120,6 +120,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(RzA1lSocState, RZA1L_SOC)
  * (SSIRXI0 = 173) and transmit-empty (SSITXI0 = 174); GIC SPI line = ID - 32.
  */
 #define RZA1L_SSIF_SSII0_SPI  (172 - 32)
+/* OSTM0TINT / OSTM1TINT: interrupt IDs 134 and 135. */
+#define RZA1L_OSTM_TINT0_SPI  (134 - 32)
+#define RZA1L_OSTM_TINT1_SPI  (135 - 32)
 #define RZA1L_SSIF_RXI0_SPI   (173 - 32)
 #define RZA1L_SSIF_TXI0_SPI   (174 - 32)
 
@@ -168,8 +171,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(RzA1lSocState, RZA1L_SOC)
 #define RZA1L_SDHI_INTC_ID   305
 #define RZA1L_SDHI_SPI       (RZA1L_SDHI_INTC_ID - 32)
 
-/* DMA channel the firmware moves SD card data on (SD1_DMA_CHANNEL). */
-#define RZA1L_SD_DMA_CH      2
 /* DMA channel the firmware reads PIC input from (PIC_RX_DMA_CHANNEL). */
 #define RZA1L_PIC_RX_DMA_CH  12
 /* DMA channel the firmware reads MIDI input from (MIDI_RX_DMA_CHANNEL). */
@@ -211,6 +212,7 @@ struct RzA1lSocState {
     MemoryRegion sdram;
     MemoryRegion sram_mirror;
     MemoryRegion sdram_mirror;
+    MemoryRegion spi_rom_mirror;
 
     RzA1lRspiState rspi0;
     RzA1lSsifState ssif;

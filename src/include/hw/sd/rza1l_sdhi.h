@@ -37,6 +37,8 @@ struct RzA1lSdhiState {
     uint16_t arg0;
     uint16_t arg1;
     uint16_t stop;
+    /* The data command's SD_CMD mode bits allow the controller's auto CMD12. */
+    bool auto_cmd12;
     uint16_t seccnt;
     uint16_t size;
 
