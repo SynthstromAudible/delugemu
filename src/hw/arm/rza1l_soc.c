@@ -205,8 +205,8 @@ static void rza1l_soc_realize(DeviceState *dev, Error **errp)
     }
 
     /*
-     * MTU2 timer. Provides the free-running counters the firmware uses for
-     * busy-wait delays. Mapped over the io.high catch-all.
+     * MTU2 timer: the counters the firmware uses for busy-wait delays, and
+     * the compare-match interrupts. Mapped over the io.high catch-all.
      */
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->mtu2), errp)) {
         return;
@@ -415,6 +415,18 @@ static void rza1l_soc_realize(DeviceState *dev, Error **errp)
                        qdev_get_gpio_in(DEVICE(&s->gic), RZA1L_OSTM_TINT0_SPI));
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->ostm), 1,
                        qdev_get_gpio_in(DEVICE(&s->gic), RZA1L_OSTM_TINT1_SPI));
+    /* MTU2 TGInA: channel compare-match-A interrupts, level while pending. */
+    {
+        static const int tgia_spi[RZA1L_MTU2_NUM_CH] = {
+            RZA1L_MTU2_TGI0A_SPI, RZA1L_MTU2_TGI1A_SPI, RZA1L_MTU2_TGI2A_SPI,
+            RZA1L_MTU2_TGI3A_SPI, RZA1L_MTU2_TGI4A_SPI,
+        };
+
+        for (int ch = 0; ch < RZA1L_MTU2_NUM_CH; ch++) {
+            sysbus_connect_irq(SYS_BUS_DEVICE(&s->mtu2), ch,
+                               qdev_get_gpio_in(DEVICE(&s->gic), tgia_spi[ch]));
+        }
+    }
 
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->ssif), 0,
                        qdev_get_gpio_in(DEVICE(&s->gic), RZA1L_SSIF_SSII0_SPI));
