@@ -311,6 +311,10 @@ static void deluge_pic_dispatch(DelugePicState *s)
     }
     if (cmd >= PIC_MSG_SET_SCROLL_ROW_BASE &&
         cmd <= PIC_MSG_SET_SCROLL_ROW_LAST) {
+        PIC_DBG("SET_SCROLL_ROW row=%u %s width=%u",
+                cmd - PIC_MSG_SET_SCROLL_ROW_BASE,
+                s->hscroll_right ? "right" : "left",
+                s->hscroll_full ? DELUGE_PIC_GRID_COLS : 16);
         deluge_pic_scroll_row(s, cmd - PIC_MSG_SET_SCROLL_ROW_BASE);
         if (s->padgrid) {
             deluge_padgrid_update(s->padgrid, s->pad_grid);
@@ -325,6 +329,8 @@ static void deluge_pic_dispatch(DelugePicState *s)
         return;
     }
     if (cmd == PIC_MSG_SET_SCROLL_UP || cmd == PIC_MSG_SET_SCROLL_DOWN) {
+        PIC_DBG("SET_SCROLL_%s vertical",
+                cmd == PIC_MSG_SET_SCROLL_UP ? "UP" : "DOWN");
         deluge_pic_scroll_vertical(s, cmd == PIC_MSG_SET_SCROLL_UP,
                                    s->payload_have / 3);
         if (s->padgrid) {
