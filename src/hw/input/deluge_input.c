@@ -13,6 +13,8 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
+#include "system/runstate.h"
 #include "qemu/timer.h"
 #include "ui/console.h"
 #include "ui/input.h"
@@ -737,6 +739,8 @@ void deluge_input_set_skin(DeviceState *dev, DeviceState *skin)
     s->skin = skin;
 }
 
+static void deluge_input_stop_cb(void *opaque);
+
 static void deluge_input_realize(DeviceState *dev, Error **errp)
 {
     DelugeInputState *s = DELUGE_INPUT(dev);
@@ -758,6 +762,8 @@ static void deluge_input_realize(DeviceState *dev, Error **errp)
 
     s->latch_active = false;
     s->latched_count = 0;
+
+    s->stop_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, deluge_input_stop_cb, s);
 
     /* Track per-binding down state so we can filter host key auto-repeat. */
     s->binding_count = ARRAY_SIZE(deluge_input_bindings);
@@ -799,10 +805,88 @@ static void deluge_input_unrealize(DeviceState *dev)
     }
 }
 
+/*
+ * Scripted input, written as the QOM property "dz-event" (qom-set): one raw
+ * event per write, independent of the pointer and the host keyboard, so a
+ * script can hold any set of controls and release each when it chooses.
+ *   "button X Y down|up"  a front-panel button at matrix column X, row Y
+ *   "pad X Y down|up"     a grid pad (X 0..17, Y 0..7)
+ *   "encoder N D"         D detents (signed) on encoder N, in the firmware's
+ *                         index order (0 scroll Y, 1 scroll X, 2 tempo,
+ *                         3 select, 4 upper gold, 5 lower gold)
+ */
+static void deluge_input_set_event(Object *obj, const char *value, Error **errp)
+{
+    DelugeInputState *s = DELUGE_INPUT(obj);
+    char kind[16], state[8];
+    int a, b;
+
+    if (sscanf(value, "%15s %d %d %7s", kind, &a, &b, state) == 4 &&
+        (strcmp(kind, "button") == 0 || strcmp(kind, "pad") == 0)) {
+        bool down = strcmp(state, "down") == 0;
+
+        if (!down && strcmp(state, "up") != 0) {
+            error_setg(errp, "dz-event: expected down|up in '%s'", value);
+            return;
+        }
+        deluge_input_emit(s, a, b, strcmp(kind, "button") == 0, down);
+        return;
+    }
+    if (sscanf(value, "%15s %d %d", kind, &a, &b) == 3 &&
+        strcmp(kind, "encoder") == 0) {
+        if (!s->gpio || a < 0 || a >= DELUGE_ENC_COUNT) {
+            error_setg(errp, "dz-event: no encoder %d", a);
+            return;
+        }
+        for (int i = 0; i < abs(b); i++) {
+            rza1l_gpio_encoder_step(s->gpio, a, b > 0 ? 1 : -1);
+        }
+        return;
+    }
+    error_setg(errp, "dz-event: cannot parse '%s'", value);
+}
+
+/*
+ * Deterministic scripted runs. Under -icount with sleep=off, virtual time
+ * advances only with guest execution, so a script that pauses the VM at exact
+ * virtual times and injects its events there replays identically:
+ *   dz-vclock-ns (read)   the virtual clock, in ns
+ *   dz-stop-at-ns (write) pause the VM (as the "stop" command does) when the
+ *                         virtual clock reaches this time; resume with "cont"
+ */
+static void deluge_input_stop_cb(void *opaque)
+{
+    qemu_system_vmstop_request_prepare();
+    qemu_system_vmstop_request(RUN_STATE_PAUSED);
+}
+
+static void deluge_input_get_vclock(Object *obj, Visitor *v, const char *name,
+                                    void *opaque, Error **errp)
+{
+    uint64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    visit_type_uint64(v, name, &ns, errp);
+}
+
+static void deluge_input_set_stop_at(Object *obj, Visitor *v, const char *name,
+                                     void *opaque, Error **errp)
+{
+    DelugeInputState *s = DELUGE_INPUT(obj);
+    uint64_t ns;
+
+    if (!visit_type_uint64(v, name, &ns, errp)) {
+        return;
+    }
+    timer_mod(s->stop_timer, ns);
+}
+
 static void deluge_input_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
+    object_class_property_add_str(klass, "dz-event", NULL, deluge_input_set_event);
+    object_class_property_add(klass, "dz-vclock-ns", "uint64", deluge_input_get_vclock, NULL, NULL, NULL);
+    object_class_property_add(klass, "dz-stop-at-ns", "uint64", NULL, deluge_input_set_stop_at, NULL, NULL);
     dc->realize = deluge_input_realize;
     dc->unrealize = deluge_input_unrealize;
     dc->desc = "Synthstrom Deluge host-input mapping";

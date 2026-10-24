@@ -64,6 +64,9 @@ class QmpClient:
         return self.execute("human-monitor-command",
                             **{"command-line": command_line})
 
+    def qom_set(self, path, prop, value):
+        return self.execute("qom-set", path=path, property=prop, value=value)
+
     def qom_get(self, path, prop):
         return self.execute("qom-get", path=path, property=prop)
 

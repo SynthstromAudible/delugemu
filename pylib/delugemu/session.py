@@ -219,6 +219,42 @@ class DelugeSession:
         """Release a control held with hold()."""
         self._btn("left", False)
 
+    # -- scripted input ------------------------------------------------------
+    # Raw events on the input device's "dz-event" property: independent of the
+    # pointer, so any set of controls can be held and each released at will.
+    def _dz_event(self, text):
+        self.q.qom_set(self._dev("input", "deluge-input", "/machine/soc/input"),
+                       "dz-event", text)
+
+    def vclock_ns(self):
+        """The guest's virtual clock, in ns (deterministic under -icount sleep=off)."""
+        return int(self.q.qom_get(self._dev("input", "deluge-input", "/machine/soc/input"), "dz-vclock-ns"))
+
+    def run_until(self, ns, timeout=120.0):
+        """Run the (paused) VM until the virtual clock reaches ``ns``, then leave it paused there. Pair with a
+        launch under ``-icount shift=N,sleep=off`` and ``-S`` for runs that replay identically."""
+        self.q.qom_set(self._dev("input", "deluge-input", "/machine/soc/input"), "dz-stop-at-ns", int(ns))
+        self.q.execute("cont")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not self.q.execute("query-status").get("running", False):
+                return
+            time.sleep(0.002)
+        raise TimeoutError("run_until(%d): the VM did not reach its stop time" % ns)
+
+    def button(self, x, y, down):
+        """Press (down=True) or release a front-panel button at matrix column x, row y."""
+        self._dz_event("button %d %d %s" % (x, y, "down" if down else "up"))
+
+    def pad_event(self, x, y, down):
+        """Press or release grid pad (x, y): x 0..17 (16/17 the sidebar), y 0..7."""
+        self._dz_event("pad %d %d %s" % (x, y, "down" if down else "up"))
+
+    def encoder(self, index, detents):
+        """Turn encoder ``index`` (firmware order: 0 scroll Y, 1 scroll X, 2 tempo,
+        3 select, 4 upper gold, 5 lower gold) by signed ``detents``."""
+        self._dz_event("encoder %d %d" % (index, detents))
+
     def turn(self, name, delta):
         """Turn a rotary encoder (``Control`` member or name) by ``delta``
         detents (negative = CCW)."""

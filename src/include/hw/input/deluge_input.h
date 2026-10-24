@@ -107,6 +107,9 @@ struct DelugeInputState {
 
     bool *binding_down;
     int binding_count;
+
+    /* Scripted runs: pauses the VM at a requested virtual time (dz-stop-at-ns). */
+    QEMUTimer *stop_timer;
 };
 
 /* Bind the PIC whose input stream this device drives (board setup). */
