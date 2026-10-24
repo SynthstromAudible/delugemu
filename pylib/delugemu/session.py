@@ -63,7 +63,7 @@ class DelugeSession:
     def launch(cls, firmware=None, sd=None, icount=None, headless=True,
                sock=None, int_log=None, extra_qemu=(), repo_root=None,
                boot_wait=0.0, connect_timeout=90.0, env=None, artifacts_dir=None,
-               run_log=None):
+               run_log=None, audio=None):
         """Start the emulator via scripts/run.sh and connect to it.
 
         ``firmware`` None lets run.sh resolve one (local image, or a download
@@ -87,6 +87,9 @@ class DelugeSession:
         if sd:
             cmd += ["--sd", sd]
         cmd += ["--display", "console" if not headless else "none"]
+        if audio is not None:
+            # run.sh's --audio: a host backend for the codec output, or "none" to play nothing.
+            cmd += ["--audio", audio]
         if icount is not None:
             cmd += ["--icount", str(icount)]
         qemu_args = ["-qmp", "unix:%s,server,nowait" % sock]

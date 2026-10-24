@@ -69,6 +69,8 @@ Input (controls are a `Control` enum member — e.g. `Control.PLAY` — or its n
 - `press(name, hold_ms=120)` — tap a button or encoder push-click (`Control.PLAY`, `Control.SHIFT`, `Control.SELECT_ENC`, …).
 - `hold(name)` / `release()` — press and keep held, then release.
 - `turn(name, delta)` — turn a rotary encoder `delta` detents (negative = CCW).
+- `launch(..., audio="none")` — no host audio output (run.sh `--audio none`); by default the codec plays through
+  the host's speakers.
 - `vclock_ns()`, `run_until(ns)` — deterministic runs: launch with `extra_qemu=("-icount", "shift=2,sleep=off",
   "-S")` (and no `icount`), then advance the paused VM to exact virtual times with `run_until` and inject input there;
   the run replays identically.
