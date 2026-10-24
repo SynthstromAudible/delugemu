@@ -799,10 +799,52 @@ static void deluge_input_unrealize(DeviceState *dev)
     }
 }
 
+/*
+ * Scripted input, written as the QOM property "dz-event" (qom-set): one raw
+ * event per write, independent of the pointer and the host keyboard, so a
+ * script can hold any set of controls and release each when it chooses.
+ *   "button X Y down|up"  a front-panel button at matrix column X, row Y
+ *   "pad X Y down|up"     a grid pad (X 0..17, Y 0..7)
+ *   "encoder N D"         D detents (signed) on encoder N, in the firmware's
+ *                         index order (0 scroll Y, 1 scroll X, 2 tempo,
+ *                         3 select, 4 upper gold, 5 lower gold)
+ */
+static void deluge_input_set_event(Object *obj, const char *value, Error **errp)
+{
+    DelugeInputState *s = DELUGE_INPUT(obj);
+    char kind[16], state[8];
+    int a, b;
+
+    if (sscanf(value, "%15s %d %d %7s", kind, &a, &b, state) == 4 &&
+        (strcmp(kind, "button") == 0 || strcmp(kind, "pad") == 0)) {
+        bool down = strcmp(state, "down") == 0;
+
+        if (!down && strcmp(state, "up") != 0) {
+            error_setg(errp, "dz-event: expected down|up in '%s'", value);
+            return;
+        }
+        deluge_input_emit(s, a, b, strcmp(kind, "button") == 0, down);
+        return;
+    }
+    if (sscanf(value, "%15s %d %d", kind, &a, &b) == 3 &&
+        strcmp(kind, "encoder") == 0) {
+        if (!s->gpio || a < 0 || a >= DELUGE_ENC_COUNT) {
+            error_setg(errp, "dz-event: no encoder %d", a);
+            return;
+        }
+        for (int i = 0; i < abs(b); i++) {
+            rza1l_gpio_encoder_step(s->gpio, a, b > 0 ? 1 : -1);
+        }
+        return;
+    }
+    error_setg(errp, "dz-event: cannot parse '%s'", value);
+}
+
 static void deluge_input_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
+    object_class_property_add_str(klass, "dz-event", NULL, deluge_input_set_event);
     dc->realize = deluge_input_realize;
     dc->unrealize = deluge_input_unrealize;
     dc->desc = "Synthstrom Deluge host-input mapping";
