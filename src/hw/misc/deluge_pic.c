@@ -20,9 +20,12 @@
  *     (245) followed by a version byte whose low 7 bits are the version and
  *     whose top bit reports whether an OLED is fitted.
  *
- * Full decoding of the remaining commands (LEDs, scrolling, display data) and
- * synthesising pad/button input events are handled in later layers; an
- * unrecognised command is framed here as a zero-payload message.
+ * Pad colours arrive as full column-pair sends (SET_COLOUR) and as scroll
+ * steps: a vertical scroll shifts the whole 18-column image one row and brings
+ * in a new row, a horizontal scroll-row message shifts one row one column and
+ * brings in a new pad. The model applies both to its pad image, so the pads it
+ * reports follow the firmware's scroll animations as the hardware shows them.
+ * An unrecognised command is framed as a zero-payload message.
  *
  * Inbound events: this layer also synthesises the PIC-to-firmware input stream.
  * Pad and button presses/releases are encoded with the same matrix indices and
@@ -89,6 +92,9 @@ static int deluge_pic_debug(void)
 #define PIC_MSG_SET_UART_SPEED       225
 #define PIC_MSG_SET_SCROLL_ROW_BASE  228  /* 228..235: scroll-row + 1 RGB     */
 #define PIC_MSG_SET_SCROLL_ROW_LAST  235
+#define PIC_MSG_SET_SCROLL_H_BASE    236  /* 236..239: + horizontal flags     */
+#define PIC_MSG_SET_SCROLL_H_LAST    239
+#define PIC_MSG_DONE_SENDING_ROWS    240
 #define PIC_MSG_SET_SCROLL_UP        241
 #define PIC_MSG_SET_SCROLL_DOWN      242
 #define PIC_MSG_SET_DIMMER_INTERVAL  243
@@ -223,6 +229,62 @@ static unsigned deluge_pic_payload_len(uint8_t cmd)
     }
 }
 
+/*
+ * Vertical scroll (SET_SCROLL_UP / SET_SCROLL_DOWN). The payload is the row
+ * that scrolls in, one RGB colour per column across all 18 columns (main grid
+ * and sidebar), as the firmware's PadLEDs::vertical::renderScroll builds it.
+ * UP (the firmware's scrollDirection > 0) moves every row down one (row y takes
+ * row y + 1) and fills the top row, 7; DOWN moves every row up one and fills
+ * the bottom row, 0. A short payload (fewer than 18 colours) fills only the
+ * columns it covers; the rest of the incoming row goes dark.
+ */
+static void deluge_pic_scroll_vertical(DelugePicState *s, bool up,
+                                       unsigned ncols)
+{
+    unsigned fill = up ? DELUGE_PIC_GRID_ROWS - 1 : 0;
+
+    for (unsigned col = 0; col < DELUGE_PIC_GRID_COLS; col++) {
+        uint8_t (*c)[3] = s->pad_grid[col];
+
+        if (up) {
+            memmove(c[0], c[1], (DELUGE_PIC_GRID_ROWS - 1) * 3);
+        } else {
+            memmove(c[1], c[0], (DELUGE_PIC_GRID_ROWS - 1) * 3);
+        }
+        if (col < ncols) {
+            memcpy(c[fill], &s->payload[col * 3], 3);
+        } else {
+            memset(c[fill], 0, 3);
+        }
+    }
+}
+
+/*
+ * Horizontal scroll step for one row (SET_SCROLL_ROW + row), within the area
+ * and direction the last horizontal-scroll setup (236 + flags) chose. As in the
+ * firmware's PadLEDs::horizontal::renderScroll: moving right (flag bit 0) shifts
+ * the row's pads one column toward column 0 and brings the payload colour in at
+ * the area's last column; moving left shifts them toward the far end and brings
+ * it in at column 0. The area is the 16 main columns, or all 18 with the sidebar
+ * (flag bit 1); columns outside it are untouched.
+ */
+static void deluge_pic_scroll_row(DelugePicState *s, unsigned row)
+{
+    unsigned width = s->hscroll_full ? DELUGE_PIC_GRID_COLS : 16;
+
+    if (s->hscroll_right) {
+        for (unsigned x = 0; x + 1 < width; x++) {
+            memcpy(s->pad_grid[x][row], s->pad_grid[x + 1][row], 3);
+        }
+        memcpy(s->pad_grid[width - 1][row], s->payload, 3);
+    } else {
+        for (unsigned x = width - 1; x > 0; x--) {
+            memcpy(s->pad_grid[x][row], s->pad_grid[x - 1][row], 3);
+        }
+        memcpy(s->pad_grid[0][row], s->payload, 3);
+    }
+}
+
 /* Act on a fully-assembled command (its payload, if any, is in s->payload). */
 static void deluge_pic_dispatch(DelugePicState *s)
 {
@@ -242,6 +304,29 @@ static void deluge_pic_dispatch(DelugePicState *s)
                 memcpy(s->pad_grid[col][row], &s->payload[i * 3], 3);
             }
         }
+        if (s->padgrid) {
+            deluge_padgrid_update(s->padgrid, s->pad_grid);
+        }
+        return;
+    }
+    if (cmd >= PIC_MSG_SET_SCROLL_ROW_BASE &&
+        cmd <= PIC_MSG_SET_SCROLL_ROW_LAST) {
+        deluge_pic_scroll_row(s, cmd - PIC_MSG_SET_SCROLL_ROW_BASE);
+        if (s->padgrid) {
+            deluge_padgrid_update(s->padgrid, s->pad_grid);
+        }
+        return;
+    }
+    if (cmd >= PIC_MSG_SET_SCROLL_H_BASE && cmd <= PIC_MSG_SET_SCROLL_H_LAST) {
+        unsigned flags = cmd - PIC_MSG_SET_SCROLL_H_BASE;
+
+        s->hscroll_right = flags & 1;
+        s->hscroll_full = flags & 2;
+        return;
+    }
+    if (cmd == PIC_MSG_SET_SCROLL_UP || cmd == PIC_MSG_SET_SCROLL_DOWN) {
+        deluge_pic_scroll_vertical(s, cmd == PIC_MSG_SET_SCROLL_UP,
+                                   s->payload_have / 3);
         if (s->padgrid) {
             deluge_padgrid_update(s->padgrid, s->pad_grid);
         }
@@ -314,7 +399,7 @@ static void deluge_pic_dispatch(DelugePicState *s)
     default:
         /*
          * Remaining commands (flash colour/pad, debounce/refresh/flash timing,
-         * dimmer, scroll rows/flags, resend-button-states, done-sending-rows)
+         * dimmer, resend-button-states, done-sending-rows)
          * affect PIC-internal behaviour with no state the renderers need yet;
          * their payloads are framed and consumed above.
          */
@@ -362,7 +447,7 @@ static int deluge_pic_chr_write(Chardev *chr, const uint8_t *buf, int len)
  */
 static const VMStateDescription vmstate_deluge_pic = {
     .name = TYPE_DELUGE_PIC,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8(cmd, DelugePicState),
@@ -383,6 +468,8 @@ static const VMStateDescription vmstate_deluge_pic = {
         VMSTATE_BOOL(oled_enabled, DelugePicState),
         VMSTATE_BOOL(oled_selected, DelugePicState),
         VMSTATE_BOOL(oled_dc_high, DelugePicState),
+        VMSTATE_BOOL_V(hscroll_right, DelugePicState, 2),
+        VMSTATE_BOOL_V(hscroll_full, DelugePicState, 2),
         VMSTATE_END_OF_LIST()
     },
 };
