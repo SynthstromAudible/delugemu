@@ -11,6 +11,7 @@
 
 #include "hw/core/sysbus.h"
 #include "qom/object.h"
+#include "qemu/timer.h"
 
 #define TYPE_RZA1L_OSTM "rza1l-ostm"
 OBJECT_DECLARE_SIMPLE_TYPE(RzA1lOstmState, RZA1L_OSTM)
@@ -20,6 +21,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RzA1lOstmState, RZA1L_OSTM)
 #define RZA1L_OSTM_MMIO_SIZE 0x800
 
 typedef struct RzA1lOstmChannel {
+    QEMUTimer *timer;  /* fires at the channel's next OSTMnTINT       */
+    qemu_irq irq;      /* OSTMnTINT, edge-triggered at the GIC         */
     uint32_t cmp;      /* OSTMnCMP  — compare/period value           */
     uint8_t  ctl;      /* OSTMnCTL  — operating mode + interrupt en   */
     bool     enabled;  /* OSTMnTE   — counter running                 */

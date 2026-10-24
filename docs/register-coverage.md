@@ -60,12 +60,21 @@ Base `0xE8200000` · size `0x800` · 16 channels (0x40-byte blocks), group commo
 On `CHCTRL.SETEN` it synchronously copies `N0TB` bytes `N0SA → N0DA` honouring
 addr modes, then sets `END|TC` and pulses the per-channel DMAINT (if `DEM` clear).
 Channel 6 is a self-advancing audio TX ring; channel 12 is the PIC RX ring.
-Channel 2 (SD data) is **DREQ-paced**: `SETEN` only arms it (`EN` set,
-`CRSA/CRDA/CRTB` loaded); it moves data while the SDHI holds its level request
-(`dreq` GPIO input) high and completes when `CRTB` reaches zero. Reads from
-the SDHI's fixed data register take the whole buffered block at once
-(`rza1l_dmac_register_dreq_pull`) rather than a byte per memory-API access:
-the same data, ~10x less host time per block.
+A channel whose `DMARS` selects SDHI0/1 transmit or receive (`0xC1/0xC2/0xC5/0xC6`)
+is **DREQ-paced**, whichever channel the firmware chose (and so is channel 2 while
+its `DMARS` is unset: the stock firmware's SD channel, whose card bring-up never
+writes it): `SETEN` only arms it
+(`EN` set, `CRSA/CRDA/CRTB` loaded); it moves data while the SDHI holds its level
+request (`sdhi-dreq` GPIO input) high and completes when `CRTB` reaches zero.
+Channel 14's MIDI timing ring is latched only while its `DMARS` selects a SCIF
+receive request (`0x62 + 4n`), as the stock firmware's does.
+
+`DMARS0–7` (`0xFCFE1000`, `0x20`): a second MMIO window of this device; each word
+holds two channels' 16-bit request selectors (even channel low).
+Reads from the SDHI's fixed data register take the whole buffered block at
+once (`rza1l_dmac_register_dreq_pull` for channel 2, `rza1l_dmac_register_sdhi_pull`
+for channels selecting SDHI) rather than a byte per memory-API access: the same
+data, ~10x less host time per block.
 
 ### SDHI — SD host · `rza1l-sdhi`
 
@@ -75,7 +84,7 @@ Base `0xE804E800` · size `0x100` · IRQ GIC SPI 273 (INTC 305).
 | ------ | --- | -------- | ----- |
 | 0x00 | SD_CMD | modelled | issues command on the QEMU SD bus; response after its bus time |
 | 0x04/06 | SD_ARG0/1 | modelled | argument |
-| 0x08/0A | SD_STOP/SECCNT | modelled | block count; `SEC` = multi-block + auto CMD12 |
+| 0x08/0A | SD_STOP/SECCNT | modelled | block count; `SEC` = multi-block, with auto CMD12 unless `SD_CMD[15:14]` = 01 (extended mode: the driver stops it) |
 | 0x0C–0x1A | SD_RESP0–7 | modelled | latched response |
 | 0x1C | SD_INFO1 | modelled | RESP/DATA/card-detect events |
 | 0x1E | SD_INFO2 | modelled | error status, BRE/BWE, `CBSY` while busy, `SCLKDIVEN` clear during a command |
@@ -132,12 +141,16 @@ Base `0xFCFEC000` · size `0x800` · two channels (OSTM0 @ +0x000, OSTM1 @ +0x40
 
 | Offset | Reg | Coverage | Notes |
 | ------ | --- | -------- | ----- |
-| +0x00 | CMP | shadow | compare/period |
+| +0x00 | CMP | modelled | compare/period; rewriting it re-arms the next interrupt |
 | +0x04 | CNT | modelled | free-running counter off the virtual clock |
 | +0x10 | TE | modelled | enable status |
 | +0x14 | TS | special | write starts / re-bases the counter |
 | +0x18 | TT | special | write stops / freezes the counter |
-| +0x20 | CTL | shadow | bit 1 = free-run vs interval |
+| +0x20 | CTL | modelled | bit 1 = free-run vs interval; bit 0 = interrupt at count start |
+
+OSTMnTINT (GIC 134/135, edge) fires at each interval underflow (first after
+`CMP` counts, then every `CMP+1`), at each free-running compare match (at `CMP`,
+then every 2³² counts), and at the start of counting when `CTL` bit 0 is set.
 
 ### MTU2 — multi-function timer · `rza1l-mtu2`
 
@@ -182,12 +195,23 @@ Base `0x3FEFA000` · size `0x100` · shadow array with special status.
 | Offset | Reg | Coverage | Notes |
 | ------ | --- | -------- | ----- |
 | 0x00–0x34 | CMNCR/SSLDR/SPBCR/DRCR/DR*…/SMCR/SM* | shadow | DRCR.SSLN negates SSL; SMCR.SPIE starts, SSLKP keeps SSL |
-| 0x38/0x3C | SMRDR0/1 | stub | read 0 (flash not busy / WIP clear) |
+| 0x38/0x3C | SMRDR0/1 | modelled | data of the last read transfer |
 | 0x40/0x44 | SMWDR0/1 | shadow | |
 | 0x48 | CMNSR | special | TEND always 1; SSLF tracks the SSL line |
 | 0x50–0x68 | CKDLY/DR*/SM*/SPODLY | shadow | |
 
-Manual-mode transfers complete instantly; no backing flash.
+Manual-mode transfers complete instantly, against a 4 MB serial NOR array (JEDEC
+`EF 40 16`). One SSL assertion is one command transaction: command and address
+from `SMCMR`/`SMADR` (`SMENR.ADE` 24/32-bit), then 1/2/4-byte data units
+(`SMENR.SPIDE`) to `SMWDR0` or from `SMRDR0`, a unit occupying the register's top
+bytes, first wire byte lowest. Reads (READ/FAST and dual/quad/4-byte variants),
+page program (NOR AND, 256-byte page wrap), 4 KB/64 KB/chip erase, WREN/WRDI, RDSR
+(never busy) and RDID are implemented; `SMCR.SPIE` reads back 0.
+
+The same array is memory-mapped read-only at `0x18000000` and its uncached
+mirror `0x58000000`. It starts erased (`0xFF`); `-global
+rza1l-spibsc.flash-file=PATH` loads it from a file and writes every program or
+erase back, so settings persist across runs.
 
 ### SSIF0 — serial sound interface (I²S) · `rza1l-ssif`
 

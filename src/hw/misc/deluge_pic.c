@@ -116,9 +116,8 @@ static int deluge_pic_debug(void)
 
 /*
  * Reported PIC firmware version. The low 7 bits are the version number; the
- * top bit tells the firmware an OLED is present (picSaysOLEDPresent). It is
- * reported here without the OLED bit so bring-up drives the 7-segment display;
- * OLED reporting is enabled once the OLED panel is modelled.
+ * top bit tells the firmware an OLED is present (picSaysOLEDPresent), and is
+ * set whenever the machine has wired an OLED panel to this PIC.
  */
 #define DELUGE_PIC_FW_VERSION   23
 #define DELUGE_PIC_OLED_FLAG    0x80
@@ -135,7 +134,7 @@ static void deluge_pic_respond(DelugePicState *s, uint8_t b)
 static void deluge_pic_send_version(DelugePicState *s)
 {
     deluge_pic_respond(s, PIC_RESP_FIRMWARE_VERSION_NEXT);
-    deluge_pic_respond(s, DELUGE_PIC_VERSION_BYTE);
+    deluge_pic_respond(s, DELUGE_PIC_VERSION_BYTE | (s->oled ? DELUGE_PIC_OLED_FLAG : 0));
 }
 
 /*

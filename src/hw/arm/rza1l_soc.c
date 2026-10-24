@@ -227,6 +227,10 @@ static void rza1l_soc_realize(DeviceState *dev, Error **errp)
                                         sysbus_mmio_get_region(
                                             SYS_BUS_DEVICE(&s->dmac), 0),
                                         1);
+    memory_region_add_subregion_overlap(system_memory, RZA1L_DMARS_BASE,
+                                        sysbus_mmio_get_region(
+                                            SYS_BUS_DEVICE(&s->dmac), 1),
+                                        1);
 
     /*
      * The SSI transmit channel streams the audio TX buffer continuously; mark
@@ -303,6 +307,21 @@ static void rza1l_soc_realize(DeviceState *dev, Error **errp)
                                         sysbus_mmio_get_region(
                                             SYS_BUS_DEVICE(&s->spibsc), 0),
                                         1);
+    /*
+     * The flash behind it, memory-mapped (external address space read mode) at
+     * the SPI-ROM window and again at its uncached mirror, where firmware reads
+     * settings it has just programmed without a stale cache line.
+     */
+    memory_region_add_subregion_overlap(system_memory, RZA1L_SPI_ROM_BASE,
+                                        sysbus_mmio_get_region(
+                                            SYS_BUS_DEVICE(&s->spibsc), 1),
+                                        1);
+    memory_region_init_alias(&s->spi_rom_mirror, OBJECT(dev), "rza1l.spirom.mirror",
+                             sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->spibsc), 1),
+                             0, RZA1L_SPIBSC_FLASH_SIZE);
+    memory_region_add_subregion_overlap(system_memory,
+                                        RZA1L_SPI_ROM_BASE + RZA1L_UNCACHED_MIRROR_OFFSET,
+                                        &s->spi_rom_mirror, 1);
 
     /*
      * OSTM OS timer. The firmware's scheduler uses OSTM0 as a free-running
@@ -391,6 +410,11 @@ static void rza1l_soc_realize(DeviceState *dev, Error **errp)
      * Wired for completeness; the firmware services audio through DMA, so the
      * model leaves them quiescent.
      */
+    /* OSTM0TINT / OSTM1TINT: an Embassy time driver's clock wrap and alarm. */
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->ostm), 0,
+                       qdev_get_gpio_in(DEVICE(&s->gic), RZA1L_OSTM_TINT0_SPI));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->ostm), 1,
+                       qdev_get_gpio_in(DEVICE(&s->gic), RZA1L_OSTM_TINT1_SPI));
     /* MTU2 TGInA: channel compare-match-A interrupts, level while pending. */
     {
         static const int tgia_spi[RZA1L_MTU2_NUM_CH] = {
@@ -539,17 +563,20 @@ static void rza1l_soc_realize(DeviceState *dev, Error **errp)
                        qdev_get_gpio_in(DEVICE(&s->gic), RZA1L_SDHI_SPI));
 
     /*
-     * The SD data DMA channel is paced by the SDHI's buffer-ready request, so
+     * The SD data DMA channels are paced by the SDHI's buffer-ready request, so
      * a multi-block transfer takes as long as the modelled card and bus do
-     * rather than completing the moment the firmware enables the channel.
+     * rather than completing the moment the firmware enables the channel. The
+     * request reaches whichever channels the firmware selected SDHI on (DMARS),
+     * as on the hardware, and channel 2 while its DMARS is unset: the stock
+     * firmware's SD channel, whose card bring-up never writes it.
      */
-    rza1l_dmac_register_dreq(&s->dmac, RZA1L_SD_DMA_CH);
-    rza1l_dmac_register_dreq_pull(&s->dmac, RZA1L_SD_DMA_CH,
+    rza1l_dmac_register_dreq(&s->dmac, RZA1L_STOCK_SD_DMA_CH);
+    rza1l_dmac_register_dreq_pull(&s->dmac, RZA1L_STOCK_SD_DMA_CH,
                                   rza1l_sdhi_dma_pull, &s->sdhi);
+    rza1l_dmac_register_sdhi_pull(&s->dmac, rza1l_sdhi_dma_pull, &s->sdhi);
     qdev_connect_gpio_out_named(DEVICE(&s->sdhi), RZA1L_SDHI_DREQ, 0,
                                 qdev_get_gpio_in_named(DEVICE(&s->dmac),
-                                                       RZA1L_DMAC_DREQ,
-                                                       RZA1L_SD_DMA_CH));
+                                                       RZA1L_DMAC_SDHI_DREQ, 0));
 
     /*
      * ADC (supply-voltage sense) and RTC (wall clock) stubs. The firmware

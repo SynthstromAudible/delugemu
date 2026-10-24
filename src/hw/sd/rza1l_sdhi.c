@@ -404,6 +404,11 @@ static void rza1l_sdhi_command(RzA1lSdhiState *s, uint16_t cmdreg)
 
     /* Clear status from any previous command. */
     rza1l_sdhi_abort(s);
+    /*
+     * SD_CMD[15:14] = 01 is extended mode, whose multi-block command leaves
+     * the stop to the driver: no auto CMD12 (the driver then sends its own).
+     */
+    s->auto_cmd12 = (cmdreg & 0xc000) != 0x4000;
     s->info1 &= ~(INFO1_RESP | INFO1_DATA_TRNS);
     s->info2 &= ~(INFO2_ERR_MASK | INFO2_RE | INFO2_WE);
     memset(s->resp, 0, sizeof(s->resp));
@@ -495,7 +500,7 @@ static void rza1l_sdhi_finish(RzA1lSdhiState *s)
      * the subsequent CMD13 status poll sees STATE_TRAN rather than a card
      * still stuck in the data state (which the driver reports as an error).
      */
-    if (s->stop & SD_STOP_SEC_ENABLE) {
+    if ((s->stop & SD_STOP_SEC_ENABLE) && s->auto_cmd12) {
         SDRequest stop = { .cmd = 12, .arg = 0, .crc = 0 };
         uint8_t rsp[16];
 
@@ -581,7 +586,7 @@ static void rza1l_sdhi_data_block_done(RzA1lSdhiState *s)
         } else {
             rza1l_sdhi_set_phase(s, SDHI_END);
             rza1l_sdhi_update_dreq(s);
-            rza1l_sdhi_schedule(s, (s->stop & SD_STOP_SEC_ENABLE) ?
+            rza1l_sdhi_schedule(s, ((s->stop & SD_STOP_SEC_ENABLE) && s->auto_cmd12) ?
                                    rza1l_sdhi_cmd12_ns(s) : 0);
         }
     } else {
@@ -599,7 +604,7 @@ static void rza1l_sdhi_data_block_done(RzA1lSdhiState *s)
                 ns += (int64_t)s->write_busy_us * SCALE_US;
             }
         }
-        if (s->blockcnt == 0 && (s->stop & SD_STOP_SEC_ENABLE)) {
+        if (s->blockcnt == 0 && (s->stop & SD_STOP_SEC_ENABLE) && s->auto_cmd12) {
             ns += rza1l_sdhi_cmd12_ns(s);
         }
         rza1l_sdhi_set_phase(s, SDHI_WRITE_WAIT);

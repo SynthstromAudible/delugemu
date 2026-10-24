@@ -252,9 +252,13 @@ static void rza1l_dmac_do_transfer(RzA1lDmacState *s, int ch)
  * buffer emptied or filled) stops the transfer at exactly that point. Completes
  * the channel once CRTB reaches zero.
  */
+static bool rza1l_dmac_dmars_is_sdhi(uint16_t dmars);
+
 static void rza1l_dmac_dreq_service(RzA1lDmacState *s, int ch)
 {
     RzA1lDmacChannel *c = &s->ch[ch];
+    RzA1lDmacPullFn *pull = c->pull;
+    void *pull_opaque = c->pull_opaque;
     bool sad_fixed = c->chcfg & CHCFG_SAD;
     bool dad_fixed = c->chcfg & CHCFG_DAD;
     unsigned unit = rza1l_dmac_unit(c);
@@ -276,11 +280,14 @@ static void rza1l_dmac_dreq_service(RzA1lDmacState *s, int ch)
      * its data register a unit at a time, without a memory-API round trip for
      * each one.
      */
-    while (c->pull && sad_fixed && !dad_fixed &&
+    if (!pull && rza1l_dmac_dmars_is_sdhi(c->dmars)) {
+        pull = s->sdhi_pull;
+        pull_opaque = s->sdhi_pull_opaque;
+    }
+    while (pull && sad_fixed && !dad_fixed &&
            c->dreq_level && (c->chstat & CHSTAT_EN) && c->crtb) {
         uint8_t blk[RZA1L_DMAC_PULL_MAX];
-        uint32_t got = c->pull(c->pull_opaque, blk,
-                               MIN(c->crtb, sizeof(blk)));
+        uint32_t got = pull(pull_opaque, blk, MIN(c->crtb, sizeof(blk)));
 
         if (!got) {
             break;
@@ -318,13 +325,36 @@ static void rza1l_dmac_dreq_service(RzA1lDmacState *s, int ch)
     }
 }
 
+/* DMARS selectors for SDHI0/SDHI1 transmit and receive (MID 0x30/0x31). */
+static bool rza1l_dmac_dmars_is_sdhi(uint16_t dmars)
+{
+    return dmars == 0xC1 || dmars == 0xC2 || dmars == 0xC5 || dmars == 0xC6;
+}
+
+/* DMARS selectors for SCIF0..4 receive: 0x62, then + 4 per channel. */
+static bool rza1l_dmac_dmars_is_scif_rx(uint16_t dmars)
+{
+    return dmars >= 0x62 && dmars <= 0x72 && ((dmars - 0x62) % 4) == 0;
+}
+
+/*
+ * A channel moves data only while the SD host requests it: one whose DMARS
+ * selects SDHI, or one registered as the SD channel (rza1l_dmac_register_dreq)
+ * while the firmware has left its DMARS unset, as the stock firmware does for
+ * the transfers its card bring-up makes.
+ */
+static bool rza1l_dmac_paced(RzA1lDmacChannel *c)
+{
+    return (c->dreq_paced && c->dmars == 0) || rza1l_dmac_dmars_is_sdhi(c->dmars);
+}
+
 static void rza1l_dmac_dreq_set(void *opaque, int ch, int level)
 {
     RzA1lDmacState *s = opaque;
     RzA1lDmacChannel *c = &s->ch[ch];
 
     c->dreq_level = level;
-    if (level && c->dreq_paced) {
+    if (level && rza1l_dmac_paced(c)) {
         rza1l_dmac_dreq_service(s, ch);
     }
 }
@@ -346,7 +376,8 @@ static void rza1l_dmac_chctrl_write(RzA1lDmacState *s, int ch, uint32_t val)
     if (val & CHCTRL_CLRTC) {
         c->chstat &= ~CHSTAT_TC;
     }
-    if ((val & CHCTRL_SETEN) && c->dreq_paced) {
+    if ((val & CHCTRL_SETEN) && rza1l_dmac_paced(c)) {
+        c->dreq_level = s->sdhi_dreq_level;
         /*
          * Arm the Next0 transfer and move whatever the peripheral is already
          * requesting; the rest follows as it raises DREQ. EN stays set (TACT
@@ -446,7 +477,8 @@ static void rza1l_dmac_chctrl_write(RzA1lDmacState *s, int ch, uint32_t val)
                 c->rx_audio_start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
                 c->crda = c->rx_audio_base;
             }
-        } else if (c->timing_ring && c->nxla != 0) {
+        } else if (c->timing_ring && rza1l_dmac_dmars_is_scif_rx(c->dmars) &&
+                   c->nxla != 0) {
             /*
              * The MIDI timing-capture channel uses a self-linking descriptor
              * whose destination is the small timing ring. Latch its base and
@@ -481,6 +513,13 @@ void rza1l_dmac_register_dreq_pull(RzA1lDmacState *s, int ch,
         s->ch[ch].pull = fn;
         s->ch[ch].pull_opaque = opaque;
     }
+}
+
+void rza1l_dmac_register_sdhi_pull(RzA1lDmacState *s, RzA1lDmacPullFn *fn,
+                                   void *opaque)
+{
+    s->sdhi_pull = fn;
+    s->sdhi_pull_opaque = opaque;
 }
 
 void rza1l_dmac_register_rx_ring(RzA1lDmacState *s, int ch)
@@ -868,6 +907,45 @@ static void rza1l_dmac_reset(DeviceState *dev)
     s->ch[RZA1L_DMAC_OLED_CH].chcfg = RZA1L_DMAC_OLED_BOOT_CHCFG;
 }
 
+/* The SD host's request line: drive every SDHI-selected channel from it. */
+static void rza1l_dmac_sdhi_dreq_set(void *opaque, int n, int level)
+{
+    RzA1lDmacState *s = opaque;
+
+    s->sdhi_dreq_level = level;
+    for (int ch = 0; ch < RZA1L_DMAC_NUM_CH; ch++) {
+        if (rza1l_dmac_paced(&s->ch[ch])) {
+            rza1l_dmac_dreq_set(s, ch, level);
+        }
+    }
+}
+
+static uint64_t rza1l_dmars_read(void *opaque, hwaddr offset, unsigned size)
+{
+    RzA1lDmacState *s = opaque;
+    int ch = (offset / 4) * 2;
+
+    return s->ch[ch].dmars | ((uint32_t)s->ch[ch + 1].dmars << 16);
+}
+
+static void rza1l_dmars_write(void *opaque, hwaddr offset, uint64_t value,
+                              unsigned size)
+{
+    RzA1lDmacState *s = opaque;
+    int ch = (offset / 4) * 2;
+
+    s->ch[ch].dmars = value & 0xffff;
+    s->ch[ch + 1].dmars = (value >> 16) & 0xffff;
+}
+
+static const MemoryRegionOps rza1l_dmars_ops = {
+    .read = rza1l_dmars_read,
+    .write = rza1l_dmars_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+};
+
 static void rza1l_dmac_realize(DeviceState *dev, Error **errp)
 {
     RzA1lDmacState *s = RZA1L_DMAC(dev);
@@ -876,12 +954,16 @@ static void rza1l_dmac_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->iomem, OBJECT(dev), &rza1l_dmac_ops, s,
                           TYPE_RZA1L_DMAC, RZA1L_DMAC_MMIO_SIZE);
     sysbus_init_mmio(sbd, &s->iomem);
+    memory_region_init_io(&s->dmars_iomem, OBJECT(dev), &rza1l_dmars_ops, s,
+                          TYPE_RZA1L_DMAC "-dmars", RZA1L_DMARS_MMIO_SIZE);
+    sysbus_init_mmio(sbd, &s->dmars_iomem);
 
     for (int i = 0; i < RZA1L_DMAC_NUM_CH; i++) {
         sysbus_init_irq(sbd, &s->irq[i]);
     }
     qdev_init_gpio_in_named(dev, rza1l_dmac_dreq_set, RZA1L_DMAC_DREQ,
                             RZA1L_DMAC_NUM_CH);
+    qdev_init_gpio_in_named(dev, rza1l_dmac_sdhi_dreq_set, RZA1L_DMAC_SDHI_DREQ, 1);
 }
 
 static const VMStateDescription vmstate_rza1l_dmac_channel = {
