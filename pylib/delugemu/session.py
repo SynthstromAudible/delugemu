@@ -206,6 +206,22 @@ class DelugeSession:
         self.q.qom_set(self._dev("input", "deluge-input", "/machine/soc/input"),
                        "dz-event", text)
 
+    def vclock_ns(self):
+        """The guest's virtual clock, in ns (deterministic under -icount sleep=off)."""
+        return int(self.q.qom_get(self._dev("input", "deluge-input", "/machine/soc/input"), "dz-vclock-ns"))
+
+    def run_until(self, ns, timeout=120.0):
+        """Run the (paused) VM until the virtual clock reaches ``ns``, then leave it paused there. Pair with a
+        launch under ``-icount shift=N,sleep=off`` and ``-S`` for runs that replay identically."""
+        self.q.qom_set(self._dev("input", "deluge-input", "/machine/soc/input"), "dz-stop-at-ns", int(ns))
+        self.q.execute("cont")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not self.q.execute("query-status").get("running", False):
+                return
+            time.sleep(0.002)
+        raise TimeoutError("run_until(%d): the VM did not reach its stop time" % ns)
+
     def button(self, x, y, down):
         """Press (down=True) or release a front-panel button at matrix column x, row y."""
         self._dz_event("button %d %d %s" % (x, y, "down" if down else "up"))

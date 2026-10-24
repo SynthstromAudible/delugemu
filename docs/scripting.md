@@ -69,6 +69,9 @@ Input (controls are a `Control` enum member — e.g. `Control.PLAY` — or its n
 - `press(name, hold_ms=120)` — tap a button or encoder push-click (`Control.PLAY`, `Control.SHIFT`, `Control.SELECT_ENC`, …).
 - `hold(name)` / `release()` — press and keep held, then release.
 - `turn(name, delta)` — turn a rotary encoder `delta` detents (negative = CCW).
+- `vclock_ns()`, `run_until(ns)` — deterministic runs: launch with `extra_qemu=("-icount", "shift=2,sleep=off",
+  "-S")` (and no `icount`), then advance the paused VM to exact virtual times with `run_until` and inject input there;
+  the run replays identically.
 - `button(x, y, down)`, `pad_event(x, y, down)`, `encoder(index, detents)` — raw scripted input on the input
   device's `dz-event` property, independent of the pointer: hold any set of controls and release each when you
   choose. Buttons by matrix column/row, pads 0..17 × 0..7, encoders in firmware order (0 scroll Y, 1 scroll X,
