@@ -969,10 +969,46 @@ static void rza1l_ssif_rh_search(RzA1lSsifState *s, uint32_t base,
     }
 }
 
+/*
+ * Copy the ring from read_off forward to the frame-aligned byte offset target
+ * into the staging FIFO. A gap of a whole ring or more means the head lapped an
+ * unread region whose data is already overwritten: resync instead of copying.
+ */
+static void rza1l_ssif_copy_to(RzA1lSsifState *s, uint32_t base, uint32_t size,
+                               uint32_t target)
+{
+    uint32_t avail = (target + size - s->read_off) % size;
+
+    if (avail >= size - RZA1L_SSIF_BYTES_PER_FRAME) {
+        s->read_off = target;
+        return;
+    }
+
+    while (avail > 0) {
+        uint8_t buf[1024];
+        uint32_t to_end = size - s->read_off;
+        uint32_t chunk = MIN(avail, MIN(to_end, (uint32_t)sizeof(buf)));
+
+        if (dma_memory_read(&address_space_memory, base + s->read_off, buf,
+                            chunk, MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+            memset(buf, 0, chunk);
+        }
+        rza1l_ssif_fifo_push(s, buf, chunk);
+        s->read_off = (s->read_off + chunk) % size;
+        avail -= chunk;
+    }
+}
+
+/* Reduce a CRSA value to a frame-aligned byte offset within the ring. */
+static uint32_t rza1l_ssif_play_off(uint32_t crsa, uint32_t base, uint32_t size)
+{
+    return ((crsa - base) % size) & ~(RZA1L_SSIF_BYTES_PER_FRAME - 1);
+}
+
 static void rza1l_ssif_pump(RzA1lSsifState *s)
 {
     uint32_t base = 0, size = 0;
-    uint32_t crsa = 0, wpos, head_off = 0, target, avail;
+    uint32_t crsa = 0, wpos, head_off = 0, target;
     int64_t now;
 
     if (!s->dmac ||
@@ -985,16 +1021,28 @@ static void rza1l_ssif_pump(RzA1lSsifState *s)
     }
 
     /*
-     * Coalesce the firmware's bursty CRSA polling into at most one ring copy
-     * per RZA1L_SSIF_PUMP_MIN_NS of virtual time. The play head still advances
-     * on the wall clock (its value is computed in the DMAC, not here), so the
-     * firmware sees a live register; we only skip the redundant copy/DMA-read
-     * work, which is what was burning vCPU time in the audio loop. The first
-     * pump after the ring arms (!play_anchored) is never skipped, so seeding is
-     * immediate.
+     * Coalesce the firmware's bursty CRSA polling into at most one full pump
+     * (render-head read, auto-detect step, copy) per RZA1L_SSIF_PUMP_MIN_NS of
+     * virtual time; that per-poll work is what burned vCPU time in the audio
+     * loop. The first pump after the ring arms (!play_anchored) is never
+     * skipped, so seeding is immediate.
+     *
+     * Between full pumps, a play-head watermark is still followed exactly: the
+     * DMA consumes each slot as the head passes it, and the firmware may rewrite
+     * any slot behind the head it has just read, so the copy catches up to the
+     * live head on every poll (see RZA1L_SSIF_PUMP_MIN_NS). A render-head
+     * watermark needs no catch-up: the firmware never rewrites a slot it has
+     * rendered until the play head has passed it a lap later.
      */
     now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     if (s->play_anchored && now - s->last_pump_ns < RZA1L_SSIF_PUMP_MIN_NS) {
+        if (s->copy_to_play_head &&
+            rza1l_dmac_get_tx_audio_crsa(s->dmac, s->tx_dma_channel, &crsa)) {
+            wpos = rza1l_ssif_play_off(crsa, base, size);
+            if (wpos != s->read_off) {
+                rza1l_ssif_copy_to(s, base, size, wpos);
+            }
+        }
         return;
     }
     s->last_pump_ns = now;
@@ -1008,8 +1056,7 @@ static void rza1l_ssif_pump(RzA1lSsifState *s)
     if (!rza1l_dmac_get_tx_audio_crsa(s->dmac, s->tx_dma_channel, &crsa)) {
         return;
     }
-    wpos = (crsa - base) % size;
-    wpos &= ~(RZA1L_SSIF_BYTES_PER_FRAME - 1);
+    wpos = rza1l_ssif_play_off(crsa, base, size);
 
     /*
      * If asked to auto-detect the render head, keep the search running until it
@@ -1028,9 +1075,11 @@ static void rza1l_ssif_pump(RzA1lSsifState *s)
      */
     if (rza1l_ssif_render_head(s, base, size, &head_off)) {
         target = head_off;
+        s->copy_to_play_head = false;
         s->rh_fail_streak = 0;
     } else {
         target = wpos;
+        s->copy_to_play_head = true;
         /*
          * A configured/locked head that stops reducing into the ring for a
          * sustained stretch is stale (wrong lock, firmware reboot, ...). The
@@ -1051,32 +1100,7 @@ static void rza1l_ssif_pump(RzA1lSsifState *s)
         s->read_off = target;
     }
 
-    /* Frames to copy now: distance from read_off forward to the watermark. */
-    avail = (target + size - s->read_off) % size;
-
-    /*
-     * If we have somehow fallen more than a ring behind (a stall longer than
-     * the ring's wrap period), the head has lapped us and the data in between
-     * is already overwritten; resync rather than read stale frames.
-     */
-    if (avail >= size - RZA1L_SSIF_BYTES_PER_FRAME) {
-        s->read_off = target;
-        avail = 0;
-    }
-
-    while (avail > 0) {
-        uint8_t buf[1024];
-        uint32_t to_end = size - s->read_off;
-        uint32_t chunk = MIN(avail, MIN(to_end, (uint32_t)sizeof(buf)));
-
-        if (dma_memory_read(&address_space_memory, base + s->read_off, buf,
-                            chunk, MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
-            memset(buf, 0, chunk);
-        }
-        rza1l_ssif_fifo_push(s, buf, chunk);
-        s->read_off = (s->read_off + chunk) % size;
-        avail -= chunk;
-    }
+    rza1l_ssif_copy_to(s, base, size, target);
 }
 
 /*
@@ -1260,6 +1284,7 @@ static void rza1l_ssif_reset(DeviceState *dev)
     s->read_off = 0;
     s->drain_frac = 0;
     s->last_pump_ns = 0;
+    s->copy_to_play_head = false;
     s->fifo_head = 0;
     s->fifo_len = 0;
     s->rec_cursor = 0;

@@ -62,6 +62,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(RzA1lSsifState, RZA1L_SSIF)
  * host pull period, so output stays smooth while the per-poll overhead is gone.
  */
 #define RZA1L_SSIF_PUMP_MIN_NS   250000ll            /* 250 us copy throttle */
+/*
+ * The throttle covers the render-head read and its search, not the copy
+ * itself: while the watermark is the play head, every CRSA read between full
+ * pumps still copies the frames the head has passed since the last copy (a
+ * compare when it has not moved a frame, else a few bytes). The firmware treats
+ * every slot behind the head it reads as consumed and may rewrite it at once,
+ * so the copy must never trail the head the firmware was shown.
+ */
 
 /*
  * Output latency cushion. The host voice consumes at a fixed real-time rate
@@ -162,6 +170,7 @@ struct RzA1lSsifState {
     uint32_t  render_head_addr;  /* guest addr of i2sTXBufferPos; 0=play-head */
     uint32_t  drain_frac;        /* 16.16 resampler phase for drift trim   */
     int64_t   last_pump_ns;      /* virtual time of last ring copy (throttle) */
+    bool      copy_to_play_head; /* last full pump's watermark was the play head */
 
     /*
      * Render-head auto-detection (tx-render-head-auto). render_head_auto is the
