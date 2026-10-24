@@ -61,7 +61,9 @@ On `CHCTRL.SETEN` it synchronously copies `N0TB` bytes `N0SA → N0DA` honouring
 addr modes, then sets `END|TC` and pulses the per-channel DMAINT (if `DEM` clear).
 Channel 6 is a self-advancing audio TX ring; channel 12 is the PIC RX ring.
 A channel whose `DMARS` selects SDHI0/1 transmit or receive (`0xC1/0xC2/0xC5/0xC6`)
-is **DREQ-paced**, whichever channel the firmware chose: `SETEN` only arms it
+is **DREQ-paced**, whichever channel the firmware chose (and so is channel 2 while
+its `DMARS` is unset: the stock firmware's SD channel, whose card bring-up never
+writes it): `SETEN` only arms it
 (`EN` set, `CRSA/CRDA/CRTB` loaded); it moves data while the SDHI holds its level
 request (`sdhi-dreq` GPIO input) high and completes when `CRTB` reaches zero.
 Channel 14's MIDI timing ring is latched only while its `DMARS` selects a SCIF

@@ -309,10 +309,15 @@ static bool rza1l_dmac_dmars_is_scif_rx(uint16_t dmars)
     return dmars >= 0x62 && dmars <= 0x72 && ((dmars - 0x62) % 4) == 0;
 }
 
-/* A channel moves data only while its peripheral requests it. */
+/*
+ * A channel moves data only while the SD host requests it: one whose DMARS
+ * selects SDHI, or one registered as the SD channel (rza1l_dmac_register_dreq)
+ * while the firmware has left its DMARS unset, as the stock firmware does for
+ * the transfers its card bring-up makes.
+ */
 static bool rza1l_dmac_paced(RzA1lDmacChannel *c)
 {
-    return c->dreq_paced || rza1l_dmac_dmars_is_sdhi(c->dmars);
+    return (c->dreq_paced && c->dmars == 0) || rza1l_dmac_dmars_is_sdhi(c->dmars);
 }
 
 static void rza1l_dmac_dreq_set(void *opaque, int ch, int level)
@@ -344,9 +349,7 @@ static void rza1l_dmac_chctrl_write(RzA1lDmacState *s, int ch, uint32_t val)
         c->chstat &= ~CHSTAT_TC;
     }
     if ((val & CHCTRL_SETEN) && rza1l_dmac_paced(c)) {
-        if (rza1l_dmac_dmars_is_sdhi(c->dmars)) {
-            c->dreq_level = s->sdhi_dreq_level;
-        }
+        c->dreq_level = s->sdhi_dreq_level;
         /*
          * Arm the Next0 transfer and move whatever the peripheral is already
          * requesting; the rest follows as it raises DREQ. EN stays set (TACT
@@ -861,7 +864,7 @@ static void rza1l_dmac_sdhi_dreq_set(void *opaque, int n, int level)
 
     s->sdhi_dreq_level = level;
     for (int ch = 0; ch < RZA1L_DMAC_NUM_CH; ch++) {
-        if (rza1l_dmac_dmars_is_sdhi(s->ch[ch].dmars)) {
+        if (rza1l_dmac_paced(&s->ch[ch])) {
             rza1l_dmac_dreq_set(s, ch, level);
         }
     }

@@ -555,8 +555,10 @@ static void rza1l_soc_realize(DeviceState *dev, Error **errp)
      * a multi-block transfer takes as long as the modelled card and bus do
      * rather than completing the moment the firmware enables the channel. The
      * request reaches whichever channels the firmware selected SDHI on (DMARS),
-     * as on the hardware.
+     * as on the hardware, and channel 2 while its DMARS is unset: the stock
+     * firmware's SD channel, whose card bring-up never writes it.
      */
+    rza1l_dmac_register_dreq(&s->dmac, RZA1L_STOCK_SD_DMA_CH);
     qdev_connect_gpio_out_named(DEVICE(&s->sdhi), RZA1L_SDHI_DREQ, 0,
                                 qdev_get_gpio_in_named(DEVICE(&s->dmac),
                                                        RZA1L_DMAC_SDHI_DREQ, 0));
