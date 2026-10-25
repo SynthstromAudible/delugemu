@@ -12,6 +12,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "hw/core/qdev-properties.h"
 #include "ui/console.h"
 #include "qemu/timer.h"
@@ -1389,6 +1390,15 @@ static const Property deluge_skin_props[] = {
  * dz-leds:      36 chars '0'/'1', indexed led = col + 9*row (col 0..8, row 0..3)
  * dz-seven-seg: 8 hex chars, one byte (raw segment bitmask) per digit
  * dz-gold-knob: base64 of 8 bytes, gold_knob[which=0..1][led=0..3] brightness
+ * dz-pad-flashes: the pad flashes since the last read, oldest first, as
+ *               "x,y,colour" joined by ';' (colour = the PIC flash-colour
+ *               index, 0 for the default; empty if none). Reading clears the
+ *               log, which keeps the last DELUGE_PIC_FLASH_LOG_MAX flashes.
+ * dz-pad-image: the pads as dz-pad-leds reports them (base64, column-major
+ *               RGB), but without the flashes on top: the firmware's own image.
+ * dz-flash-length, dz-refresh-time, dz-dimmer-interval: the last flash length
+ *               (ms), pad refresh time and pad dimmer interval the firmware
+ *               sent the PIC; -1 until it sends one (or with no PIC).
  */
 static char *deluge_skin_get_leds(Object *obj, Error **errp)
 {
@@ -1437,6 +1447,52 @@ static char *deluge_skin_get_gold_knob(Object *obj, Error **errp)
     return g_base64_encode(buf, sizeof(buf));
 }
 
+static char *deluge_skin_get_pad_flashes(Object *obj, Error **errp)
+{
+    DelugeSkinState *s = DELUGE_SKIN(obj);
+    DelugePicFlashEvent ev[DELUGE_PIC_FLASH_LOG_MAX];
+    GString *out = g_string_new("");
+    unsigned n;
+
+    if (!s->pic) {
+        return g_string_free(out, false);
+    }
+    n = deluge_pic_take_flashes(s->pic, ev);
+    for (unsigned i = 0; i < n; i++) {
+        g_string_append_printf(out, "%s%u,%u,%u", i ? ";" : "",
+                               ev[i].x, ev[i].y, ev[i].colour);
+    }
+    return g_string_free(out, false);
+}
+
+static char *deluge_skin_get_pad_image(Object *obj, Error **errp)
+{
+    DelugeSkinState *s = DELUGE_SKIN(obj);
+    uint8_t img[DELUGE_PIC_GRID_COLS][DELUGE_PIC_GRID_ROWS][3];
+
+    if (!s->pic) {
+        return g_strdup("");
+    }
+    deluge_pic_get_pad_image(s->pic, img);
+    return g_base64_encode((const guchar *)img, sizeof(img));
+}
+
+/* opaque selects the field: 0 flash length, 1 refresh time, 2 dimmer. */
+static void deluge_skin_get_pic_timing(Object *obj, Visitor *v,
+                                       const char *name, void *opaque,
+                                       Error **errp)
+{
+    DelugeSkinState *s = DELUGE_SKIN(obj);
+    int32_t t[3] = { -1, -1, -1 };
+    int32_t value;
+
+    if (s->pic) {
+        deluge_pic_get_timing(s->pic, &t[0], &t[1], &t[2]);
+    }
+    value = t[(uintptr_t)opaque];
+    visit_type_int32(v, name, &value, errp);
+}
+
 static void deluge_skin_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -1454,6 +1510,19 @@ static void deluge_skin_class_init(ObjectClass *klass, const void *data)
                                   deluge_skin_get_seven_seg, NULL);
     object_class_property_add_str(klass, "dz-gold-knob",
                                   deluge_skin_get_gold_knob, NULL);
+    object_class_property_add_str(klass, "dz-pad-flashes",
+                                  deluge_skin_get_pad_flashes, NULL);
+    object_class_property_add_str(klass, "dz-pad-image",
+                                  deluge_skin_get_pad_image, NULL);
+    object_class_property_add(klass, "dz-flash-length", "int32",
+                              deluge_skin_get_pic_timing, NULL, NULL,
+                              (void *)(uintptr_t)0);
+    object_class_property_add(klass, "dz-refresh-time", "int32",
+                              deluge_skin_get_pic_timing, NULL, NULL,
+                              (void *)(uintptr_t)1);
+    object_class_property_add(klass, "dz-dimmer-interval", "int32",
+                              deluge_skin_get_pic_timing, NULL, NULL,
+                              (void *)(uintptr_t)2);
 }
 
 static const TypeInfo deluge_skin_info = {

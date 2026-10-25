@@ -25,7 +25,11 @@
  * in a new row, a horizontal scroll-row message shifts one row one column and
  * brings in a new pad. The model applies both to its pad image, so the pads it
  * reports follow the firmware's scroll animations as the hardware shows them.
- * An unrecognised command is framed as a zero-payload message.
+ * A pad flash (SET_PAD_FLASHING) shows one main pad in the flash colour for the
+ * flash length, in virtual time, and then restores it; each flash is also
+ * logged for a read-and-clear readout, since a flash is shorter than a
+ * sampling script's period. An unrecognised command is framed as a
+ * zero-payload message.
  *
  * Inbound events: this layer also synthesises the PIC-to-firmware input stream.
  * Pad and button presses/releases are encoded with the same matrix indices and
@@ -81,11 +85,14 @@ static int deluge_pic_debug(void)
  */
 #define PIC_MSG_SET_COLOUR_BASE      1    /* 1..9: column-pair RGB block      */
 #define PIC_MSG_SET_COLOUR_LAST      9
+#define PIC_MSG_SET_FLASH_COLOR_BASE 10   /* 10..17: + flash colour index     */
+#define PIC_MSG_SET_FLASH_COLOR_LAST 17
 #define PIC_MSG_SET_DEBOUNCE_TIME    18
 #define PIC_MSG_SET_REFRESH_TIME     19
 #define PIC_MSG_SET_GOLD_KNOB0       20
 #define PIC_MSG_SET_GOLD_KNOB1       21
 #define PIC_MSG_SET_FLASH_LENGTH     23
+#define PIC_MSG_SET_PAD_FLASHING     24   /* 24..151: + pad y + 8 * x         */
 #define PIC_MSG_SET_LED_OFF_BASE     152  /* 152..179: indicator LED off      */
 #define PIC_MSG_SET_LED_ON_BASE      188  /* 188..215: indicator LED on       */
 #define PIC_MSG_UPDATE_SEVEN_SEGMENT 224
@@ -128,6 +135,124 @@ static int deluge_pic_debug(void)
 #define DELUGE_PIC_FW_VERSION   23
 #define DELUGE_PIC_OLED_FLAG    0x80
 #define DELUGE_PIC_VERSION_BYTE (DELUGE_PIC_FW_VERSION & 0x7f)
+
+/*
+ * Flash length used before the firmware sets one (it sends 6 ms at boot).
+ */
+#define DELUGE_PIC_FLASH_MS_DEFAULT 6
+
+/*
+ * Flash colours by SET_FLASH_COLOR index. The PIC's own table is not
+ * documented; the firmware names index 1 red (PadLEDs' fast cursor flash on a
+ * red row) and index 3 yellow (the sound editor's second-layer shortcut blink),
+ * which fits the index being an R/G/B bit mask (bit 0 red, bit 1 green, bit 2
+ * blue), so the model uses that mask at full brightness. Index 0, the colour of
+ * a flash not preceded by SET_FLASH_COLOR, is shown white. Both are
+ * placeholders until checked against hardware; the flash readout reports the
+ * index, not the RGB.
+ */
+static void deluge_pic_flash_colour_rgb(uint8_t index, uint8_t rgb[3])
+{
+    if (index == 0) {
+        rgb[0] = rgb[1] = rgb[2] = 0xff;
+        return;
+    }
+    rgb[0] = (index & 1) ? 0xff : 0;
+    rgb[1] = (index & 2) ? 0xff : 0;
+    rgb[2] = (index & 4) ? 0xff : 0;
+}
+
+/*
+ * Push the pad image to the renderer: the firmware's pad_grid with every pad
+ * that is mid-flash shown in its flash colour.
+ */
+static void deluge_pic_push_pads(DelugePicState *s)
+{
+    uint8_t out[DELUGE_PIC_GRID_COLS][DELUGE_PIC_GRID_ROWS][3];
+
+    if (!s->padgrid) {
+        return;
+    }
+    memcpy(out, s->pad_grid, sizeof(out));
+    for (unsigned x = 0; x < DELUGE_PIC_FLASH_COLS; x++) {
+        for (unsigned y = 0; y < DELUGE_PIC_GRID_ROWS; y++) {
+            unsigned i = y + x * DELUGE_PIC_GRID_ROWS;
+
+            if (s->flash_until_ns[i]) {
+                memcpy(out[x][y], s->flash_rgb[i], 3);
+            }
+        }
+    }
+    deluge_padgrid_update(s->padgrid, out);
+}
+
+/* Arm the flash timer for the earliest flash still showing, if any. */
+static void deluge_pic_flash_rearm(DelugePicState *s)
+{
+    int64_t next = INT64_MAX;
+
+    for (unsigned i = 0; i < ARRAY_SIZE(s->flash_until_ns); i++) {
+        if (s->flash_until_ns[i] && s->flash_until_ns[i] < next) {
+            next = s->flash_until_ns[i];
+        }
+    }
+    if (next == INT64_MAX) {
+        timer_del(s->flash_timer);
+    } else {
+        timer_mod(s->flash_timer, next);
+    }
+}
+
+/* A flash's time is up: restore every pad whose flash has ended. */
+static void deluge_pic_flash_expire(void *opaque)
+{
+    DelugePicState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    for (unsigned i = 0; i < ARRAY_SIZE(s->flash_until_ns); i++) {
+        if (s->flash_until_ns[i] && s->flash_until_ns[i] <= now) {
+            s->flash_until_ns[i] = 0;
+        }
+    }
+    deluge_pic_flash_rearm(s);
+    deluge_pic_push_pads(s);
+}
+
+/*
+ * SET_PAD_FLASHING + idx, idx = y + 8 * x over the 16 main columns. The
+ * colour a SET_FLASH_COLOR chose applies to this flash only (the firmware
+ * sends it before every coloured flash and nothing before a default one).
+ * A flash on a pad already flashing restarts it.
+ */
+static void deluge_pic_flash_pad(DelugePicState *s, unsigned idx)
+{
+    unsigned x = idx / DELUGE_PIC_GRID_ROWS;
+    unsigned y = idx % DELUGE_PIC_GRID_ROWS;
+    int32_t ms = s->flash_length_ms >= 0 ? s->flash_length_ms
+                                         : DELUGE_PIC_FLASH_MS_DEFAULT;
+    uint8_t colour = s->flash_colour;
+
+    s->flash_colour = 0;
+    PIC_DBG("SET_PAD_FLASHING x=%u y=%u colour=%u ms=%d", x, y, colour, ms);
+
+    if (s->flash_log_len == DELUGE_PIC_FLASH_LOG_MAX) {
+        memmove(&s->flash_log[0], &s->flash_log[1],
+                (DELUGE_PIC_FLASH_LOG_MAX - 1) * sizeof(s->flash_log[0]));
+        s->flash_log_len--;
+    }
+    s->flash_log[s->flash_log_len++] = (DelugePicFlashEvent){
+        .x = x, .y = y, .colour = colour,
+    };
+
+    if (ms <= 0) {
+        return;
+    }
+    deluge_pic_flash_colour_rgb(colour, s->flash_rgb[idx]);
+    s->flash_until_ns[idx] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                             (int64_t)ms * SCALE_MS;
+    deluge_pic_flash_rearm(s);
+    deluge_pic_push_pads(s);
+}
 
 /* Deliver one response byte to the firmware via its receive DMA ring. */
 static void deluge_pic_respond(DelugePicState *s, uint8_t b)
@@ -303,9 +428,7 @@ static void deluge_pic_dispatch(DelugePicState *s)
                 memcpy(s->pad_grid[col][row], &s->payload[i * 3], 3);
             }
         }
-        if (s->padgrid) {
-            deluge_padgrid_update(s->padgrid, s->pad_grid);
-        }
+        deluge_pic_push_pads(s);
         return;
     }
     if (cmd >= PIC_MSG_SET_SCROLL_ROW_BASE &&
@@ -315,9 +438,7 @@ static void deluge_pic_dispatch(DelugePicState *s)
                 s->hscroll_right ? "right" : "left",
                 s->hscroll_full ? DELUGE_PIC_GRID_COLS : 16);
         deluge_pic_scroll_row(s, cmd - PIC_MSG_SET_SCROLL_ROW_BASE);
-        if (s->padgrid) {
-            deluge_padgrid_update(s->padgrid, s->pad_grid);
-        }
+        deluge_pic_push_pads(s);
         return;
     }
     if (cmd >= PIC_MSG_SET_SCROLL_H_BASE && cmd <= PIC_MSG_SET_SCROLL_H_LAST) {
@@ -332,9 +453,18 @@ static void deluge_pic_dispatch(DelugePicState *s)
                 cmd == PIC_MSG_SET_SCROLL_UP ? "UP" : "DOWN");
         deluge_pic_scroll_vertical(s, cmd == PIC_MSG_SET_SCROLL_UP,
                                    s->payload_have / 3);
-        if (s->padgrid) {
-            deluge_padgrid_update(s->padgrid, s->pad_grid);
-        }
+        deluge_pic_push_pads(s);
+        return;
+    }
+    if (cmd >= PIC_MSG_SET_FLASH_COLOR_BASE &&
+        cmd <= PIC_MSG_SET_FLASH_COLOR_LAST) {
+        s->flash_colour = cmd - PIC_MSG_SET_FLASH_COLOR_BASE;
+        return;
+    }
+    if (cmd >= PIC_MSG_SET_PAD_FLASHING &&
+        cmd < PIC_MSG_SET_PAD_FLASHING +
+                  DELUGE_PIC_FLASH_COLS * DELUGE_PIC_GRID_ROWS) {
+        deluge_pic_flash_pad(s, cmd - PIC_MSG_SET_PAD_FLASHING);
         return;
     }
     if (cmd >= PIC_MSG_SET_LED_OFF_BASE &&
@@ -351,6 +481,15 @@ static void deluge_pic_dispatch(DelugePicState *s)
     switch (cmd) {
     case PIC_MSG_SET_UART_SPEED:
         s->baud_div = s->payload[0];
+        break;
+    case PIC_MSG_SET_FLASH_LENGTH:
+        s->flash_length_ms = s->payload[0];
+        break;
+    case PIC_MSG_SET_REFRESH_TIME:
+        s->refresh_time = s->payload[0];
+        break;
+    case PIC_MSG_SET_DIMMER_INTERVAL:
+        s->dimmer_interval = s->payload[0];
         break;
     case PIC_MSG_SET_GOLD_KNOB0:
         memcpy(s->gold_knob[0], s->payload, DELUGE_PIC_GOLD_LEDS);
@@ -403,10 +542,11 @@ static void deluge_pic_dispatch(DelugePicState *s)
         break;
     default:
         /*
-         * Remaining commands (flash colour/pad, debounce/refresh/flash timing,
-         * dimmer, resend-button-states, done-sending-rows)
-         * affect PIC-internal behaviour with no state the renderers need yet;
-         * their payloads are framed and consumed above.
+         * Remaining commands (debounce time, minimum interrupt interval,
+         * resend-button-states, done-sending-rows) affect PIC-internal
+         * behaviour with no state the renderers need; their payloads are
+         * framed and consumed above. The refresh time and dimmer interval are
+         * recorded for the readout only: pad brightness is not rendered.
          */
         break;
     }
@@ -450,10 +590,18 @@ static int deluge_pic_chr_write(Chardev *chr, const uint8_t *buf, int len)
  * state the renderers mirror. Device pointers, the DMA channel and the
  * heartbeat timer are transient and re-established by deluge_pic_set_dma().
  */
+/* Re-arm the flash timer for the flashes a snapshot was taken during. */
+static int deluge_pic_post_load(void *opaque, int version_id)
+{
+    deluge_pic_flash_rearm(opaque);
+    return 0;
+}
+
 static const VMStateDescription vmstate_deluge_pic = {
     .name = TYPE_DELUGE_PIC,
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 1,
+    .post_load = deluge_pic_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8(cmd, DelugePicState),
         VMSTATE_BOOL(in_message, DelugePicState),
@@ -475,6 +623,14 @@ static const VMStateDescription vmstate_deluge_pic = {
         VMSTATE_BOOL(oled_dc_high, DelugePicState),
         VMSTATE_BOOL_V(hscroll_right, DelugePicState, 2),
         VMSTATE_BOOL_V(hscroll_full, DelugePicState, 2),
+        VMSTATE_UINT8_V(flash_colour, DelugePicState, 3),
+        VMSTATE_INT64_ARRAY_V(flash_until_ns, DelugePicState,
+                              DELUGE_PIC_FLASH_COLS * DELUGE_PIC_GRID_ROWS, 3),
+        VMSTATE_BUFFER_UNSAFE(flash_rgb, DelugePicState, 3,
+                              DELUGE_PIC_FLASH_COLS * DELUGE_PIC_GRID_ROWS * 3),
+        VMSTATE_INT32_V(flash_length_ms, DelugePicState, 3),
+        VMSTATE_INT32_V(refresh_time, DelugePicState, 3),
+        VMSTATE_INT32_V(dimmer_interval, DelugePicState, 3),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -600,6 +756,35 @@ void deluge_pic_get_seven_seg(Chardev *chr, uint8_t out[DELUGE_PIC_SEG_DIGITS])
     memcpy(out, s->seven_seg, sizeof(s->seven_seg));
 }
 
+unsigned deluge_pic_take_flashes(Chardev *chr, DelugePicFlashEvent *out)
+{
+    DelugePicState *s = DELUGE_PIC(chr);
+    unsigned n = s->flash_log_len;
+
+    memcpy(out, s->flash_log, n * sizeof(s->flash_log[0]));
+    s->flash_log_len = 0;
+    return n;
+}
+
+void deluge_pic_get_pad_image(Chardev *chr,
+                              uint8_t out[DELUGE_PIC_GRID_COLS]
+                                         [DELUGE_PIC_GRID_ROWS][3])
+{
+    DelugePicState *s = DELUGE_PIC(chr);
+
+    memcpy(out, s->pad_grid, sizeof(s->pad_grid));
+}
+
+void deluge_pic_get_timing(Chardev *chr, int32_t *flash_length_ms,
+                           int32_t *refresh_time, int32_t *dimmer_interval)
+{
+    DelugePicState *s = DELUGE_PIC(chr);
+
+    *flash_length_ms = s->flash_length_ms;
+    *refresh_time = s->refresh_time;
+    *dimmer_interval = s->dimmer_interval;
+}
+
 static void deluge_pic_class_init(ObjectClass *oc, const void *data)
 {
     ChardevClass *cc = CHARDEV_CLASS(oc);
@@ -608,9 +793,23 @@ static void deluge_pic_class_init(ObjectClass *oc, const void *data)
     cc->chr_write = deluge_pic_chr_write;
 }
 
+static void deluge_pic_instance_init(Object *obj)
+{
+    DelugePicState *s = DELUGE_PIC(obj);
+
+    s->flash_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                  deluge_pic_flash_expire, s);
+    s->flash_length_ms = -1;
+    s->refresh_time = -1;
+    s->dimmer_interval = -1;
+}
+
 static void deluge_pic_finalize(Object *obj)
 {
     DelugePicState *s = DELUGE_PIC(obj);
+
+    timer_free(s->flash_timer);
+    s->flash_timer = NULL;
 
     if (s->heartbeat) {
         timer_free(s->heartbeat);
@@ -622,6 +821,7 @@ static const TypeInfo deluge_pic_info = {
     .name            = TYPE_DELUGE_PIC,
     .parent          = TYPE_CHARDEV,
     .instance_size   = sizeof(DelugePicState),
+    .instance_init   = deluge_pic_instance_init,
     .instance_finalize = deluge_pic_finalize,
     .class_init      = deluge_pic_class_init,
 };
