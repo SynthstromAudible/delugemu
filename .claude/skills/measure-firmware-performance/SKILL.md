@@ -106,9 +106,12 @@ look at that cold phase.
   firmware does, so use `--icount` for it. The plugin prints a warning if it happens.
 - **Hardware's L1I refill counter (~12 per 1,000 instructions) is not a demand-miss count.** It includes fetch-ahead.
   The model's ~5 is the right order. Don't "fix" the model to match the counter (see the README).
-- **Instruction hotspots**, not just cache ones: run the stock `libhotblocks` plugin as well
-  (`-plugin qemu/build/contrib/plugins/libhotblocks.dylib,inline=on,limit=0`) and bucket with
-  `scripts/dz_bucket.py <log> <elf>`.
+- **Instruction hotspots**, not just cache ones: add `--hotblocks` to `run_emu.py`, and run it again with
+  `--slices 0` (stops at PLAY) to subtract boot and song load:
+  `scripts/dz_bucket.py <run>/plugin.log <elf> 40 --minus <toplay>/plugin.log`.
+- **The scheduler (`chooseBestTask`) is where the firmware waits when idle,** so its share tracks spare time:
+  ~48% over boot/load, ~8% playing at 89% load. Don't read a big scheduler share as scheduler cost; profile at
+  Deluge speed with a song that loads the CPU.
 
 ## Hardware calibration (only when the user asks)
 

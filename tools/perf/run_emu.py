@@ -30,6 +30,9 @@ def main():
     ap.add_argument("--slices", type=int, default=200, help="stop this many 100M-instruction slices after PLAY")
     ap.add_argument("--warm", type=int, default=5_000_000_000, help="SCOPE totals start this many instructions after PLAY")
     ap.add_argument("--timeout", type=float, default=3600)
+    ap.add_argument("--hotblocks", action="store_true",
+                    help="also run QEMU's libhotblocks, for a per-symbol instruction profile: scripts/dz_bucket.py "
+                         "<out>/plugin.log <elf>")
     ap.add_argument("--lean", action="store_true",
                     help="fast flat-CPI timing (timectl=1,cachesim=0 in --plugin): no per-render/per-function accounting")
     args = ap.parse_args()
@@ -47,6 +50,13 @@ def main():
     if args.plugin:
         opts.append(args.plugin)
     sock = "/tmp/dzperf_%d.sock" % os.getpid()
+    extra = ["-plugin", "%s,%s" % (lib, ",".join(opts))]
+    if args.hotblocks:
+        # Writes its report to the same log when QEMU quits
+        hb = os.path.join(REPO, "qemu", "build", "contrib", "plugins",
+                          "libhotblocks." + ("dylib" if sys.platform == "darwin" else "so"))
+        extra += ["-plugin", hb + ",inline=on,limit=0"]
+    extra += ["-d", "plugin", "-D", log]
 
     def slices_after_mark():
         try:
@@ -58,7 +68,7 @@ def main():
 
     with DelugeSession.launch(firmware=args.elf, sd=args.sd, icount=args.icount, headless=True, audio="none",
                               sock=sock, run_log=os.path.join(args.out, "run.log"), boot_wait=5,
-                              extra_qemu=["-plugin", "%s,%s" % (lib, ",".join(opts)), "-d", "plugin", "-D", log]) as dz:
+                              extra_qemu=extra) as dz:
         t0 = time.time()
         while slices_after_mark() < args.slices and time.time() - t0 < args.timeout:
             time.sleep(10)
