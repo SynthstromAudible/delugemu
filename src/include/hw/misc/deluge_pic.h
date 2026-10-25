@@ -55,6 +55,18 @@ DECLARE_INSTANCE_CHECKER(DelugePicState, DELUGE_PIC, TYPE_DELUGE_PIC)
 /* Largest message payload: vertical scroll carries (16 + 2) RGB triples. */
 #define DELUGE_PIC_MAX_PAYLOAD ((16 + 2) * 3)
 
+/* Pad flashes cover the 16 main columns only (SET_PAD_FLASHING 24..151). */
+#define DELUGE_PIC_FLASH_COLS 16
+
+/* Flash events kept for the read-and-clear readout; older ones are dropped. */
+#define DELUGE_PIC_FLASH_LOG_MAX 64
+
+typedef struct DelugePicFlashEvent {
+    uint8_t x;
+    uint8_t y;
+    uint8_t colour; /* SET_FLASH_COLOR index in effect, 0 for the default */
+} DelugePicFlashEvent;
+
 struct DelugePicState {
     /*< private >*/
     Chardev parent;
@@ -132,6 +144,33 @@ struct DelugePicState {
      */
     bool hscroll_right;
     bool hscroll_full;
+
+    /*
+     * Pad flashes (SET_PAD_FLASHING + pad). The PIC shows the pad in the flash
+     * colour for flash_length ms and then restores it; pad_grid stays the
+     * firmware's image throughout and the flash is an overlay composed on top
+     * when the pads are pushed to the renderer. flash_until_ns is the virtual
+     * time each overlay ends (0 = not flashing), flash_rgb its colour, and
+     * flash_timer fires at the earliest end. flash_colour is the index the
+     * last SET_FLASH_COLOR chose for the next flash only.
+     */
+    uint8_t flash_colour;
+    int64_t flash_until_ns[DELUGE_PIC_FLASH_COLS * DELUGE_PIC_GRID_ROWS];
+    uint8_t flash_rgb[DELUGE_PIC_FLASH_COLS * DELUGE_PIC_GRID_ROWS][3];
+    struct QEMUTimer *flash_timer;
+
+    /* Flashes since the readout last cleared them (oldest first). */
+    DelugePicFlashEvent flash_log[DELUGE_PIC_FLASH_LOG_MAX];
+    unsigned flash_log_len;
+
+    /*
+     * Last values the firmware set for the PIC's timing controls, -1 until
+     * set: flash length (ms), pad refresh time and pad dimmer interval (the
+     * user's pad-brightness setting).
+     */
+    int32_t flash_length_ms;
+    int32_t refresh_time;
+    int32_t dimmer_interval;
 };
 
 /*
@@ -173,5 +212,16 @@ uint8_t deluge_pic_get_gold_knob(Chardev *chr, int which, int led);
 
 /* Copy the 4 raw 7-segment digit bitmasks into out (for state readout). */
 void deluge_pic_get_seven_seg(Chardev *chr, uint8_t out[DELUGE_PIC_SEG_DIGITS]);
+
+/*
+ * Copy the pad flashes logged since the last call, oldest first, into out
+ * (room for DELUGE_PIC_FLASH_LOG_MAX) and clear the log. Returns the number
+ * copied.
+ */
+unsigned deluge_pic_take_flashes(Chardev *chr, DelugePicFlashEvent *out);
+
+/* Last flash length, refresh time and dimmer interval set; -1 if never. */
+void deluge_pic_get_timing(Chardev *chr, int32_t *flash_length_ms,
+                           int32_t *refresh_time, int32_t *dimmer_interval);
 
 #endif /* HW_MISC_DELUGE_PIC_H */

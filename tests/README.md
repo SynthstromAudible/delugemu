@@ -182,6 +182,22 @@ Polling is wall-clock, so it requires only a couple of the scroll's steps to be
 seen. It **skips cleanly** (exit 0) when no firmware or SD image is present
 (the SD image defaults to `build/deluge_sd.img`).
 
+## `pad-flash.sh`
+
+The PIC pad-flash model test. It boots a firmware image, opens the sound menu on
+a parameter with SHIFT + its shortcut pad (`SHORTCUT_PAD`, default `11,1`;
+the firmware then blinks that pad with the PIC's SET_PAD_FLASHING), polls the
+read-and-clear flash readout (`dz-pad-flashes`), and asserts that flashes were
+reported on that pad only, that none follow once BACK closes the menu, and that
+the boot PIC timing (flash length 6 ms, refresh time, dimmer interval) reads
+back.
+
+```sh
+DELUGE_FIRMWARE=path [DELUGE_SD=path] ./tests/pad-flash.sh
+```
+
+It **skips cleanly** (exit 0) when no firmware image is present.
+
 ## Adding tests
 
 Keep tests runnable standalone and CI-friendly: exit non-zero on failure, avoid

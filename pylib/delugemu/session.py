@@ -329,6 +329,26 @@ class DelugeSession:
         path = self._dev("skin", "deluge-skin", "/machine/soc/skin")
         return display.decode_gold_knob(self.q.qom_get(path, "dz-gold-knob"))
 
+    def read_pad_flashes(self):
+        """The pad flashes the PIC has shown since the last call, oldest first,
+        as (x, y, colour) tuples; colour is the PIC flash-colour index (0 for
+        the default). Reading clears the PIC's log, which keeps the most recent
+        64. A flash lasts only the flash length (6 ms), so poll this rather
+        than ``read_pads`` to see every one."""
+        path = self._dev("skin", "deluge-skin", "/machine/soc/skin")
+        text = self.q.qom_get(path, "dz-pad-flashes")
+        return [tuple(int(v) for v in ev.split(",")) for ev in text.split(";") if ev]
+
+    def read_pic_settings(self):
+        """The PIC timing the firmware last set: ``flash_length`` (ms),
+        ``refresh_time`` and ``dimmer_interval`` (the pad-brightness setting).
+        Each is -1 until the firmware sends it."""
+        path = self._dev("skin", "deluge-skin", "/machine/soc/skin")
+        return {key: int(self.q.qom_get(path, prop)) for key, prop in (
+            ("flash_length", "dz-flash-length"),
+            ("refresh_time", "dz-refresh-time"),
+            ("dimmer_interval", "dz-dimmer-interval"))}
+
     def screenshot(self, path):
         """Capture the composited front panel. PNG if the path ends .png (falls
         back to PPM when the QEMU build lacks PNG screendump)."""
