@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Bucket a libhotblocks report by firmware symbol → ranked flat profile.
 
-Usage: dz_bucket.py <hotblocks_report.txt> <deluge.elf> [top_n]
+Usage: dz_bucket.py <hotblocks_report.txt> <deluge.elf> [top_n] [--minus <report.txt>]
+
+--minus subtracts another report's per-symbol counts, e.g. a run of the same firmware stopped at PLAY, to leave
+only what ran while the song played.
 
 hotblocks lines look like:  "0x20034abc, 3, 12, 4567"  (pc, tcount, icount, ecount)
 Weight = icount * ecount  (total guest instructions executed in that block).
@@ -45,17 +48,10 @@ def demangle(names):
         return names
 
 
-def main():
-    report, elf = sys.argv[1], sys.argv[2]
-    top_n = int(sys.argv[3]) if len(sys.argv) > 3 else 40
-
-    addrs, names = load_symbols(elf)
-    dnames = demangle(names)
-
+def bucket(report, addrs, dnames):
     sym_weight = {}
-    total = 0
     line_re = re.compile(r"^\s*(0x[0-9a-fA-F]+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)")
-    with open(report) as fh:
+    with open(report, errors="replace") as fh:
         for line in fh:
             m = line_re.match(line)
             if not m:
@@ -64,13 +60,34 @@ def main():
             icount = int(m.group(3))
             ecount = int(m.group(4))
             weight = icount * ecount
-            total += weight
             i = bisect.bisect_right(addrs, pc) - 1
             if i < 0:
                 sym = "<below-first-symbol>"
             else:
                 sym = dnames[i]
             sym_weight[sym] = sym_weight.get(sym, 0) + weight
+    return sym_weight
+
+
+def main():
+    args = sys.argv[1:]
+    minus = None
+    if "--minus" in args:
+        i = args.index("--minus")
+        minus = args[i + 1]
+        del args[i:i + 2]
+    report, elf = args[0], args[1]
+    top_n = int(args[2]) if len(args) > 2 else 40
+
+    addrs, names = load_symbols(elf)
+    dnames = demangle(names)
+
+    sym_weight = bucket(report, addrs, dnames)
+    if minus:
+        for sym, w in bucket(minus, addrs, dnames).items():
+            sym_weight[sym] = sym_weight.get(sym, 0) - w
+        sym_weight = {s: w for s, w in sym_weight.items() if w > 0}
+    total = sum(sym_weight.values())
 
     if total == 0:
         print("no hotblocks rows parsed", file=sys.stderr)

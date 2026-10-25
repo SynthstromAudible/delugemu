@@ -22,7 +22,7 @@ boundary trick. Profiling is used **only to rank guest-instruction-count
 hotspots**, which is a portable ranking; TCG does not model cache/pipeline
 timing.
 
-## Key finding: it's the scheduler, and you must profile the Release build
+## Key finding: the scheduler is where the firmware idles, and you must profile the Release build
 
 `firmware/deluge.elf` is byte-identical to `build/Debug/deluge.elf` (`-Og`, no
 LTO). **Real hardware ships the Release build** (`-O2 -flto=auto`), which must be
@@ -37,28 +37,56 @@ firmware/DelugeFirmware/toolchain/current/cmake/bin/cmake \
 At `-O2` the scheduler helpers that dominate the *Debug* profile
 (`Time::operator<=>`, `Task::isReady`, `Task::isRunnable`) are **fully inlined**
 and vanish as symbols, and the `double` time constants fold away (no soft-float
-in the hot path). The complete Release profile (dense `FAM1.XML`, no `--icount`,
-`libhotblocks,limit=0`, 48 B instructions) is overwhelmingly the cooperative
-task scheduler:
+in the hot path).
+
+**The scheduler's share of instructions measures idle time, not scheduler cost.**
+When no task is ready, the dispatch loop re-runs `chooseBestTask` (three O(N)
+passes over all tasks) + `checkConditionalTasks` (O(25)) + `runHighestPriTask`
+and loops: a busy-spin, which is how the firmware waits. So the less work there
+is, the bigger the scheduler looks. An earlier version of this table (dense
+`FAM1.XML`, no `--icount`, host clock) put `chooseBestTask` at 74.9% and the
+scheduler at ~91%. That run was idle-diluted: on the host clock the guest runs
+much faster than a Deluge and spends most of its time waiting. It is not the
+load on a real Deluge playing a song.
+
+Release profile while a song plays, at Deluge speed (2026-10-25): probe firmware
+(`debug/pmu-render-probe`, community d2bfbf188), "Make You A Deal 2",
+`tools/perf/run_emu.py --plugin timectl=1,cachesim=0,cpi=1.45 --lean --slices 400
+--hotblocks`. Render load **88.7%**, with the firmware culling voices to stay
+there. 39.4 B instructions over ~100 s of playback. Boot and song load are
+subtracted using a second run stopped at PLAY:
+`scripts/dz_bucket.py <run>/plugin.log <elf> 40 --minus <toplay>/plugin.log`.
 
 | Symbol | % of guest instructions |
 |--------|------------------------|
-| `TaskManager::chooseBestTask` | **74.9%** |
-| `checkConditionalTasks` | 7.5% |
-| `getSecondsFromStart` | 7.1% |
-| `runHighestPriTask` + `runTask` | ~1.6% |
-| **scheduler subtotal** | **~91%** |
-| all audio DSP combined (Freeverb, `Sound::render`, compressor, filters, oscillators, voices) | **~7%** |
+| `Delay::process` | **28.6%** |
+| `Freeverb::process` | 8.2% |
+| `LpLadderFilter::doFilterStereo` | 7.7% |
+| `ModControllableAudio::processFX` | 7.6% |
+| `HpLadderFilter::doFilterStereo` | 7.0% |
+| `processReverbSendAndVolume` | 3.2% |
+| `GlobalEffectableForClip::renderOutput` | 2.9% |
+| `processSRRAndBitcrushing` | 2.6% |
+| `Sound::render` | 2.3% |
+| `RMSFeedbackCompressor::render` | 1.4% |
+| `TaskManager::chooseBestTask` | 7.7% |
+| `getSecondsFromStart` + `checkConditionalTasks` + `runTask` + `runHighestPriTask` | 2.0% |
+| **scheduler subtotal** | **9.7%** |
+| probe instrumentation (`dzProbeWindow`, `DzScope`) | 1.3% |
 
-This holds at `--icount 2` and full host speed, and on both Debug and Release —
-it is **not** an idle-throttle artifact. When no task is "ready" the dispatch
-loop re-runs `chooseBestTask` (three O(N) passes over all tasks) +
-`checkConditionalTasks` (O(25)) + `runHighestPriTask`, then loops — a tight
-busy-spin. Source: `src/OSLikeStuff/task_scheduler/task_scheduler.cpp`.
+The scheduler's 9.7% is close to the 11.3% of time not spent rendering. For
+comparison, over boot and song load (5.0 B instructions, mostly waiting) the same
+firmware spends 48% in `chooseBestTask` alone. In lean mode time is proportional
+to instructions (flat CPI), so these shares are shares of time too. The cache
+model (`run_emu.py` without `--lean`) charges render code more per instruction
+than the cache-hot spin loop, so render's real share of time is a little higher.
 
-**Consequence:** the DSP levers (compressor LUT, per-voice block processing)
-target only a ~7% slice. The single material lever is `chooseBestTask` itself —
-see "What we tried and ruled out" before touching it.
+**Consequence:** at high load the scheduler mostly drops out, and render DSP is
+what limits how many voices play. `chooseBestTask` is the right target only for
+latency (how soon a ready task starts) or power, not for render capacity.
+Cutting its per-call cost still matters a little at high load, as the spin
+between renders gets shorter, but it can't buy back more than the ~10% the
+firmware isn't already rendering.
 
 ## Useful tools (built and proven)
 
@@ -96,8 +124,11 @@ see "What we tried and ruled out" before touching it.
 SD card: `./scripts/mksd.sh sdcard build/deluge_sd.img`. Worst-case song ranking:
 `FAM1` (127 sounds) > `FAM3` (129) > `FAM2` (10) > `SONG010` (2).
 
-**Idle-dilution caveat:** on a fast host the guest keeps up and idle-spins in
-the scheduler, so an unsaturated profile is ~70% scheduler with DSP buried. Run
+**Idle-dilution caveat:** the scheduler is where the firmware waits, so its
+share tracks idle time (see the key finding above). On a fast host the guest
+keeps up and idle-spins in the scheduler, so an unsaturated profile is ~70%+
+scheduler with DSP buried. For a Deluge-like profile, use `tools/perf/run_emu.py
+--hotblocks` with `timectl=1` (Deluge speed) and a song that loads the CPU. Run
 under `--icount 2` to saturate. At `--icount 4`+ the firmware's adaptive
 voice-culling activates (synth voices drop, master-bus work remains) — read both
 a moderate and a deep-saturation profile.
@@ -163,20 +194,24 @@ cheaper call just lets the idle loop spin more). The only confound-free metric
 is **instructions per `chooseBestTask` call** = (its total instructions) ÷ (its
 entry-block execution count, col 4 of the hotblocks report at the symbol PC).
 
-**Open lever (not attempted):** a real win needs an **event-driven next-wake**
-redesign — compute the next time any task transitions to ready and skip dispatch
-until then — on the maintainers' core scheduler. That carries genuine
+**Open lever (not attempted):** an **event-driven next-wake** redesign —
+compute the next time any task transitions to ready and skip dispatch until
+then — on the maintainers' core scheduler. As the spin is idle time, this would
+cut wasted instructions and power, not add render capacity. It carries genuine
 timing-behavior risk, so it is deferred pending explicit direction.
 
-## DSP levers (secondary, bounded by the ~7% share)
+## DSP levers (the main lever at high load)
 
 - **`RMSFeedbackCompressor`** (master bus, always-on) — `render` + `calcRMS`
   driven by `expf`/`logf`. Clean LUT candidate gated by an offline kernel
   null-test, but only ~0.5% of instructions.
 - **Per-voice DSP** — `Freeverb::process` (~1%), `Sound::render` (~0.8%),
   `Lp`/`HpLadderFilter` (~0.6%), oscillator/wavetable kernels, voices. All
-  fixed-point `long` (Q31). Block-processing raises the polyphony ceiling but
-  cannot move the overall budget while the scheduler is ~91%.
+  fixed-point `long` (Q31). Block-processing raises the polyphony ceiling,
+  which is what's limiting at high load (render is ~89% of time on "Make You A
+  Deal 2"). The shares above came from the idle-diluted FAM1 profile; on that
+  song `Delay::process` (28.6%), Freeverb (8.2%), the ladder filters (~16%) and
+  `processFX` (7.6%) lead.
 
 Other clean HW-portable wins if/when the DSP becomes the bottleneck: FPSCR
 flush-to-zero / default-NaN (if any FP appears — denormals are catastrophic on
