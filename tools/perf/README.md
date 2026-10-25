@@ -11,6 +11,7 @@ roughly the speed a real Deluge would, so CPU-bound behaviour (voice culling) ca
 | `tools/perf/hw_probe.py` | Loads the probe firmware onto a Deluge through a Black Magic Probe, dumps its ring, restores. |
 | `tools/perf/summarize.py` | Side-by-side table of runs and a hardware dump; per-function cost per active call. |
 | `tools/perf/cache_report.py` | Functions ranked by modelled cache stall, and which data the misses hit. |
+| `tools/perf/icache_replay.c` | Replays an instruction-fetch trace (`itrace=`) through L1I size/replacement/fetch-ahead variants. |
 
 The firmware side is the DelugeFirmware branch `debug/pmu-render-probe`: a probe that records 100 ms windows of
 render timing, culls, A9 PMU counters (cycles, instructions, L1 refills, I/D-cache stall cycles), inclusive costs of
@@ -22,13 +23,19 @@ six functions (`DzScope`) and delay-path counts, and that loads and plays a song
 
 ```sh
 scripts/build-plugins.sh
-tools/perf/run_emu.py --elf probe.elf --out runs/cpi145 --plugin timectl=1,cachesim=0,cpi=1.45   # ~4.5 min
-tools/perf/run_emu.py --elf probe.elf --out runs/cache  --plugin timectl=1,pfstreams=4,pfdist=4,l2pf=1  # ~8 min
+tools/perf/run_emu.py --elf probe.elf --out runs/cpi145 --plugin timectl=1,cachesim=0,cpi=1.45 --lean  # ~70 s
+tools/perf/run_emu.py --elf probe.elf --out runs/cpi145f --plugin timectl=1,cachesim=0,cpi=1.45  # + per-function, ~4.5 min
+tools/perf/run_emu.py --elf probe.elf --out runs/cache  --plugin timectl=1,pfstreams=4,pfdist=4,l2pf=1  # ~8 min, calibrated defaults
 tools/perf/summarize.py runs/cpi145 runs/cache --hw hw.bin --hw-play 136
 tools/perf/cache_report.py runs/cache/plugin.log --elf probe.elf
 ```
 
 Host audio is never connected (`--audio none`).
+
+`--lean` (plugin `lean=1`) is the fast way to run firmware at Deluge speed: instructions are counted inline per
+translation block and the clock advances every few thousand instructions, with no per-instruction callbacks, so an
+80 s song runs in about 70 s instead of 4.5 minutes, with the same culling, voices and load. It has no per-render or
+per-function accounting; drop `--lean` for those. The plugin assumes a single vCPU and takes no locks.
 
 ## Calibration (October 2026, "I'Ll Make You A Deal 2", 32 KiB-cluster card)
 
@@ -44,13 +51,29 @@ just has more active units. With time control:
 | clock | render ins/frame | load | culls/5 s | voices |
 | ----- | ---------------- | ---- | --------- | ------ |
 | hardware | 5,710 | 88% | 45-63 | 2.1-2.4 |
-| `cpi=1.37` | 5,887 | 88% | 21 | 3.7 |
-| `cpi=1.45` | 5,612 | 89% | 49 | 2.4 |
-| cache model | 5,917 | 88% | 14 | 4.1 |
+| `cpi=1.37` (flat) | 5,887 | 88% | 22 | 3.6 |
+| `cpi=1.45` (flat) | 5,607 | 89% | 50 | 2.4 |
+| cache model, first fit (penalties from PMU refill counts) | 5,914 | 88% | 14 | 4.2 |
+| cache model, defaults (`cpi=1.30,pi=9,pd=25.6,pdev=60`) | 5,490 | 89% | 59 | 2.1 |
 
-So `timectl=1,cachesim=0,cpi=1.45` is the usable stand-in for a Deluge. The cache model's D-side miss rate matches
-hardware (5.7 vs 5.3 per 1,000 instructions) but it finds well under half the I-cache misses (5.3 vs 12.4), so it
-under-charges instruction fetch and runs a little fast.
+So `timectl=1,cachesim=0,cpi=1.45 --lean` is the quick stand-in for a Deluge, and the cache model with its defaults
+the closer one (and the one to use when changing memory layout or code size).
+
+### The I-cache "gap"
+
+The A9's L1I refill counter reads 12 per 1,000 render instructions, the model 5-6. The counter isn't a demand-miss
+count, though: the same renders spend only 3.9% of cycles (53 per 1,000 instructions) stalled on the I-cache, about
+4 cycles per counted refill, where a demand miss served by the L2 costs ~20. Most counted refills are fetch-ahead
+and wrong-path fetches that overlap execution; demand misses are more like 2.5-3 per 1,000 instructions, the
+model's order. `tools/perf/icache_replay.c` replays an instruction-fetch trace (`itrace=`) through L1I variants: the
+counter's 12 needs the fetch unit requesting 3-4 lines ahead, while the hot render code sits right at the 32 KiB
+edge (16 KiB doubles the misses, 64 KiB removes four fifths).
+
+So the cache model's timing penalties are fitted to the hardware's *stall cycles*, not its refill counts:
+`pi=9` cycles per modelled I-miss, `pd=25.6` per D-miss, `pdev=60` per strongly-ordered/device access, and a base
+`cpi=1.30` fitted so the emulator culls like the Deluge (1.26 gives 35 culls per 5 s, 1.30 59, 1.34 82; the
+hardware 63). These are the plugin's defaults, and with them the model's L1D miss rate (5.1 per 1,000 instructions)
+and voice count (2.1) match the hardware.
 
 The PL310 is r3p2, 128 KiB, 8-way, 32-byte lines, round-robin replacement, next-line I and D prefetch; its event
 counters read zero because AUX_CONTROL bit 20 (event monitor bus) is off and can only be set with L2 disabled.

@@ -19,9 +19,9 @@
  * (AudioEngine::audioSampleTimer); inclusive SCOPE totals for up to six functions (s0..s5) once `warm` instructions
  * past the first mark; and at exit the instructions causing the most misses (INSN) and a data-miss map (HEAT).
  *
- * Args: ttb l2c mark slice phasea render timer|head fn0..fn3=lo-hi s0..s5 warm
+ * Args: ttb l2c mark slice phasea render timer|head fn0..fn3=lo-hi s0..s5 warm itrace itskip itlen
  *       l1size l1assoc l2size l2assoc line l1repl l2repl (0 LRU, 1 random, 2 round-robin)
- *       pfstreams pfdist l2pf timectl cachesim cpi pi pd hz quantum
+ *       pfstreams pfdist l2pf timectl lean cachesim cpi pi pd pdev pnc hz quantum
  * Build: scripts/build-plugins.sh
  */
 #include <glib.h>
@@ -255,6 +255,16 @@ static double scope_cyc0[NSCOPE];
 static uint64_t scope_calls[NSCOPE], scope_ins[NSCOPE];
 static double scope_cyc[NSCOPE];
 static uint64_t warm_insns; /* only count scopes once this many instructions past the mark */
+
+/*
+ * Instruction-fetch trace (itrace=<file>): from itskip instructions past the first mark, for itlen instructions, one
+ * u32 per change of 32-byte line: the line's address, bit 0 set if it isn't the line after the previous one (a jump).
+ * For replaying the L1I stream under other models offline (tools/perf/icache_replay.c).
+ */
+static FILE *itrace;
+static uint64_t itrace_skip, itrace_len = 200000000;
+static uint32_t itrace_buf[65536];
+static size_t itrace_n;
 static uint64_t mark_insns;
 
 static Cache *l1i, *l1d, *l2;
@@ -267,7 +277,13 @@ static Cache *l1i, *l1d, *l2;
  */
 static bool timectl;
 static const void *time_handle;
-static double cpi0 = 1.16, pen_i = 4.3, pen_d = 30.0, hz = 400e6;
+/*
+ * Defaults fitted to a Deluge: pi/pd from the PMU's I/D-cache stall cycles per render instruction divided by the
+ * model's demand misses (not the PMU refill counts, which include fetch-ahead), pdev a typical strongly-ordered
+ * access, and cpi the base that makes the emulator cull like the hardware on a CPU-bound song.
+ */
+static double cpi0 = 1.30, pen_i = 9.0, pen_d = 25.6, hz = 400e6;
+static double pen_dev = 60.0, pen_nc = 0.0; /* per strongly-ordered/device access, per Normal uncached access */
 static double cycles, cycles_at_update;
 static double quantum = 4000; /* cycles between clock updates (10 us at 400 MHz) */
 static bool cachesim = true;
@@ -281,7 +297,6 @@ static uint64_t next_slice;
 static int64_t mark_slice = -1; /* slice index at the first mark */
 static uint32_t last_iline = UINT32_MAX;
 static GHashTable *insn_stats; /* vaddr -> InsnStats */
-static GMutex lock;
 static struct qemu_plugin_register *regs[16];
 static GByteArray *regbuf;
 
@@ -511,7 +526,6 @@ static void vcpu_insn_exec(unsigned int cpu, void *udata)
     Insn *in = udata;
     uint32_t line;
 
-    g_mutex_lock(&lock);
     for (int i = 0; i < NSCOPE; i++) {
         if (scope_active[i] && in->vaddr == scope_ret[i]) {
             scope_active[i] = false;
@@ -566,6 +580,14 @@ static void vcpu_insn_exec(unsigned int cpu, void *udata)
         Attr a = attr_for(in->vaddr);
         uint32_t ev;
 
+        if (itrace && mark_insns && tot.insns >= mark_insns + itrace_skip &&
+            tot.insns < mark_insns + itrace_skip + itrace_len) {
+            itrace_buf[itrace_n++] = (line << l1i->line_bits) | (line != last_iline + 1);
+            if (itrace_n == G_N_ELEMENTS(itrace_buf)) {
+                fwrite(itrace_buf, 4, itrace_n, itrace);
+                itrace_n = 0;
+            }
+        }
         last_iline = line;
         if (a.inner) {
             tot.l1i_acc++;
@@ -590,7 +612,6 @@ static void vcpu_insn_exec(unsigned int cpu, void *udata)
         next_slice += slice;
         print_slice();
     }
-    g_mutex_unlock(&lock);
 }
 
 /* CP15 c7 maintenance: read Rt and apply it to L1. */
@@ -616,7 +637,6 @@ static void vcpu_maint_exec(unsigned int cpu, void *udata)
             memcpy(&rt, regbuf->data, 4);
         }
     }
-    g_mutex_lock(&lock);
     tot.l1_maint++;
     if (icache_all) {
         memset(l1i->valid, 0, l1i->sets * l1i->assoc);
@@ -628,7 +648,6 @@ static void vcpu_maint_exec(unsigned int cpu, void *udata)
     } else {
         tot.l1d_wb += cache_maint_addr(l1d, rt, clean, inval);
     }
-    g_mutex_unlock(&lock);
 }
 
 static void vcpu_render_entry(unsigned int cpu, void *udata)
@@ -644,7 +663,6 @@ static void vcpu_render_entry(unsigned int cpu, void *udata)
         memcpy(&lr, b->data, 4);
     }
     g_byte_array_set_size(b, 0);
-    g_mutex_lock(&lock);
     render_ret = lr & ~1u;
     head0 = 0;
     if (qemu_plugin_read_memory_vaddr(head_addr, b, 4) && b->len >= 4) {
@@ -655,7 +673,6 @@ static void vcpu_render_entry(unsigned int cpu, void *udata)
     memset(fn_l1d, 0, sizeof(fn_l1d));
     memset(fn_l2, 0, sizeof(fn_l2));
     in_render = true;
-    g_mutex_unlock(&lock);
     g_byte_array_free(b, TRUE);
 }
 
@@ -669,7 +686,6 @@ static void vcpu_scope_entry(unsigned int cpu, void *udata)
         memcpy(&lr, b->data, 4);
     }
     g_byte_array_free(b, TRUE);
-    g_mutex_lock(&lock);
     for (int i = 0; i < NSCOPE; i++) {
         if (scope_addr[i] == in->vaddr && !scope_active[i]) {
             scope_active[i] = true;
@@ -678,7 +694,6 @@ static void vcpu_scope_entry(unsigned int cpu, void *udata)
             scope_cyc0[i] = cycles;
         }
     }
-    g_mutex_unlock(&lock);
 }
 
 static void l2c_store(uint32_t off, uint32_t val)
@@ -715,7 +730,6 @@ static void vcpu_mem(unsigned int cpu, qemu_plugin_meminfo_t info, uint64_t vadd
     Attr a;
     int ph;
 
-    g_mutex_lock(&lock);
     ph = phase_now();
     if (write && pa >= ttb && pa < ttb + 0x4000) {
         attr_valid[(pa - ttb) / 4] = false;
@@ -727,8 +741,10 @@ static void vcpu_mem(unsigned int cpu, qemu_plugin_meminfo_t info, uint64_t vadd
     a = attr_for(addr);
     if (a.type == ATTR_SO || a.type == ATTR_DEV) {
         tot.dev++;
+        cycles += pen_dev;
     } else if (!a.inner) {
         tot.nc++;
+        cycles += pen_nc;
         in->st->nc[ph]++;
         if (a.outer) {
             to_l2(addr, write, a, in->st, ph);
@@ -765,7 +781,6 @@ static void vcpu_mem(unsigned int cpu, qemu_plugin_meminfo_t info, uint64_t vadd
             to_l2(ev, true, attr_for(ev), NULL, ph);
         }
     }
-    g_mutex_unlock(&lock);
 }
 
 /* Decode an MCR p15, 0, Rt, c7, CRm, opc2 from an ARM word or a Thumb-2 pair. */
@@ -780,9 +795,72 @@ static bool decode_c7(uint32_t w, int *op, int *rt)
     return true;
 }
 
+/*
+ * Lean mode (lean=1, with timectl=1 and cachesim=0): no per-instruction callbacks. Instructions are counted with
+ * inline per-block adds, and a conditional callback every `quantum` cycles' worth advances the clock and prints
+ * slices, so a flat-CPI run goes at close to plain emulation speed. Only the mark instruction gets a callback; there
+ * is no per-render or per-function accounting.
+ */
+static bool lean;
+static struct qemu_plugin_scoreboard *lean_sb;
+static qemu_plugin_u64 lean_count;
+static uint64_t lean_quantum_insns;
+
+static void lean_advance(void)
+{
+    uint64_t n = qemu_plugin_u64_get(lean_count, 0);
+
+    qemu_plugin_u64_set(lean_count, 0, 0);
+    tot.insns += n;
+    cycles += n * cpi0;
+    qemu_plugin_update_ns(time_handle, (int64_t)(cycles * 1e9 / hz));
+    while (tot.insns >= next_slice) {
+        next_slice += slice;
+        print_slice();
+    }
+}
+
+static void lean_quantum(unsigned int cpu, void *udata)
+{
+    lean_advance();
+}
+
+static void lean_mark(unsigned int cpu, void *udata)
+{
+    /* Bring the count up to date, including the instructions of this block before the mark */
+    uint64_t pending = qemu_plugin_u64_get(lean_count, 0);
+    g_autofree char *m = g_strdup_printf("MARK insns=%" PRIu64 " slice=%" PRIu64 "\n", tot.insns + pending,
+                                         (tot.insns + pending) / slice);
+    qemu_plugin_outs(m);
+    if (mark_slice < 0) {
+        mark_slice = (tot.insns + pending) / slice;
+        mark_insns = tot.insns + pending;
+    }
+}
+
+static void lean_tb_trans(struct qemu_plugin_tb *tb)
+{
+    size_t n = qemu_plugin_tb_n_insns(tb);
+
+    qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu(tb, QEMU_PLUGIN_INLINE_ADD_U64, lean_count, n);
+    qemu_plugin_register_vcpu_tb_exec_cond_cb(tb, lean_quantum, QEMU_PLUGIN_CB_NO_REGS, QEMU_PLUGIN_COND_GE,
+                                              lean_count, lean_quantum_insns, NULL);
+    for (size_t i = 0; mark_addr && i < n; i++) {
+        struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
+        if (qemu_plugin_insn_vaddr(insn) == (uint32_t)mark_addr) {
+            qemu_plugin_register_vcpu_insn_exec_cb(insn, lean_mark, QEMU_PLUGIN_CB_NO_REGS, NULL);
+        }
+    }
+}
+
 static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 {
     size_t n = qemu_plugin_tb_n_insns(tb);
+
+    if (lean) {
+        lean_tb_trans(tb);
+        return;
+    }
 
     for (size_t i = 0; i < n; i++) {
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
@@ -806,10 +884,8 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         if (render_addr && in->vaddr == (uint32_t)render_addr) {
             qemu_plugin_register_vcpu_insn_exec_cb(insn, vcpu_render_entry, QEMU_PLUGIN_CB_R_REGS, in);
         }
-        g_mutex_lock(&lock);
-        in->st = insn_stats_for(in->vaddr);
-        g_mutex_unlock(&lock);
-        if (sz == 4) {
+            in->st = insn_stats_for(in->vaddr);
+            if (sz == 4) {
             uint32_t arm = b[0] | b[1] << 8 | b[2] << 16 | (uint32_t)b[3] << 24;
             uint32_t thumb = (uint32_t)(b[0] | b[1] << 8) << 16 | (b[2] | b[3] << 8);
             if (decode_c7(arm, &in->maint, &in->rt) || decode_c7(thumb, &in->maint, &in->rt)) {
@@ -872,6 +948,11 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     gpointer k, v;
 
     print_slice();
+    if (itrace) {
+        fwrite(itrace_buf, 4, itrace_n, itrace);
+        fclose(itrace);
+        itrace = NULL;
+    }
     for (int i = 0; i < NSCOPE; i++) {
         if (scope_addr[i]) {
             g_autofree char *l = g_strdup_printf("SCOPE %d calls=%" PRIu64 " ins=%" PRIu64 " cyc=%.0f\n", i,
@@ -927,12 +1008,18 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
         else if (!strcmp(t[0], "render")) render_addr = v & ~1ull;
         else if (!strcmp(t[0], "pfstreams")) pf_streams = MIN(v, 16);
         else if (!strcmp(t[0], "timectl")) timectl = v;
+        else if (!strcmp(t[0], "lean")) lean = v;
         else if (!strcmp(t[0], "warm")) warm_insns = v;
+        else if (!strcmp(t[0], "itrace")) itrace = fopen(t[1], "wb");
+        else if (!strcmp(t[0], "itskip")) itrace_skip = v;
+        else if (!strcmp(t[0], "itlen")) itrace_len = v;
         else if (t[0][0] == 's' && t[0][1] >= '0' && t[0][1] <= '5' && !t[0][2]) scope_addr[t[0][1] - '0'] = v & ~1u;
         else if (!strcmp(t[0], "cachesim")) cachesim = v;
         else if (!strcmp(t[0], "cpi")) cpi0 = g_ascii_strtod(t[1], NULL);
         else if (!strcmp(t[0], "pi")) pen_i = g_ascii_strtod(t[1], NULL);
         else if (!strcmp(t[0], "pd")) pen_d = g_ascii_strtod(t[1], NULL);
+        else if (!strcmp(t[0], "pdev")) pen_dev = g_ascii_strtod(t[1], NULL);
+        else if (!strcmp(t[0], "pnc")) pen_nc = g_ascii_strtod(t[1], NULL);
         else if (!strcmp(t[0], "hz")) hz = g_ascii_strtod(t[1], NULL);
         else if (!strcmp(t[0], "quantum")) quantum = v;
         else if (!strcmp(t[0], "l1repl")) l1repl = v;
@@ -964,6 +1051,19 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
             fprintf(stderr, "dzcache: time control unavailable (another plugin has it, or -icount is on)\n");
             return -1;
         }
+    }
+    if (info->system_emulation && info->system.max_vcpus > 1) {
+        fprintf(stderr, "dzcache: assumes a single vCPU (the Deluge has one core), and keeps no locks\n");
+        return -1;
+    }
+    if (lean) {
+        if (!timectl || cachesim) {
+            fprintf(stderr, "dzcache: lean=1 needs timectl=1 and cachesim=0\n");
+            return -1;
+        }
+        lean_sb = qemu_plugin_scoreboard_new(sizeof(uint64_t));
+        lean_count = qemu_plugin_scoreboard_u64(lean_sb);
+        lean_quantum_insns = MAX(1, (uint64_t)(quantum / cpi0));
     }
     next_slice = slice;
     insn_stats = g_hash_table_new(NULL, NULL);

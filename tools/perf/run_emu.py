@@ -4,7 +4,7 @@
 The probe firmware loads and plays its song by itself, so no input is needed. Host audio is never connected.
 Writes <out>/plugin.log (SLICE/MARK/R/SCOPE lines), <out>/probe.bin (the probe's window ring) and <out>/run.log.
 
-  tools/perf/run_emu.py --elf probe.elf --out runs/cpi145 --plugin timectl=1,cachesim=0,cpi=1.45
+  tools/perf/run_emu.py --elf probe.elf --out runs/cpi145 --plugin timectl=1,cachesim=0,cpi=1.45 --lean
   tools/perf/run_emu.py --elf probe.elf --out runs/ic1 --icount 1 --plugin cachesim=0
 """
 import argparse
@@ -30,15 +30,20 @@ def main():
     ap.add_argument("--slices", type=int, default=200, help="stop this many 100M-instruction slices after PLAY")
     ap.add_argument("--warm", type=int, default=5_000_000_000, help="SCOPE totals start this many instructions after PLAY")
     ap.add_argument("--timeout", type=float, default=3600)
+    ap.add_argument("--lean", action="store_true",
+                    help="fast flat-CPI timing (timectl=1,cachesim=0 in --plugin): no per-render/per-function accounting")
     args = ap.parse_args()
 
     a = dzprobe.probe_addresses(args.elf)
     os.makedirs(args.out, exist_ok=True)
     log = os.path.abspath(os.path.join(args.out, "plugin.log"))
     lib = os.path.join(REPO, "build", "plugins", "libdzcache." + ("dylib" if sys.platform == "darwin" else "so"))
-    opts = ["ttb=%#x" % a["ttb"], "l2c=0x3FFFF000", "mark=%#x" % a["mark"], "slice=100000000", "phasea=63",
-            "render=%#x" % a["render"], "timer=%#x" % a["timer"], "warm=%d" % args.warm]
-    opts += ["s%d=%#x" % (i, addr) for i, addr in enumerate(a["scopes"])]
+    opts = ["ttb=%#x" % a["ttb"], "l2c=0x3FFFF000", "mark=%#x" % a["mark"], "slice=100000000", "phasea=63"]
+    if args.lean:
+        opts.append("lean=1")
+    else:
+        opts += ["render=%#x" % a["render"], "timer=%#x" % a["timer"], "warm=%d" % args.warm]
+        opts += ["s%d=%#x" % (i, addr) for i, addr in enumerate(a["scopes"])]
     if args.plugin:
         opts.append(args.plugin)
     sock = "/tmp/dzperf_%d.sock" % os.getpid()

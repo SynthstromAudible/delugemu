@@ -17,6 +17,8 @@ for src in "${REPO_ROOT}"/plugins/*.c; do
     name="$(basename "${src}" .c)"
     # shellcheck disable=SC2086
     cc -O2 -shared -fPIC -Wall -Wno-unused-function -I "${QEMU_DIR}/include/plugins" ${GLIB_CFLAGS} \
-        "${LINK[@]}" -o "${OUT}/lib${name}.${EXT}" "${src}"
+        "${LINK[@]}" -o "${OUT}/lib${name}.${EXT}.tmp" "${src}"
+    # Rename into place: emulators still running keep the library they loaded, rather than crashing on a rewrite
+    mv -f "${OUT}/lib${name}.${EXT}.tmp" "${OUT}/lib${name}.${EXT}"
     log "Built ${OUT}/lib${name}.${EXT}"
 done

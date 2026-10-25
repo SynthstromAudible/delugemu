@@ -23,20 +23,24 @@ def emu_run(path, skip, ips, warm=5_000_000_000):
     after = text[mark.start():]
     slices = [dict((k, float(v)) for k, v in re.findall(r"(\w+)=([\d.]+)", l))
               for l in re.findall(r"^SLICE \d+ (.*)$", after, re.M)]
-    slices = [s for s in slices if s.get("insns") == 1e8]
+    # Full mode prints a slice every 1e8 instructions exactly; lean mode at the first clock update past it
+    slices = [s for s in slices if abs(s.get("insns", 0) - 1e8) < 1e6]
     timectl = slices and slices[-1].get("cycles", 0) > 0
     per_slice = (slices[-1]["cycles"] - slices[0]["cycles"]) / 400e6 / (len(slices) - 1) if timectl else 1e8 / ips
     slices = slices[int(skip / per_slice):]
     ins = sum(s["insns"] for s in slices)
-    rins = sum(s["render_ins"] for s in slices)
-    rfr = sum(s["render_frames"] for s in slices)
+    rins = sum(s.get("render_ins", 0) for s in slices)
+    rfr = sum(s.get("render_frames", 0) for s in slices)
     secs = per_slice * len(slices)
-    r = dict(name=os.path.basename(path.rstrip("/")), frames_s=rfr / secs, ins_frame=rins / max(1, rfr),
+    r = dict(name=os.path.basename(path.rstrip("/")), frames_s=rfr / secs, ins_frame=rins / rfr if rfr else float("nan"),
              l1i=1000 * sum(s["l1i_miss"] for s in slices) / ins,
              l1d=1000 * sum(s["l1d_rd_miss"] + s["l1d_wr_miss"] for s in slices) / ins)
     # Culls, voices and load from the probe ring: windows while playing, after the skip
     w = [x for x in dzprobe.load_windows(os.path.join(path, "probe.bin")) if x.get("audioVoices")]
     w = w[int(skip * 10):]
+    if not rfr:  # lean run: no per-render accounting, so frames from the probe and instructions per frame overall
+        r["frames_s"] = sum(x["frames"] for x in w) / (len(w) * 0.1)
+        r["ins_frame"] = float("nan")
     r["culls"] = 50 * sum(x["culls"] for x in w) / len(w)
     r["voices"] = sum(x["voices"] for x in w) / len(w)
     r["load"] = 100 * sum(x["sum_cyc"] for x in w) / (len(w) * 0.1 * 1e9)  # QEMU's PMU cycle counter runs at 1 GHz
