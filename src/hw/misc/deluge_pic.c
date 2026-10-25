@@ -766,6 +766,15 @@ unsigned deluge_pic_take_flashes(Chardev *chr, DelugePicFlashEvent *out)
     return n;
 }
 
+void deluge_pic_get_pad_image(Chardev *chr,
+                              uint8_t out[DELUGE_PIC_GRID_COLS]
+                                         [DELUGE_PIC_GRID_ROWS][3])
+{
+    DelugePicState *s = DELUGE_PIC(chr);
+
+    memcpy(out, s->pad_grid, sizeof(s->pad_grid));
+}
+
 void deluge_pic_get_timing(Chardev *chr, int32_t *flash_length_ms,
                            int32_t *refresh_time, int32_t *dimmer_interval)
 {

@@ -321,7 +321,14 @@ class DelugeSession:
         path = self._dev("skin", "deluge-skin", "/machine/soc/skin")
         return display.decode_leds(self.q.qom_get(path, "dz-leds"))
 
-    def read_pads(self):
+    def read_pads(self, flashes=True):
+        """The 18x8 pad colours as shown. ``flashes=False`` gives the firmware's
+        pad image without the PIC's pad flashes on top (``read_pad_flashes``
+        reports those), so a sample's phase against a 6 ms flash does not
+        change what it reads."""
+        if not flashes:
+            path = self._dev("skin", "deluge-skin", "/machine/soc/skin")
+            return display.decode_pads(self.q.qom_get(path, "dz-pad-image"))
         path = self._dev("padgrid", "deluge-padgrid", "/machine/soc/padgrid")
         return display.decode_pads(self.q.qom_get(path, "dz-pad-leds"))
 

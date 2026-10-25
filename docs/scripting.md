@@ -91,7 +91,7 @@ Readout (deterministic, via `qom-get`)
 - `read_oled()` → 48×128 list of bools; `oled_text()` → `#`/`.` rows; `oled_on()` → bool.
 - `read_segment()` → best-effort 4-char 7-segment text.
 - `read_leds()` → `{control_name: bool}` for every indicator LED.
-- `read_pads()` → 18×8 grid of `(r, g, b)`; `read_gold_knob()` → `[2][4]` brightness.
+- `read_pads()` → 18×8 grid of `(r, g, b)`; `read_pads(flashes=False)` → the same without the PIC's pad flashes on top; `read_gold_knob()` → `[2][4]` brightness.
 - `read_pad_flashes()` → the PIC pad flashes since the last call, `[(x, y, colour), ...]` oldest first (colour = flash-colour index, 0 the default); reading clears them. A flash shows in `read_pads()` only for the flash length (6 ms), so poll this to see every one.
 - `read_pic_settings()` → `{"flash_length", "refresh_time", "dimmer_interval"}`, the PIC timing the firmware last set (-1 until set); the dimmer interval is the pad-brightness setting.
 - `screenshot(path)` → PNG (falls back to PPM if the build lacks PNG screendump).
@@ -202,6 +202,7 @@ standard `qom-get` QMP command (no QAPI schema change):
 | `/machine/soc/skin` | `dz-leds` | 36 indicator LEDs (`'0'`/`'1'`, index `col + 9*row`) |
 | `/machine/soc/skin` | `dz-seven-seg` | 4 raw segment bitmasks (hex) |
 | `/machine/soc/skin` | `dz-gold-knob` | base64 of the 8 gold-knob brightnesses |
+| `/machine/soc/skin` | `dz-pad-image` | as `dz-pad-leds`, without the pad flashes on top |
 | `/machine/soc/skin` | `dz-pad-flashes` | pad flashes since the last read, `x,y,colour;...` (read-and-clear, last 64 kept) |
 | `/machine/soc/skin` | `dz-flash-length`, `dz-refresh-time`, `dz-dimmer-interval` | last PIC timing values set (int, -1 until set) |
 

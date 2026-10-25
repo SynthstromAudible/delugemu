@@ -220,6 +220,14 @@ void deluge_pic_get_seven_seg(Chardev *chr, uint8_t out[DELUGE_PIC_SEG_DIGITS]);
  */
 unsigned deluge_pic_take_flashes(Chardev *chr, DelugePicFlashEvent *out);
 
+/*
+ * The firmware's pad image, [column][row] RGB, without the flashes the PIC
+ * shows on top of it.
+ */
+void deluge_pic_get_pad_image(Chardev *chr,
+                              uint8_t out[DELUGE_PIC_GRID_COLS]
+                                         [DELUGE_PIC_GRID_ROWS][3]);
+
 /* Last flash length, refresh time and dimmer interval set; -1 if never. */
 void deluge_pic_get_timing(Chardev *chr, int32_t *flash_length_ms,
                            int32_t *refresh_time, int32_t *dimmer_interval);

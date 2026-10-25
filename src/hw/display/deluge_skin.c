@@ -1394,6 +1394,8 @@ static const Property deluge_skin_props[] = {
  *               "x,y,colour" joined by ';' (colour = the PIC flash-colour
  *               index, 0 for the default; empty if none). Reading clears the
  *               log, which keeps the last DELUGE_PIC_FLASH_LOG_MAX flashes.
+ * dz-pad-image: the pads as dz-pad-leds reports them (base64, column-major
+ *               RGB), but without the flashes on top: the firmware's own image.
  * dz-flash-length, dz-refresh-time, dz-dimmer-interval: the last flash length
  *               (ms), pad refresh time and pad dimmer interval the firmware
  *               sent the PIC; -1 until it sends one (or with no PIC).
@@ -1463,6 +1465,18 @@ static char *deluge_skin_get_pad_flashes(Object *obj, Error **errp)
     return g_string_free(out, false);
 }
 
+static char *deluge_skin_get_pad_image(Object *obj, Error **errp)
+{
+    DelugeSkinState *s = DELUGE_SKIN(obj);
+    uint8_t img[DELUGE_PIC_GRID_COLS][DELUGE_PIC_GRID_ROWS][3];
+
+    if (!s->pic) {
+        return g_strdup("");
+    }
+    deluge_pic_get_pad_image(s->pic, img);
+    return g_base64_encode((const guchar *)img, sizeof(img));
+}
+
 /* opaque selects the field: 0 flash length, 1 refresh time, 2 dimmer. */
 static void deluge_skin_get_pic_timing(Object *obj, Visitor *v,
                                        const char *name, void *opaque,
@@ -1498,6 +1512,8 @@ static void deluge_skin_class_init(ObjectClass *klass, const void *data)
                                   deluge_skin_get_gold_knob, NULL);
     object_class_property_add_str(klass, "dz-pad-flashes",
                                   deluge_skin_get_pad_flashes, NULL);
+    object_class_property_add_str(klass, "dz-pad-image",
+                                  deluge_skin_get_pad_image, NULL);
     object_class_property_add(klass, "dz-flash-length", "int32",
                               deluge_skin_get_pic_timing, NULL, NULL,
                               (void *)(uintptr_t)0);
