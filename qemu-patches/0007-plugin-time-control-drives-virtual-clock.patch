@@ -1,0 +1,75 @@
+diff --git a/include/system/cpu-timers.h b/include/system/cpu-timers.h
+index a1abed0d7a..7445bc030b 100644
+--- a/include/system/cpu-timers.h
++++ b/include/system/cpu-timers.h
+@@ -41,6 +41,12 @@ void qemu_timer_notify_cb(void *opaque, QEMUClockType type);
+ /* get/set VIRTUAL clock and VM elapsed ticks via the cpus accel interface */
+ int64_t cpus_get_virtual_clock(void);
+ void cpus_set_virtual_clock(int64_t new_time);
++/*
++ * delugemu: a TCG plugin has taken control of time (qemu_plugin_request_time_control). Without -icount, TCG keeps
++ * QEMU_CLOCK_VIRTUAL on the host clock and ignores qemu_plugin_update_ns(); from here on the virtual clock is
++ * whatever the plugin last set, frozen in between. Assumes the guest doesn't sit halted waiting for a timer.
++ */
++void cpus_enable_plugin_virtual_clock(void);
+ int64_t cpus_get_elapsed_ticks(void);
+ 
+ #endif /* SYSTEM_CPU_TIMERS_H */
+diff --git a/plugins/api-system.c b/plugins/api-system.c
+index fbf905cd63..5e4e81b910 100644
+--- a/plugins/api-system.c
++++ b/plugins/api-system.c
+@@ -17,6 +17,7 @@
+ #include "hw/core/boards.h"
+ #include "qemu/plugin-memory.h"
+ #include "qemu/plugin.h"
++#include "system/cpu-timers.h"
+ 
+ /*
+  * In system mode we cannot trace the binary being executed so the
+@@ -109,6 +110,7 @@ const void *qemu_plugin_request_time_control(void)
+         error_setg(&migration_blocker,
+                    "TCG plugin time control does not support migration");
+         migrate_add_blocker(&migration_blocker, &error_fatal);
++        cpus_enable_plugin_virtual_clock();
+         return &has_control;
+     }
+     return NULL;
+diff --git a/system/cpus.c b/system/cpus.c
+index bded87feb1..9a84226efc 100644
+--- a/system/cpus.c
++++ b/system/cpus.c
+@@ -210,8 +210,22 @@ void cpu_exec_reset_hold(CPUState *cpu)
+     }
+ }
+ 
++static bool plugin_virtual_clock_enabled;
++static int64_t plugin_virtual_clock;
++
++void cpus_enable_plugin_virtual_clock(void)
++{
++    if (!plugin_virtual_clock_enabled && !(cpus_accel && cpus_accel->set_virtual_clock)) {
++        plugin_virtual_clock = cpus_get_virtual_clock();
++        plugin_virtual_clock_enabled = true;
++    }
++}
++
+ int64_t cpus_get_virtual_clock(void)
+ {
++    if (plugin_virtual_clock_enabled) {
++        return plugin_virtual_clock;
++    }
+     /*
+      * XXX
+      *
+@@ -236,6 +250,10 @@ int64_t cpus_get_virtual_clock(void)
+  */
+ void cpus_set_virtual_clock(int64_t new_time)
+ {
++    if (plugin_virtual_clock_enabled) {
++        plugin_virtual_clock = MAX(plugin_virtual_clock, new_time);
++        return;
++    }
+     if (cpus_accel && cpus_accel->set_virtual_clock) {
+         cpus_accel->set_virtual_clock(new_time);
+     }
