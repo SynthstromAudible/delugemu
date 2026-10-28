@@ -198,6 +198,24 @@ DELUGE_FIRMWARE=path [DELUGE_SD=path] ./tests/pad-flash.sh
 
 It **skips cleanly** (exit 0) when no firmware image is present.
 
+## `arp_freeze/`
+
+Integration tests for the arp freeze of the community firmware (`FREEZE` on the
+arpeggiator's `PATTERN` menu, which replaces a clip's notes with what its
+arpeggiator plays). Each test loads a song from `arp_freeze/fixture` in a fresh
+emulator, freezes it through the menu, saves it and checks the saved notes and
+clip layout: sync rates (8ths, triplets, dotted, unsynced), reversed and
+ping-pong clips, rows with their own length or direction, and undo.
+
+The feature isn't in a firmware release yet, so the tests skip unless
+`ARP_FREEZE_FIRMWARE` points at a build that has it (a separate variable from
+`DELUGE_FIRMWARE`, which CI sets to a release). The card is a folder, so they
+need mtools and dosfstools, like `scripts/mksd.sh`.
+
+```sh
+ARP_FREEZE_FIRMWARE=path/to/deluge.bin python3 tests/arp_freeze/test_arp_freeze.py -v
+```
+
 ## Adding tests
 
 Keep tests runnable standalone and CI-friendly: exit non-zero on failure, avoid
