@@ -15,6 +15,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "migration/vmstate.h"
 #include "hw/core/qdev-properties.h"
 #include "ui/console.h"
@@ -244,6 +245,15 @@ static bool deluge_oled_get_inverted(Object *obj, Error **errp)
     return DELUGE_OLED(obj)->inverted;
 }
 
+/* The first GDDRAM page the panel shows: the page window's start, as drawn. */
+static void deluge_oled_get_page_start(Object *obj, Visitor *v, const char *name,
+                                       void *opaque, Error **errp)
+{
+    uint8_t page = DELUGE_OLED(obj)->page_start;
+
+    visit_type_uint8(v, name, &page, errp);
+}
+
 static void deluge_oled_reset(DeviceState *dev)
 {
     DelugeOledState *s = DELUGE_OLED(dev);
@@ -336,6 +346,8 @@ static void deluge_oled_class_init(ObjectClass *klass, const void *data)
                                    deluge_oled_get_display_on, NULL);
     object_class_property_add_bool(klass, "dz-inverted",
                                    deluge_oled_get_inverted, NULL);
+    object_class_property_add(klass, "dz-page-start", "uint8",
+                              deluge_oled_get_page_start, NULL, NULL, NULL);
 }
 
 static const TypeInfo deluge_oled_info = {

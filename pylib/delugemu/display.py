@@ -30,16 +30,20 @@ for _ch, _segs in _GLYPHS.items():
     _MASK_TO_CHAR.setdefault(_m, _ch)
 
 
-def decode_oled(b64, width=OLED_WIDTH, height=OLED_HEIGHT):
+def decode_oled(b64, width=OLED_WIDTH, height=OLED_HEIGHT, page_start=0):
     """Decode a ``dz-framebuffer`` snapshot to a height x width list of bools.
 
     The raw GDDRAM is page-major (byte [page][col]); bit b of that byte is the
-    pixel at row page*8 + b."""
+    pixel at row (page - page_start)*8 + b. The panel shows ``height`` rows
+    from ``page_start`` (``dz-page-start``), as the display model draws them."""
     data = base64.b64decode(b64)
     cols = len(data) // 8  # 8 pages
     rows = []
     for y in range(height):
-        page = y >> 3
+        page = page_start + (y >> 3)
+        if page >= 8:
+            rows.append([False] * width)
+            continue
         bit = y & 7
         base = page * cols
         row = [bool((data[base + x] >> bit) & 1) for x in range(width)]

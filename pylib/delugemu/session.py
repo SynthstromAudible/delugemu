@@ -303,7 +303,11 @@ class DelugeSession:
     # -- readout -----------------------------------------------------------
     def read_oled(self):
         path = self._dev("oled", "deluge-oled", "/machine/soc/oled")
-        return display.decode_oled(self.q.qom_get(path, "dz-framebuffer"))
+        # The rows the panel shows start at the controller's page window, as the display model draws them.
+        return display.decode_oled(
+            self.q.qom_get(path, "dz-framebuffer"),
+            page_start=int(self.q.qom_get(path, "dz-page-start")),
+        )
 
     def oled_text(self):
         return display.oled_text(self.read_oled())
