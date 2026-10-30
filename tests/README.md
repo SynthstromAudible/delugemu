@@ -69,6 +69,24 @@ Firmware is not shipped with the repo, so the test looks for
 the SDHI path. Observed healthy counts: 19 IRQs without an SD image, 183 with
 one, and 0 aborts in both cases.
 
+## `determinism.sh`
+
+The scripted-run determinism test. Scripted runs (pylib's `run_until`, the
+`dz-stop-at-ns` property) pause the VM at exact virtual times under
+`-icount sleep=off` and inject input there, so two runs of one script must see
+the same guest however busy the host is. The test keeps every host CPU busy,
+runs two emulators at once, steps both in 10 ms of virtual time, presses Play
+halfway, and asserts that both runs pause at the same virtual times and show
+the same panel (OLED, pads, LEDs, gold knobs) at every step.
+
+```sh
+DELUGE_FIRMWARE=path ./tests/determinism.sh
+DELUGE_FIRMWARE=path DELUGE_SD_IMG=img ./tests/determinism.sh
+DET_SECONDS=12 ./tests/determinism.sh   # a longer run
+```
+
+Like `boot.sh`, it **skips cleanly** (exit 0) when no firmware image is present.
+
 ## `audio-bench.sh`
 
 The audio-throughput benchmark (roadmap M6). It drives the firmware through a
