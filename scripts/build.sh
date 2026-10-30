@@ -12,13 +12,10 @@
 
 require_submodule
 
-# Ensure our models are linked in before configuring. integrate.sh may have
-# linked (symlink) or copied the sources in, so test for existence rather than
-# specifically a symlink (Windows/MSYS2 may use a copy).
-if [ ! -e "${QEMU_DIR}/hw/deluge" ]; then
-    warn "delugemu sources not linked into QEMU; running integrate.sh first."
-    "${REPO_ROOT}/scripts/integrate.sh"
-fi
+# Link our models in and apply qemu-patches/ before every build. integrate.sh is
+# idempotent, and a tree integrated before a patch was added still needs that
+# patch: without it the build silently lacks it.
+"${REPO_ROOT}/scripts/integrate.sh"
 
 RECONFIGURE=0
 # Initialised empty; under `set -u` on bash 3.2 (macOS) an empty array must be
