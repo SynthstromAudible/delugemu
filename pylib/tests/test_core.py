@@ -5,6 +5,7 @@ Run with:  PYTHONPATH=pylib python3 -m unittest discover -s pylib/tests
 """
 import base64
 import os
+import re
 import subprocess
 import sys
 import unittest
@@ -129,6 +130,27 @@ class TestDisplay(unittest.TestCase):
         grid = display.decode_pads(base64.b64encode(bytes(data)).decode())
         self.assertEqual(grid[2][1], (255, 0, 0))
         self.assertEqual(grid[0][0], (0, 0, 0))
+
+
+class TestEncoderWiring(unittest.TestCase):
+    # The firmware's kEncoderIrqMap (hid/encoders.cpp; the deluge-sdk's encoder WIRING agrees): A pin, B pin,
+    # IRQn, invert. The emulator drives the pins so that this decode reads the turn it was asked for.
+    FIRMWARE = {
+        "SCROLL_Y": (8, 10, 0, False),
+        "SCROLL_X": (11, 12, 3, False),
+        "TEMPO": (6, 7, 2, True),
+        "SELECT": (3, 2, 7, True),
+        "MOD_1": (5, 4, 1, False),
+        "MOD_0": (0, 15, 4, False),
+    }
+
+    def test_gpio_encoder_map_matches_the_firmware(self):
+        src = open(os.path.join(REPO, "src", "hw", "gpio", "rza1l_gpio.c")).read()
+        rows = re.findall(
+            r"\[DELUGE_ENC_(\w+)\]\s*=\s*\{\s*\.irq_pin = (\d+),\s*\.comp_pin = (\d+),"
+            r"\s*\.irq_num = (\d+),\s*\.invert = (true|false)", src)
+        got = {name: (int(a), int(b), int(n), inv == "true") for name, a, b, n, inv in rows}
+        self.assertEqual(got, self.FIRMWARE)
 
 
 class TestControlMapSync(unittest.TestCase):
