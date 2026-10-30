@@ -854,10 +854,16 @@ static void deluge_input_set_event(Object *obj, const char *value, Error **errp)
  *   dz-stop-at-ns (write) pause the VM (as the "stop" command does) when the
  *                         virtual clock reaches this time; resume with "cont"
  */
+/*
+ * The stop timer fires on the main loop with the BQL held. The vCPU needs the
+ * BQL to start its next slice, so pausing it here, synchronously, stops it on
+ * the virtual time asked for. A vmstop request would leave the pause to a
+ * later main-loop pass, and the vCPU would run on to the next timer meanwhile,
+ * by however long the host took to get there.
+ */
 static void deluge_input_stop_cb(void *opaque)
 {
-    qemu_system_vmstop_request_prepare();
-    qemu_system_vmstop_request(RUN_STATE_PAUSED);
+    vm_stop(RUN_STATE_PAUSED);
 }
 
 static void deluge_input_get_vclock(Object *obj, Visitor *v, const char *name,

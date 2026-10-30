@@ -16,8 +16,8 @@
 #   ./tests/run-all.sh --require-firmware      # CI: firmware must be present
 #   DELUGE_FIRMWARE=path DELUGE_SD_IMG=img ./tests/run-all.sh
 #
-# Tests: smoke, unit (pylib unit tests), geometry-sync, boot, scenario,
-# pad-click, usb-midi, usb-midi-bridge, usb-peripheral, midi-coremidi,
+# Tests: smoke, unit (pylib unit tests), geometry-sync, boot, determinism,
+# scenario, pad-click, usb-midi, usb-midi-bridge, usb-peripheral, midi-coremidi,
 # audio-bench. Logs go to build/test-logs/<test>.log. Exits non-zero if any
 # test failed.
 set -uo pipefail
@@ -25,13 +25,13 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-ALL_TESTS=(smoke unit geometry-sync boot scenario pad-click usb-midi
+ALL_TESTS=(smoke unit geometry-sync boot determinism scenario pad-click usb-midi
            usb-midi-bridge usb-peripheral midi-coremidi audio-bench)
 
 # Tests whose only reason to skip is missing firmware (or the SD image built
 # alongside it). usb-peripheral is not listed: it also skips when the firmware
 # predates peripheral USB support, which no published release has yet.
-NEEDS_FIRMWARE=" boot scenario pad-click usb-midi usb-midi-bridge audio-bench "
+NEEDS_FIRMWARE=" boot determinism scenario pad-click usb-midi usb-midi-bridge audio-bench "
 
 REQUIRE_FIRMWARE=0
 TESTS=()
