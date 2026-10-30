@@ -359,6 +359,48 @@ static void rza1l_dmac_dreq_set(void *opaque, int ch, int level)
     }
 }
 
+/*
+ * Walk an audio ring's descriptor loop from `head` (8 little-endian words
+ * each: [0] header [1] src [2] dst [3] byte count ... [7] next link) and
+ * report the buffer it covers, taking each descriptor's address from word
+ * `addr_off` bytes in (4 for the source, 8 for the destination). The ring is
+ * one descriptor that links to itself, or several, one per block, linked in a
+ * loop; the blocks must be contiguous and in order, so the channel's address
+ * moves through the buffer at the sample rate and wraps to its start. Returns
+ * false for anything else. A loop whose byte counts sum to zero is still a
+ * ring: the caller latches it as an inactive one.
+ */
+static bool rza1l_dmac_audio_ring(uint32_t head, int addr_off,
+                                  uint32_t *base, uint32_t *size)
+{
+    uint32_t link = head;
+    uint32_t next_addr = 0;
+    uint32_t total = 0;
+
+    for (int i = 0; i < 64; i++) {
+        uint8_t d[32];
+        uint32_t addr, bytes;
+
+        dma_memory_read(&address_space_memory, link, d, sizeof(d),
+                        MEMTXATTRS_UNSPECIFIED);
+        addr = ldl_le_p(d + addr_off);
+        bytes = ldl_le_p(d + 12);
+        if (i == 0) {
+            *base = addr;
+        } else if (addr != next_addr) {
+            return false;
+        }
+        next_addr = addr + bytes;
+        total += bytes;
+        link = ldl_le_p(d + 28);
+        if (link == head) {
+            *size = total;
+            return true;
+        }
+    }
+    return false;
+}
+
 static void rza1l_dmac_chctrl_write(RzA1lDmacState *s, int ch, uint32_t val)
 {
     RzA1lDmacChannel *c = &s->ch[ch];
@@ -443,37 +485,33 @@ static void rza1l_dmac_chctrl_write(RzA1lDmacState *s, int ch, uint32_t val)
             }
         } else if (c->tx_audio_ring && c->nxla != 0) {
             /*
-             * The SSI transmit channel uses a self-linking descriptor whose
-             * source is the audio TX buffer. Latch the source base and size
-             * and start the playback clock; CRSA is then synthesised from
-             * elapsed virtual time on each read (see rza1l_dmac_read).
+             * The SSI transmit channel loops over its descriptors, whose
+             * sources tile the audio TX buffer. Latch the buffer's base and
+             * size and start the playback clock; CRSA is then synthesised
+             * from elapsed virtual time on each read (see rza1l_dmac_read).
              */
-            uint8_t d[32];
+            uint32_t base, size;
 
-            dma_memory_read(&address_space_memory, c->nxla, d, sizeof(d),
-                            MEMTXATTRS_UNSPECIFIED);
-            if (ldl_le_p(d + 28) == c->nxla) {
-                c->tx_audio_base = ldl_le_p(d + 4);
-                c->tx_audio_size = ldl_le_p(d + 12);
-                c->tx_audio_active = (c->tx_audio_size != 0);
+            if (rza1l_dmac_audio_ring(c->nxla, 4, &base, &size)) {
+                c->tx_audio_base = base;
+                c->tx_audio_size = size;
+                c->tx_audio_active = (size != 0);
                 c->tx_audio_start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
                 c->crsa = c->tx_audio_base;
             }
         } else if (c->rx_audio_ring && c->nxla != 0) {
             /*
-             * The SSI receive channel uses a self-linking descriptor whose
-             * destination is the audio RX buffer. Latch the destination base
+             * The SSI receive channel loops over its descriptors, whose
+             * destinations tile the audio RX buffer. Latch the buffer's base
              * and size and start the capture clock; CRDA is then synthesised
              * from elapsed virtual time on each read (see rza1l_dmac_read).
              */
-            uint8_t d[32];
+            uint32_t base, size;
 
-            dma_memory_read(&address_space_memory, c->nxla, d, sizeof(d),
-                            MEMTXATTRS_UNSPECIFIED);
-            if (ldl_le_p(d + 28) == c->nxla) {
-                c->rx_audio_base = ldl_le_p(d + 8);
-                c->rx_audio_size = ldl_le_p(d + 12);
-                c->rx_audio_active = (c->rx_audio_size != 0);
+            if (rza1l_dmac_audio_ring(c->nxla, 8, &base, &size)) {
+                c->rx_audio_base = base;
+                c->rx_audio_size = size;
+                c->rx_audio_active = (size != 0);
                 c->rx_audio_start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
                 c->crda = c->rx_audio_base;
             }
