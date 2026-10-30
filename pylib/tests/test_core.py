@@ -89,6 +89,18 @@ class TestDisplay(unittest.TestCase):
         self.assertTrue(rows[7][127])
         self.assertFalse(rows[1][1])
 
+    def test_oled_rows_start_at_the_page_window(self):
+        # The firmware addresses pages 2-7 and the panel shows them, so row 0 is page 2's bit 0 and the
+        # last row is page 7's bit 7.
+        data = bytearray(1024)
+        data[2 * 128 + 3] = 1
+        data[7 * 128 + 4] = 0x80
+        rows = display.decode_oled(base64.b64encode(bytes(data)).decode(), page_start=2)
+        self.assertEqual(len(rows), 48)
+        self.assertTrue(rows[0][3])
+        self.assertTrue(rows[47][4])
+        self.assertEqual(sum(map(sum, rows)), 2)
+
     def test_segment_digits(self):
         m0 = (1 << 6) | (1 << 5) | (1 << 4) | (1 << 3) | (1 << 2) | (1 << 1)
         m1 = (1 << 5) | (1 << 4)
