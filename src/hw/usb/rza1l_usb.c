@@ -357,9 +357,15 @@ static void rza1l_usb_event(void *opaque)
     rza1l_usb_update_irq(s);
 }
 
+/*
+ * Posted on the virtual clock, due now: under -icount the vCPU cannot run past
+ * a due timer, so the event lands on the same guest instruction every run. A
+ * bottom half would land wherever the guest had got to when the host's main
+ * loop reached it.
+ */
 static void rza1l_usb_schedule_event(RzA1lUsbState *s)
 {
-    qemu_bh_schedule(s->event_bh);
+    timer_mod(s->event_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 }
 
 /* ---- Peripheral-mode USB-audio: WAV sink -------------------------------- */
@@ -1793,7 +1799,7 @@ static void rza1l_usb_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq);
 
-    s->event_bh = qemu_bh_new(rza1l_usb_event, s);
+    s->event_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rza1l_usb_event, s);
     s->sof_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rza1l_usb_sof_tick, s);
 
     /*

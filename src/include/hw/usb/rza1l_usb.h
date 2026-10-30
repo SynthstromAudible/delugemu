@@ -139,9 +139,9 @@ struct RzA1lUsbState {
     bool     ctrl_active;              /* a control transfer is awaiting its status stage */
 
     /* Deferred interrupt delivery (decouples from the triggering MMIO write). */
-    QEMUBH  *event_bh;
-    uint16_t pending_ints0;  /* INTSTS0 bits to assert from the bottom half */
-    uint16_t pending_ints1;  /* INTSTS1 bits to assert from the bottom half */
+    QEMUTimer *event_timer;
+    uint16_t pending_ints0;  /* INTSTS0 bits to assert from the event timer */
+    uint16_t pending_ints1;  /* INTSTS1 bits to assert from the event timer */
     uint16_t pending_brdy;   /* BRDYSTS pipe bits to set */
     uint16_t pending_bemp;   /* BEMPSTS pipe bits to set */
     bool     pending_attach; /* drive the initial device attach */
