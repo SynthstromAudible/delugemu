@@ -367,7 +367,8 @@ static void rza1l_dmac_dreq_set(void *opaque, int ch, int level)
  * one descriptor that links to itself, or several, one per block, linked in a
  * loop; the blocks must be contiguous and in order, so the channel's address
  * moves through the buffer at the sample rate and wraps to its start. Returns
- * false for anything else.
+ * false for anything else. A loop whose byte counts sum to zero is still a
+ * ring: the caller latches it as an inactive one.
  */
 static bool rza1l_dmac_audio_ring(uint32_t head, int addr_off,
                                   uint32_t *base, uint32_t *size)
@@ -394,7 +395,7 @@ static bool rza1l_dmac_audio_ring(uint32_t head, int addr_off,
         link = ldl_le_p(d + 28);
         if (link == head) {
             *size = total;
-            return total != 0;
+            return true;
         }
     }
     return false;
@@ -494,7 +495,7 @@ static void rza1l_dmac_chctrl_write(RzA1lDmacState *s, int ch, uint32_t val)
             if (rza1l_dmac_audio_ring(c->nxla, 4, &base, &size)) {
                 c->tx_audio_base = base;
                 c->tx_audio_size = size;
-                c->tx_audio_active = true;
+                c->tx_audio_active = (size != 0);
                 c->tx_audio_start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
                 c->crsa = c->tx_audio_base;
             }
@@ -510,7 +511,7 @@ static void rza1l_dmac_chctrl_write(RzA1lDmacState *s, int ch, uint32_t val)
             if (rza1l_dmac_audio_ring(c->nxla, 8, &base, &size)) {
                 c->rx_audio_base = base;
                 c->rx_audio_size = size;
-                c->rx_audio_active = true;
+                c->rx_audio_active = (size != 0);
                 c->rx_audio_start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
                 c->crda = c->rx_audio_base;
             }
