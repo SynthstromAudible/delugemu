@@ -31,6 +31,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
+#include "qapi/visitor.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
@@ -320,6 +321,57 @@ bool rza1l_gpio_get_output_pin(DeviceState *dev, unsigned port, unsigned pin)
     return (s->regs[off] >> (pin % 8)) & 1;
 }
 
+/* TRIGGER CLOCK IN is wired to external IRQ6 (firmware main.c). */
+#define RZA1L_TRIG_CLOCK_IRQ 6
+
+static void rza1l_gpio_trig_cb(void *opaque)
+{
+    RzA1lGpioState *s = opaque;
+
+    if (!s->trig_period_ns) {
+        return;
+    }
+    /* A rising edge: latch IRQRR bit 6 and raise the line; the ISR acks it. */
+    s->irqrr |= (uint16_t)(1u << RZA1L_TRIG_CLOCK_IRQ);
+    qemu_set_irq(s->irq[RZA1L_TRIG_CLOCK_IRQ], 1);
+    s->trig_edges++;
+    s->trig_next_ns += s->trig_period_ns;
+    timer_mod(s->trig_timer, s->trig_next_ns);
+}
+
+static void rza1l_gpio_get_trig_period(Object *obj, Visitor *v, const char *name,
+                                       void *opaque, Error **errp)
+{
+    visit_type_uint64(v, name, &RZA1L_GPIO(obj)->trig_period_ns, errp);
+}
+
+static void rza1l_gpio_set_trig_period(Object *obj, Visitor *v, const char *name,
+                                       void *opaque, Error **errp)
+{
+    RzA1lGpioState *s = RZA1L_GPIO(obj);
+    uint64_t ns;
+
+    if (!visit_type_uint64(v, name, &ns, errp)) {
+        return;
+    }
+    s->trig_period_ns = ns;
+    if (!s->trig_timer) {
+        return;
+    }
+    if (ns) {
+        s->trig_next_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ns;
+        timer_mod(s->trig_timer, s->trig_next_ns);
+    } else {
+        timer_del(s->trig_timer);
+    }
+}
+
+static void rza1l_gpio_get_trig_edges(Object *obj, Visitor *v, const char *name,
+                                      void *opaque, Error **errp)
+{
+    visit_type_uint64(v, name, &RZA1L_GPIO(obj)->trig_edges, errp);
+}
+
 static const MemoryRegionOps rza1l_gpio_ops = {
     .read = rza1l_gpio_read,
     .write = rza1l_gpio_write,
@@ -445,6 +497,7 @@ static void rza1l_gpio_realize(DeviceState *dev, Error **errp)
     }
 
     s->edge_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rza1l_gpio_edge_cb, s);
+    s->trig_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rza1l_gpio_trig_cb, s);
 }
 
 static void rza1l_gpio_unrealize(DeviceState *dev)
@@ -455,6 +508,11 @@ static void rza1l_gpio_unrealize(DeviceState *dev)
         timer_del(s->edge_timer);
         timer_free(s->edge_timer);
         s->edge_timer = NULL;
+    }
+    if (s->trig_timer) {
+        timer_del(s->trig_timer);
+        timer_free(s->trig_timer);
+        s->trig_timer = NULL;
     }
 }
 
@@ -488,6 +546,11 @@ static void rza1l_gpio_class_init(ObjectClass *klass, const void *data)
     dc->vmsd = &vmstate_rza1l_gpio;
     device_class_set_legacy_reset(dc, rza1l_gpio_reset);
     device_class_set_props(dc, deluge_gpio_props);
+    object_class_property_add(klass, "trigger-clock-period-ns", "uint64",
+                              rza1l_gpio_get_trig_period,
+                              rza1l_gpio_set_trig_period, NULL, NULL);
+    object_class_property_add(klass, "trigger-clock-edges", "uint64",
+                              rza1l_gpio_get_trig_edges, NULL, NULL, NULL);
 }
 
 static const TypeInfo rza1l_gpio_info = {

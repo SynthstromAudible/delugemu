@@ -112,6 +112,15 @@ struct RzA1lGpioState {
     int edge_tail;
     uint32_t edge_spacing_ns;
     QEMUTimer *edge_timer;
+
+    /*
+     * TRIGGER CLOCK IN (P1_14 -> external IRQ6). A host-driven pulse train on
+     * the virtual clock: one rising edge every trig_period_ns (0 = off).
+     */
+    uint64_t trig_period_ns;
+    uint64_t trig_edges;
+    int64_t trig_next_ns;
+    QEMUTimer *trig_timer;
 };
 
 /*
