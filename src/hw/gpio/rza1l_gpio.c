@@ -465,6 +465,20 @@ static void rza1l_gpio_reset(DeviceState *dev)
     if (s->edge_timer) {
         timer_del(s->edge_timer);
     }
+    /*
+     * trigger-clock-period-ns is the host's cable on the jack, so it outlives
+     * a reset like any property; the pulse train restarts from now.
+     */
+    s->trig_edges = 0;
+    s->trig_next_ns = 0;
+    if (s->trig_timer) {
+        timer_del(s->trig_timer);
+        if (s->trig_period_ns) {
+            s->trig_next_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                              s->trig_period_ns;
+            timer_mod(s->trig_timer, s->trig_next_ns);
+        }
+    }
     for (int i = 0; i < RZA1L_GPIO_NUM_IRQ; i++) {
         if (s->irq[i]) {
             qemu_set_irq(s->irq[i], 0);
@@ -523,8 +537,8 @@ static const Property deluge_gpio_props[] = {
 
 static const VMStateDescription vmstate_rza1l_gpio = {
     .name = TYPE_RZA1L_GPIO,
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8_ARRAY(regs, RzA1lGpioState, RZA1L_GPIO_MMIO_SIZE),
         VMSTATE_UINT16_ARRAY(in_drive, RzA1lGpioState, RZA1L_GPIO_NUM_PORTS),
@@ -533,6 +547,10 @@ static const VMStateDescription vmstate_rza1l_gpio = {
         VMSTATE_UINT16(icr0, RzA1lGpioState),
         VMSTATE_UINT16(icr1, RzA1lGpioState),
         VMSTATE_UINT16(irqrr, RzA1lGpioState),
+        VMSTATE_UINT64(trig_period_ns, RzA1lGpioState),
+        VMSTATE_UINT64(trig_edges, RzA1lGpioState),
+        VMSTATE_INT64(trig_next_ns, RzA1lGpioState),
+        VMSTATE_TIMER_PTR(trig_timer, RzA1lGpioState),
         VMSTATE_END_OF_LIST()
     },
 };
