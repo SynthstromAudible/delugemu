@@ -43,7 +43,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RzA1lUsbState, RZA1L_USB)
 #define RZA1L_USB_NUM_REGS  (RZA1L_USB_MMIO_SIZE / 2)
 
 /* Maximum synthetic control-transfer response we ever return (config + class). */
-#define RZA1L_USB_RESP_MAX  128
+#define RZA1L_USB_RESP_MAX  4096
 
 /* Bulk MIDI receive queue: complete 4-byte USB-MIDI event packets awaiting
  * delivery to the firmware. Sized to hold a healthy burst of MIDI traffic. */
@@ -61,6 +61,9 @@ struct RzA1lUsbState {
 
     /* Properties. */
     bool midi;          /* present an attached USB-MIDI device on the host port */
+    uint32_t midi_desc_pad; /* bytes of AudioControl terminal descriptors to insert
+                             * ahead of the MIDIStreaming interface (rounded up to
+                             * whole 12-byte descriptors) */
     CharFrontend chr;   /* host serial-MIDI chardev bridged to the bulk pipes */
 
     /* Resolved MIDI data-bridge configuration. The bridge logic is the same in
@@ -132,6 +135,8 @@ struct RzA1lUsbState {
 
     /* Control-transfer (DCP / pipe 0) data stage. */
     uint8_t  resp[RZA1L_USB_RESP_MAX]; /* IN data to return to the host */
+    uint8_t  midi_cfg[RZA1L_USB_RESP_MAX]; /* config descriptor, built at realize */
+    uint32_t midi_cfg_len;
     uint32_t resp_len;                 /* total bytes staged */
     uint32_t resp_pos;                 /* read cursor within resp[] */
     bool     ctrl_in;                  /* current control transfer is device->host */
