@@ -24,13 +24,22 @@ Base `0xE8007000` (SCIF0, MIDI) and `0xE8007800` (SCIF1, PIC) · size `0x100`.
 | 0x04 | SCBRR | shadow | bit rate |
 | 0x08 | SCSCR | shadow | control; RIE gates RXI |
 | 0x0C | SCFTDR | special | TX byte → chardev (`qemu_chr_fe_write_all`) |
-| 0x10 | SCFSR | modelled | TDFE\|TEND always set; RDF/DR on RX |
+| 0x10 | SCFSR | modelled | TDFE\|TEND always set (strict: from the TX FIFO); RDF/DR on RX |
 | 0x14 | SCFRDR | special | RX holding byte; clears rx_full |
 | 0x18 | SCFCR | shadow | FIFO control |
 | 0x1C | SCFDR | stub | data count, returns 0 or 1 |
 | 0x20–0x28 | SCSPTR/SCLSR/SCEMR | stub | |
 
 TX is synchronous to the chardev; RX is interrupt-driven (RXI when `SCSCR.RIE`).
+
+**Strict mode** (`DELUGEMU_SCIF_STRICT=1` in the environment; SCIF0/DIN MIDI only)
+replaces the always-ready transmitter with the hardware's, per the RZ/A1L manual
+(ch. 14): a 16-byte FIFO that drains one character per 320 us (31250 baud),
+`TDFE` set while it holds no more than the `SCFCR.TTRG` trigger (8/4/2/0),
+`TEND` once empty, the TX count in `SCFDR[12:8]`, and the TXI DMA request
+asserted while `TDFE`, `SCSCR.TE` and `SCSCR.TIE` all hold. A byte written to
+`SCFTDR` while the FIFO is full is ignored, as on hardware, and logged as
+`rza1l-scif strict: transmit FIFO full, byte 0x.. ignored (N dropped so far)`.
 
 SCIF0 (MIDI) additionally has its receive path bound to DMAC channel 13
 (`MIDI_RX_DMA_CHANNEL`): bytes arriving from the host `-serial`/`--midi` chardev
@@ -68,6 +77,15 @@ writes it): `SETEN` only arms it
 request (`sdhi-dreq` GPIO input) high and completes when `CRTB` reaches zero.
 Channel 14's MIDI timing ring is latched only while its `DMARS` selects a SCIF
 receive request (`0x62 + 4n`), as the stock firmware's does.
+
+In SCIF strict mode, a channel whose `DMARS` selects SCIF0 transmit (`0x61`) is
+paced by SCIF0's TXI instead of completing on `SETEN`, and follows the manual's
+register mode (ch. 9.6.2) exactly: `SETEN` loads the Next set `CHCFG.RSEL`
+selects; each transaction end sets `END`, raises DMAINT unless `DEM` (which then
+self-clears), and with `REN` inverts `RSEL` (if `RSW`), self-clears `REN` and runs
+the other set. `TM=0` moves one unit per request; `TM=1` (block) runs the whole
+transaction once requested, regardless of the FIFO. Writing the active set's
+registers or `CHCFG`, or `SETEN` while enabled, is logged as `rza1l-dmac strict:`.
 
 `DMARS0–7` (`0xFCFE1000`, `0x20`): a second MMIO window of this device; each word
 holds two channels' 16-bit request selectors (even channel low).

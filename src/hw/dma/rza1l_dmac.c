@@ -401,6 +401,134 @@ static bool rza1l_dmac_audio_ring(uint32_t head, int addr_off,
     return false;
 }
 
+/*
+ * Strict SCIF transmit (DELUGEMU_SCIF_STRICT): the DIN MIDI TX channel is
+ * paced by SCIF0's TXI request, as on hardware (manual table 9.4: TM=0 single
+ * transfer, LVL=1 level detection), and runs register mode exactly per section
+ * 9.6.2: SETEN loads the Next set chosen by RSEL; at each transaction end DEM
+ * suppresses the end interrupt and self-clears, and REN continues with the
+ * other set (after RSW inverts RSEL) and self-clears. Anything the hardware
+ * would do differently from the lenient model therefore shows up, and the SCIF
+ * side (rza1l_scif.c) drops and logs bytes written to a full FIFO.
+ */
+
+/* DMARS selector for SCIF0 transmit (TXI), the DIN MIDI port. */
+#define RZA1L_DMARS_SCIF0_TX 0x61
+#define CHCFG_RSEL 0x10000000 /* register set to load next: 0 Next0, 1 Next1 */
+#define CHCFG_TM   0x00400000 /* block transfer mode */
+
+static bool rza1l_dmac_strict_tx(RzA1lDmacState *s, RzA1lDmacChannel *c)
+{
+    return s->scif_strict && c->dmars == RZA1L_DMARS_SCIF0_TX;
+}
+
+/* Load the Next register set RSEL selects into the current registers. */
+static void rza1l_dmac_load_next_set(RzA1lDmacChannel *c)
+{
+    if (c->chcfg & CHCFG_RSEL) {
+        c->crsa = c->n1sa;
+        c->crda = c->n1da;
+        c->crtb = c->n1tb;
+    } else {
+        c->crsa = c->n0sa;
+        c->crda = c->n0da;
+        c->crtb = c->n0tb;
+    }
+}
+
+static void rza1l_dmac_strict_service(RzA1lDmacState *s, int ch);
+
+/*
+ * End of a strict channel's transaction (section 9.6.2 (1), steps 4-6): END is
+ * set; the end interrupt is issued unless DEM, which then clears; with REN the
+ * channel carries on with the other register set (if RSW) and REN clears,
+ * otherwise EN clears and the transfer is over.
+ */
+static void rza1l_dmac_strict_transaction_end(RzA1lDmacState *s, int ch)
+{
+    RzA1lDmacChannel *c = &s->ch[ch];
+
+    c->chstat |= CHSTAT_END | CHSTAT_TC;
+    if (c->chcfg & CHCFG_DEM) {
+        c->chcfg &= ~CHCFG_DEM;
+    } else {
+        qemu_irq_pulse(s->irq[ch]);
+    }
+    if (c->chcfg & CHCFG_REN) {
+        if (c->chcfg & CHCFG_RSW) {
+            c->chcfg ^= CHCFG_RSEL;
+        }
+        c->chcfg &= ~CHCFG_REN;
+        rza1l_dmac_load_next_set(c);
+        if (c->crtb == 0) {
+            qemu_log("rza1l-dmac strict: ch%d continued into an empty register "
+                     "set (N%dTB = 0)\n", ch, (c->chcfg & CHCFG_RSEL) ? 1 : 0);
+            rza1l_dmac_strict_transaction_end(s, ch);
+        }
+        return;
+    }
+    c->chstat &= ~(CHSTAT_EN | CHSTAT_TACT);
+}
+
+/*
+ * Move one transfer unit per TXI request (single transfer mode). The SCIF
+ * lowers TXI from inside the destination write once its FIFO is above the
+ * trigger level, which ends this loop until the FIFO drains and TXI rises.
+ */
+static void rza1l_dmac_strict_service(RzA1lDmacState *s, int ch)
+{
+    RzA1lDmacChannel *c = &s->ch[ch];
+    unsigned unit = rza1l_dmac_unit(c);
+    uint8_t buf[RZA1L_DMAC_MAX_UNIT];
+
+    if (c->dreq_servicing) {
+        return;
+    }
+    c->dreq_servicing = true;
+    /*
+     * Single transfer mode (TM=0) moves one unit per request; block transfer
+     * mode (TM=1) runs the whole transaction once a request arrives, whatever
+     * the SCIF's FIFO does meanwhile (manual 9.7.1).
+     */
+    bool block = (c->chcfg & CHCFG_TM) && s->scif0_txi;
+    while ((c->chstat & CHSTAT_EN) && (s->scif0_txi || block)) {
+        unsigned n = MIN(unit, c->crtb);
+
+        if (n) {
+            dma_memory_read(&address_space_memory, c->crsa, buf, n,
+                            MEMTXATTRS_UNSPECIFIED);
+            dma_memory_write(&address_space_memory, c->crda, buf, n,
+                             MEMTXATTRS_UNSPECIFIED);
+            if (!(c->chcfg & CHCFG_SAD)) {
+                c->crsa += n;
+            }
+            if (!(c->chcfg & CHCFG_DAD)) {
+                c->crda += n;
+            }
+            c->crtb -= n;
+        }
+        if (c->crtb == 0) {
+            rza1l_dmac_strict_transaction_end(s, ch);
+        }
+    }
+    c->dreq_servicing = false;
+}
+
+void rza1l_dmac_scif_txi_set(RzA1lDmacState *s, bool level)
+{
+    s->scif0_txi = level;
+    if (!level) {
+        return;
+    }
+    for (int ch = 0; ch < RZA1L_DMAC_NUM_CH; ch++) {
+        RzA1lDmacChannel *c = &s->ch[ch];
+
+        if (rza1l_dmac_strict_tx(s, c) && (c->chstat & CHSTAT_EN)) {
+            rza1l_dmac_strict_service(s, ch);
+        }
+    }
+}
+
 static void rza1l_dmac_chctrl_write(RzA1lDmacState *s, int ch, uint32_t val)
 {
     RzA1lDmacChannel *c = &s->ch[ch];
@@ -431,6 +559,15 @@ static void rza1l_dmac_chctrl_write(RzA1lDmacState *s, int ch, uint32_t val)
         c->chstat &= ~(CHSTAT_TACT | CHSTAT_ER | CHSTAT_END | CHSTAT_TC);
         c->chstat |= CHSTAT_EN;
         rza1l_dmac_dreq_service(s, ch);
+    } else if ((val & CHCTRL_SETEN) && rza1l_dmac_strict_tx(s, c)) {
+        if (c->chstat & CHSTAT_EN) {
+            qemu_log("rza1l-dmac strict: ch%d SETEN while already enabled "
+                     "(CRTB %u left)\n", ch, c->crtb);
+        }
+        rza1l_dmac_load_next_set(c);
+        c->chstat &= ~(CHSTAT_ER | CHSTAT_END | CHSTAT_TC);
+        c->chstat |= CHSTAT_EN | CHSTAT_TACT;
+        rza1l_dmac_strict_service(s, ch);
     } else if (val & CHCTRL_SETEN) {
         /*
          * Run the transfer to completion immediately. The channel never
@@ -845,6 +982,14 @@ static void rza1l_dmac_write(void *opaque, hwaddr offset, uint64_t value,
             return; /* status / current registers are read-only */
         }
 
+        if (rza1l_dmac_strict_tx(s, c) && (c->chstat & CHSTAT_EN) &&
+            (chreg == DMAC_CHCFG ||
+             (chreg <= DMAC_N0TB && !(c->chcfg & CHCFG_RSEL)) ||
+             (chreg >= DMAC_N1SA && chreg <= DMAC_N1TB && (c->chcfg & CHCFG_RSEL)))) {
+            qemu_log("rza1l-dmac strict: ch%d register 0x%02x written while "
+                     "the channel is active (CRTB %u left)\n",
+                     ch, (unsigned)chreg, c->crtb);
+        }
         uint32_t *p = rza1l_dmac_ch_reg_ptr(c, chreg);
         if (p) {
             *p = (*p & ~mask) | (val32 & mask);
@@ -1002,6 +1147,8 @@ static void rza1l_dmac_realize(DeviceState *dev, Error **errp)
     qdev_init_gpio_in_named(dev, rza1l_dmac_dreq_set, RZA1L_DMAC_DREQ,
                             RZA1L_DMAC_NUM_CH);
     qdev_init_gpio_in_named(dev, rza1l_dmac_sdhi_dreq_set, RZA1L_DMAC_SDHI_DREQ, 1);
+
+    s->scif_strict = rza1l_scif_strict_enabled();
 }
 
 static const VMStateDescription vmstate_rza1l_dmac_channel = {

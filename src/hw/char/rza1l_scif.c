@@ -4,6 +4,9 @@
  * Models one SCIF channel as a UART. Transmit is synchronous: a byte written
  * to the transmit FIFO data register (SCFTDR) is pushed straight to the
  * character backend and the FIFO is reported permanently ready (TDFE|TEND).
+ * With DELUGEMU_SCIF_STRICT set, the DIN MIDI channel instead models the
+ * hardware's 16-byte transmit FIFO, its TXI DMA request and lost writes to a
+ * full FIFO (see rza1l_scif_tx_update).
  * Receive is interrupt-driven: an incoming byte is latched, the receive-data
  * flags (RDF|DR) are set, and the RXI interrupt is asserted when receive
  * interrupts are enabled (SCSCR.RIE). Reading SCFRDR returns the byte and
@@ -27,6 +30,7 @@
 #include "migration/vmstate.h"
 #include "hw/char/rza1l_scif.h"
 #include "hw/dma/rza1l_dmac.h"
+#include "qemu/timer.h"
 
 /* Channel register offsets. */
 #define SCIF_SCSMR  0x00 /* serial mode            (16) */
@@ -60,6 +64,75 @@ static void rza1l_scif_update_irq(RzA1lScifState *s)
     qemu_set_irq(s->irq, rx);
 }
 
+/* Transmit FIFO capacity, and TDFE trigger levels by SCFCR.TTRG (manual 14.3). */
+#define SCIF_TX_FIFO_SIZE 16
+#define SCFCR_TFRST 0x0004
+static const uint8_t scif_ttrg_levels[4] = { 8, 4, 2, 0 };
+
+static unsigned rza1l_scif_tx_trigger(RzA1lScifState *s)
+{
+    return scif_ttrg_levels[(s->scfcr >> 4) & 3];
+}
+
+/* Let the transmitter shift out whatever it has finished by `now`. */
+static void rza1l_scif_tx_drain(RzA1lScifState *s, int64_t now)
+{
+    while (s->tx_count && s->tx_done_ns <= now) {
+        s->tx_count--;
+        if (s->tx_count) {
+            s->tx_done_ns += s->tx_char_ns;
+        }
+    }
+}
+
+/*
+ * Recompute TDFE and drive the TXI DMA request: asserted while the FIFO holds
+ * no more than the trigger level, with transmit and its interrupt enabled.
+ * While it's above the trigger, wake when it drains down to it.
+ */
+static void rza1l_scif_tx_update(RzA1lScifState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    unsigned trigger;
+
+    if (!s->tx_strict) {
+        return;
+    }
+    rza1l_scif_tx_drain(s, now);
+    trigger = rza1l_scif_tx_trigger(s);
+    if (s->tx_count > trigger) {
+        timer_mod(s->tx_timer,
+                  s->tx_done_ns + (int64_t)(s->tx_count - trigger - 1) * s->tx_char_ns);
+    }
+    rza1l_dmac_scif_txi_set(s->dmac, s->tx_count <= trigger &&
+                                     (s->scscr & SCSCR_TE) && (s->scscr & SCSCR_TIE));
+}
+
+static void rza1l_scif_tx_timer(void *opaque)
+{
+    rza1l_scif_tx_update(opaque);
+}
+
+/* A byte written to SCFTDR in strict mode: queued, or lost if the FIFO's full. */
+static void rza1l_scif_tx_write(RzA1lScifState *s, uint8_t b)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    rza1l_scif_tx_drain(s, now);
+    if (s->tx_count >= SCIF_TX_FIFO_SIZE) {
+        s->tx_dropped++;
+        qemu_log("rza1l-scif strict: transmit FIFO full, byte 0x%02x ignored "
+                 "(%u dropped so far)\n", b, s->tx_dropped);
+    } else {
+        if (s->tx_count == 0) {
+            s->tx_done_ns = now + s->tx_char_ns;
+        }
+        s->tx_count++;
+        qemu_chr_fe_write_all(&s->chr, &b, 1);
+    }
+    rza1l_scif_tx_update(s);
+}
+
 static uint64_t rza1l_scif_read(void *opaque, hwaddr offset, unsigned size)
 {
     RzA1lScifState *s = opaque;
@@ -71,10 +144,20 @@ static uint64_t rza1l_scif_read(void *opaque, hwaddr offset, unsigned size)
         return s->scbrr;
     case SCIF_SCSCR:
         return s->scscr;
-    case SCIF_SCFSR:
-        /* Transmit is always ready; receive flags reflect the holding byte. */
-        return s->scfsr | SCFSR_TDFE | SCFSR_TEND |
-               (s->rx_full ? (SCFSR_RDF | SCFSR_DR) : 0);
+    case SCIF_SCFSR: {
+        /*
+         * Lenient: transmit is always ready. Strict: TDFE while the FIFO is at
+         * or below its trigger level, TEND once it's empty.
+         */
+        uint16_t tx = SCFSR_TDFE | SCFSR_TEND;
+
+        if (s->tx_strict) {
+            rza1l_scif_tx_drain(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+            tx = (s->tx_count <= rza1l_scif_tx_trigger(s) ? SCFSR_TDFE : 0) |
+                 (s->tx_count == 0 ? SCFSR_TEND : 0);
+        }
+        return s->scfsr | tx | (s->rx_full ? (SCFSR_RDF | SCFSR_DR) : 0);
+    }
     case SCIF_SCFRDR: {
         uint8_t b = s->rx_fifo;
         s->rx_full = false;
@@ -86,8 +169,11 @@ static uint64_t rza1l_scif_read(void *opaque, hwaddr offset, unsigned size)
     case SCIF_SCFCR:
         return s->scfcr;
     case SCIF_SCFDR:
-        /* Receive-data count in [4:0]; transmit FIFO always empty. */
-        return s->rx_full ? 1 : 0;
+        /* Receive-data count in [4:0]; transmit count in [12:8] (strict only). */
+        if (s->tx_strict) {
+            rza1l_scif_tx_drain(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        }
+        return (s->tx_strict ? s->tx_count << 8 : 0) | (s->rx_full ? 1 : 0);
     case SCIF_SCSPTR:
     case SCIF_SCLSR:
     case SCIF_SCEMR:
@@ -114,11 +200,17 @@ static void rza1l_scif_write(void *opaque, hwaddr offset, uint64_t value,
     case SCIF_SCSCR:
         s->scscr = value;
         rza1l_scif_update_irq(s);
+        rza1l_scif_tx_update(s);
         break;
     case SCIF_SCFTDR: {
         uint8_t b = value;
-        /* Transmit immediately to the backend. */
-        qemu_chr_fe_write_all(&s->chr, &b, 1);
+
+        if (s->tx_strict) {
+            rza1l_scif_tx_write(s, b);
+        } else {
+            /* Transmit immediately to the backend. */
+            qemu_chr_fe_write_all(&s->chr, &b, 1);
+        }
         break;
     }
     case SCIF_SCFSR:
@@ -130,6 +222,10 @@ static void rza1l_scif_write(void *opaque, hwaddr offset, uint64_t value,
         break;
     case SCIF_SCFCR:
         s->scfcr = value;
+        if (value & SCFCR_TFRST) {
+            s->tx_count = 0;
+        }
+        rza1l_scif_tx_update(s);
         break;
     case SCIF_SCFDR:
     case SCIF_SCSPTR:
@@ -204,6 +300,7 @@ static void rza1l_scif_reset(DeviceState *dev)
     s->scfcr = 0;
     s->rx_fifo = 0;
     s->rx_full = false;
+    s->tx_count = 0;
     rza1l_scif_update_irq(s);
 }
 
@@ -219,6 +316,14 @@ static void rza1l_scif_realize(DeviceState *dev, Error **errp)
 
     qemu_chr_fe_set_handlers(&s->chr, rza1l_scif_can_receive,
                              rza1l_scif_receive, NULL, NULL, s, NULL, true);
+
+    /*
+     * Strict transmit is for the DIN MIDI channel, the one bound to a DMAC:
+     * 31250 baud with 10 bits per character is 320 us a byte.
+     */
+    s->tx_strict = s->dmac && rza1l_scif_strict_enabled();
+    s->tx_char_ns = 320000;
+    s->tx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rza1l_scif_tx_timer, s);
 }
 
 static const Property rza1l_scif_properties[] = {
