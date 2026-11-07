@@ -116,7 +116,7 @@ static void deluge_load_firmware(DelugeMachineState *m, MachineState *machine)
         code_execute = ldl_le_p(data + DELUGE_HDR_CODE_EXECUTE);
 
         if (code_start < RZA1L_SRAM_BASE ||
-            code_start + len > RZA1L_SRAM_BASE + RZA1L_SRAM_SIZE ||
+            code_start + len > RZA1L_SRAM_BASE + m->soc.sram_size ||
             code_execute < code_start ||
             code_execute >= code_start + len) {
             error_report("firmware boot header addresses out of range "

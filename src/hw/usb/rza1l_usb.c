@@ -260,7 +260,7 @@ static const uint8_t usb_midi_device_desc[18] = {
  */
 static const uint8_t usb_midi_config_desc[] = {
     /* Configuration descriptor (9) */
-    0x09, 0x02, 0x65, 0x00, 0x02, 0x01, 0x00, 0x80, 0x32,
+    0x09, 0x02, 0x56, 0x00, 0x02, 0x01, 0x00, 0x80, 0x32,
     /* Interface 0: Audio Control (9) */
     0x09, 0x04, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00,
     /* AC interface header (9) */
@@ -282,6 +282,51 @@ static const uint8_t usb_midi_config_desc[] = {
     /* MS bulk IN class endpoint (5) */
     0x05, 0x25, 0x01, 0x01, 0x03,
 };
+
+/* Length of the config + Audio Control interface + AC header prefix of
+ * usb_midi_config_desc; padding is inserted straight after it. */
+#define USB_MIDI_CFG_AC_PREFIX 27
+#define USB_MIDI_PAD_DESC_LEN  12
+
+/*
+ * Build the configuration descriptor, inserting midi_desc_pad bytes of AC
+ * input terminal descriptors before the MIDIStreaming interface. Big
+ * descriptors like this come from keyboards that also expose audio, and push
+ * the MIDI endpoints a long way into the descriptor.
+ */
+static void rza1l_usb_build_midi_config(RzA1lUsbState *s)
+{
+    uint32_t n_pad = (s->midi_desc_pad + USB_MIDI_PAD_DESC_LEN - 1) / USB_MIDI_PAD_DESC_LEN;
+    uint32_t max_pad = (RZA1L_USB_RESP_MAX - sizeof(usb_midi_config_desc)) / USB_MIDI_PAD_DESC_LEN;
+    uint32_t pos = USB_MIDI_CFG_AC_PREFIX;
+    uint32_t i, ac_len;
+
+    n_pad = MIN(n_pad, MIN(max_pad, 200u)); /* terminal IDs must fit in a byte */
+    memcpy(s->midi_cfg, usb_midi_config_desc, USB_MIDI_CFG_AC_PREFIX);
+    for (i = 0; i < n_pad; i++) {
+        uint8_t *d = &s->midi_cfg[pos];
+        memset(d, 0, USB_MIDI_PAD_DESC_LEN);
+        d[0] = USB_MIDI_PAD_DESC_LEN;
+        d[1] = 0x24;                  /* CS_INTERFACE */
+        d[2] = 0x02;                  /* INPUT_TERMINAL */
+        d[3] = (uint8_t)(i + 10);     /* bTerminalID */
+        d[4] = 0x01; d[5] = 0x02;     /* wTerminalType = microphone */
+        d[7] = 0x02;                  /* bNrChannels */
+        d[8] = 0x03;                  /* wChannelConfig = L/R */
+        pos += USB_MIDI_PAD_DESC_LEN;
+    }
+    memcpy(&s->midi_cfg[pos], &usb_midi_config_desc[USB_MIDI_CFG_AC_PREFIX],
+           sizeof(usb_midi_config_desc) - USB_MIDI_CFG_AC_PREFIX);
+    pos += sizeof(usb_midi_config_desc) - USB_MIDI_CFG_AC_PREFIX;
+    s->midi_cfg_len = pos;
+
+    s->midi_cfg[2] = pos & 0xff;          /* config wTotalLength */
+    s->midi_cfg[3] = (pos >> 8) & 0xff;
+    ac_len = 9 + n_pad * USB_MIDI_PAD_DESC_LEN;
+    s->midi_cfg[23] = ac_len & 0xff;      /* AC header wTotalLength */
+    s->midi_cfg[24] = (ac_len >> 8) & 0xff;
+    USB_DBG("midi config descriptor: %u bytes (%u padding descriptors)", pos, n_pad);
+}
 
 /* String descriptor 0: supported language IDs (English, US). */
 static const uint8_t usb_midi_string_langid[4] = {
@@ -1207,8 +1252,8 @@ static void rza1l_usb_setup(RzA1lUsbState *s)
             src = usb_midi_device_desc;
             srclen = sizeof(usb_midi_device_desc);
         } else if (type == USB_DT_CONFIGURATION) {
-            src = usb_midi_config_desc;
-            srclen = sizeof(usb_midi_config_desc);
+            src = s->midi_cfg;
+            srclen = s->midi_cfg_len;
         } else if (type == USB_DT_STRING) {
             if ((val & 0xff) == 0) {
                 src = usb_midi_string_langid;
@@ -1844,6 +1889,7 @@ static void rza1l_usb_realize(DeviceState *dev, Error **errp)
         s->midi_tx_pipe = USB_BULK_SEND_PIPE;
         s->midi_rx_lo = USB_BULK_RECV_MIN;
         s->midi_rx_hi = USB_BULK_RECV_MAX;
+        rza1l_usb_build_midi_config(s);
     } else if (rza1l_usb_is_peripheral(s)) {
         s->mbridge = true;
         s->midi_tx_pipe = USB_PMIDI_PIPE_TX;
@@ -1878,6 +1924,7 @@ static const VMStateDescription vmstate_rza1l_usb = {
 
 static const Property rza1l_usb_properties[] = {
     DEFINE_PROP_BOOL("midi", RzA1lUsbState, midi, false),
+    DEFINE_PROP_UINT32("midi-desc-pad", RzA1lUsbState, midi_desc_pad, 0),
     DEFINE_PROP_CHR("chardev", RzA1lUsbState, chr),
     /* Peripheral (USB-MIDI device) is the default role, so any firmware comes up
      * as a USB-MIDI peripheral out of the box; host mode (midi=on) overrides it. */

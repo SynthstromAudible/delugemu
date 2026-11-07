@@ -161,6 +161,14 @@ struct RzA1lDmacState {
     void *sdhi_pull_opaque;
 
     /*
+     * Strict SCIF transmit (DELUGEMU_SCIF_STRICT): the SCIF0 (DIN MIDI) TX
+     * channel moves a byte only while SCIF0 asserts its TXI request, and runs
+     * register mode exactly as the manual describes (see rza1l_dmac.c).
+     */
+    bool scif_strict;
+    bool scif0_txi; /* SCIF0's TXI (transmit FIFO data empty) request level */
+
+    /*
      * Per-channel transfer-end interrupt lines (DMAINT0..DMAINT15). Pulsed
      * when a transfer completes with the channel's end-interrupt unmasked
      * (CHCFG.DEM clear). These are wired to the GIC by the SoC.
@@ -303,5 +311,18 @@ void rza1l_dmac_register_dreq_pull(RzA1lDmacState *s, int ch,
  */
 void rza1l_dmac_register_sdhi_pull(RzA1lDmacState *s, RzA1lDmacPullFn *fn,
                                    void *opaque);
+
+/*
+ * Strict SCIF modelling, opt-in via the DELUGEMU_SCIF_STRICT environment
+ * variable: SCIF0's transmit FIFO and the DMA feeding it behave as the RZ/A1
+ * hardware manual specifies, including losing bytes written to a full FIFO.
+ */
+static inline bool rza1l_scif_strict_enabled(void)
+{
+    return getenv("DELUGEMU_SCIF_STRICT") != NULL;
+}
+
+/* SCIF0 raises or lowers its TXI DMA request (strict mode only). */
+void rza1l_dmac_scif_txi_set(RzA1lDmacState *s, bool level);
 
 #endif /* HW_DMA_RZA1L_DMAC_H */

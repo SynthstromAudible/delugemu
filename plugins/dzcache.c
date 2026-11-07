@@ -231,6 +231,9 @@ typedef struct {
     InsnStats *st;
     int maint;        /* 0, or the c7 op: (CRm << 4) | opc2 */
     int rt;
+    int pld_rn;       /* PLD/PLDW (pld=1): base register, offset register or -1, and immediate offset */
+    int pld_rm;
+    int32_t pld_imm;
     int range;        /* index into fn[], or -1 */
 } Insn;
 
@@ -784,6 +787,81 @@ static void vcpu_mem(unsigned int cpu, qemu_plugin_meminfo_t info, uint64_t vadd
 }
 
 /* Decode an MCR p15, 0, Rt, c7, CRm, opc2 from an ARM word or a Thumb-2 pair. */
+/*
+ * PLD/PLDW with an immediate or (unshifted, or Thumb LSL #0-3) register offset, in ARM or Thumb-2. QEMU translates
+ * them as no-ops, so without this the model never sees a software prefetch. With pld=1 the line is fetched into L1D
+ * (and L2) at once, like the modelled hardware prefetcher: an upper bound, since a real PLD to SDRAM only helps if
+ * there's enough work between it and the load.
+ */
+static bool pld_enabled;
+
+static bool decode_pld_arm(uint32_t w, Insn *in)
+{
+    int32_t off;
+    if ((w & 0xFF30F000) == 0xF510F000) { /* PLD/PLDW immediate */
+        off = w & 0xFFF;
+        in->pld_rm = -1;
+    } else if ((w & 0xFF30F010) == 0xF710F000 && !(w & 0xFF0)) { /* PLD/PLDW register, no shift */
+        off = 0;
+        in->pld_rm = w & 0xF;
+    } else {
+        return false;
+    }
+    in->pld_rn = (w >> 16) & 0xF;
+    in->pld_imm = (w & (1u << 23)) ? off : -off;
+    return in->pld_rn != 15;
+}
+
+static bool decode_pld_thumb(uint32_t w, Insn *in)
+{
+    uint32_t hw1 = w >> 16, hw2 = w & 0xFFFF;
+    if ((hw1 & 0xFFD0) == 0xF890 && (hw2 & 0xF000) == 0xF000) { /* PLD/PLDW Rn, #imm12 */
+        in->pld_imm = hw2 & 0xFFF;
+        in->pld_rm = -1;
+    } else if ((hw1 & 0xFFD0) == 0xF810 && (hw2 & 0xFF00) == 0xFC00) { /* PLD/PLDW Rn, #-imm8 */
+        in->pld_imm = -(int32_t)(hw2 & 0xFF);
+        in->pld_rm = -1;
+    } else if ((hw1 & 0xFFD0) == 0xF810 && (hw2 & 0xFFC0) == 0xF000) { /* PLD/PLDW Rn, Rm (LSL #0-3) */
+        in->pld_imm = (hw2 >> 4) & 3; /* shift */
+        in->pld_rm = 16 | (hw2 & 0xF);
+    } else {
+        return false;
+    }
+    in->pld_rn = hw1 & 0xF;
+    return in->pld_rn != 15;
+}
+
+static uint32_t read_reg32(int r)
+{
+    uint32_t v = 0;
+    if (regs[r]) {
+        g_byte_array_set_size(regbuf, 0);
+        if (qemu_plugin_read_register(regs[r], regbuf) && regbuf->len >= 4) {
+            memcpy(&v, regbuf->data, 4);
+        }
+    }
+    return v;
+}
+
+static void l1d_prefetch(uint32_t addr);
+static uint64_t pld_count;
+
+static void vcpu_pld_exec(unsigned int cpu, void *udata)
+{
+    Insn *in = udata;
+    uint32_t addr = read_reg32(in->pld_rn);
+
+    if (in->pld_rm < 0) {
+        addr += in->pld_imm;
+    } else if (in->pld_rm & 16) {
+        addr += read_reg32(in->pld_rm & 15) << in->pld_imm;
+    } else {
+        addr += in->pld_imm < 0 ? -read_reg32(in->pld_rm) : read_reg32(in->pld_rm);
+    }
+    pld_count++;
+    l1d_prefetch(addr);
+}
+
 static bool decode_c7(uint32_t w, int *op, int *rt)
 {
     if ((w & 0x0F100010) != 0x0E000010 || ((w >> 8) & 0xF) != 15 || ((w >> 16) & 0xF) != 7 ||
@@ -890,6 +968,8 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             uint32_t thumb = (uint32_t)(b[0] | b[1] << 8) << 16 | (b[2] | b[3] << 8);
             if (decode_c7(arm, &in->maint, &in->rt) || decode_c7(thumb, &in->maint, &in->rt)) {
                 qemu_plugin_register_vcpu_insn_exec_cb(insn, vcpu_maint_exec, QEMU_PLUGIN_CB_R_REGS, in);
+            } else if (pld_enabled && cachesim && (decode_pld_arm(arm, in) || decode_pld_thumb(thumb, in))) {
+                qemu_plugin_register_vcpu_insn_exec_cb(insn, vcpu_pld_exec, QEMU_PLUGIN_CB_R_REGS, in);
             }
         }
         qemu_plugin_register_vcpu_insn_exec_cb(insn, vcpu_insn_exec, QEMU_PLUGIN_CB_NO_REGS, in);
@@ -948,6 +1028,11 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     gpointer k, v;
 
     print_slice();
+    if (pld_enabled) {
+        g_autofree char *m = g_strdup_printf("PLD executed=%" PRIu64 " prefetches_issued=%" PRIu64 "\n", pld_count,
+                                             pf_issued);
+        qemu_plugin_outs(m);
+    }
     if (itrace) {
         fwrite(itrace_buf, 4, itrace_n, itrace);
         fclose(itrace);
@@ -1026,6 +1111,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
         else if (!strcmp(t[0], "l2repl")) l2repl = v;
         else if (!strcmp(t[0], "pfdist")) pf_dist = v;
         else if (!strcmp(t[0], "l2pf")) l2pf = v;
+        else if (!strcmp(t[0], "pld")) pld_enabled = v;
         else if (!strcmp(t[0], "head")) head_addr = v;
         else if (!strcmp(t[0], "timer")) { head_addr = v; head_is_timer = true; }
         else if (t[0][0] == 'f' && t[0][1] == 'n' && t[1] && strchr(t[1], '-')) {

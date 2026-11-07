@@ -50,6 +50,20 @@ struct RzA1lScifState {
      */
     struct RzA1lDmacState *dmac;
     int rx_dma_channel;
+
+    /*
+     * Strict transmit (DELUGEMU_SCIF_STRICT, DIN MIDI channel only): a real
+     * 16-byte transmit FIFO that drains one character per tx_char_ns, raises
+     * TXI to the DMAC while it holds no more than the TTRG trigger level, and
+     * ignores (drops, and logs) bytes written while it's full - as the
+     * hardware manual specifies for SCFTDR.
+     */
+    bool     tx_strict;
+    uint8_t  tx_count;    /* bytes in the transmit FIFO and shift register */
+    int64_t  tx_done_ns;  /* virtual time the byte being sent finishes */
+    int64_t  tx_char_ns;
+    uint32_t tx_dropped;
+    QEMUTimer *tx_timer;
 };
 
 /* Route received bytes into a DMAC receive ring (MIDI input via DMA). */

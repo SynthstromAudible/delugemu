@@ -26,6 +26,8 @@
 #   ./tests/usb-midi-bridge.sh
 #   DELUGE_FIRMWARE=path ./tests/usb-midi-bridge.sh
 #   RUN_SECONDS=12 ./tests/usb-midi-bridge.sh
+#   MIDI_DESC_PAD=400 ./tests/usb-midi-bridge.sh   # grow the config descriptor
+#   USB_DEBUG_LOG=/tmp/usb.log ./tests/usb-midi-bridge.sh   # keep the USB trace
 
 set -euo pipefail
 
@@ -79,11 +81,15 @@ except FileNotFoundError:
 cmd = [binp, "-M", "deluge", "-kernel", fw, "-display", "none",
        "-audiodev", "none,id=deluge0", "-global", "rza1l-ssif.audiodev=deluge0",
        "-global", "rza1l-usb.midi=on",
+       "-global", "rza1l-usb.midi-desc-pad=" + os.environ.get("MIDI_DESC_PAD", "0"),
        "-serial", "null",
        "-chardev", f"socket,id=um,path={sock},server=on,wait=off",
        "-serial", "chardev:um"]
 
-p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+dbg_log = os.environ.get("USB_DEBUG_LOG")
+dbg = open(dbg_log, "wb") if dbg_log else subprocess.DEVNULL
+env = dict(os.environ, RZA1L_USB_DEBUG="1") if dbg_log else None
+p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=dbg, env=env)
 got = b""
 try:
     # Wait for QEMU to create the listening socket, then for the firmware to

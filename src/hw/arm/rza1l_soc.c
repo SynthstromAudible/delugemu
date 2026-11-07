@@ -91,9 +91,15 @@ static void rza1l_soc_realize(DeviceState *dev, Error **errp)
         return;
     }
 
-    /* On-chip SRAM (3 MB). */
+    /* On-chip SRAM (3 MB unless sram-size says otherwise). */
+    if (s->sram_size < RZA1L_SRAM_SIZE || s->sram_size > RZA1L_SRAM_SIZE_MAX ||
+        s->sram_size % (1024 * 1024)) {
+        error_setg(errp, "sram-size must be whole MB from %u to %u",
+                   RZA1L_SRAM_SIZE, RZA1L_SRAM_SIZE_MAX);
+        return;
+    }
     memory_region_init_ram(&s->sram, OBJECT(dev), "rza1l.sram",
-                           RZA1L_SRAM_SIZE, &err);
+                           s->sram_size, &err);
     if (err) {
         error_propagate(errp, err);
         return;
@@ -115,7 +121,7 @@ static void rza1l_soc_realize(DeviceState *dev, Error **errp)
      * RAM so either view sees the same bytes.
      */
     memory_region_init_alias(&s->sram_mirror, OBJECT(dev), "rza1l.sram.mirror",
-                             &s->sram, 0, RZA1L_SRAM_SIZE);
+                             &s->sram, 0, s->sram_size);
     memory_region_add_subregion(system_memory,
                                 RZA1L_SRAM_BASE + RZA1L_UNCACHED_MIRROR_OFFSET,
                                 &s->sram_mirror);
@@ -601,11 +607,16 @@ static void rza1l_soc_realize(DeviceState *dev, Error **errp)
                                         1);
 }
 
+static const Property rza1l_soc_properties[] = {
+    DEFINE_PROP_UINT32("sram-size", RzA1lSocState, sram_size, RZA1L_SRAM_SIZE),
+};
+
 static void rza1l_soc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = rza1l_soc_realize;
+    device_class_set_props(dc, rza1l_soc_properties);
     /* This is a container SoC device; it cannot be user-created on the cmdline. */
     dc->user_creatable = false;
 }
