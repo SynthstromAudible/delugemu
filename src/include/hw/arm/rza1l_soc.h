@@ -47,6 +47,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(RzA1lSocState, RZA1L_SOC)
 /* On-chip SRAM: 3 MB. (fw) RAM012L */
 #define RZA1L_SRAM_BASE   0x20000000
 #define RZA1L_SRAM_SIZE   (3 * 1024 * 1024)
+/*
+ * Largest sram-size: the firmware's MMU table maps 10 MB there (the RZ/A1H's
+ * on-chip RAM). Only for builds too big for a Deluge, e.g. PGO-instrumented.
+ */
+#define RZA1L_SRAM_SIZE_MAX (10 * 1024 * 1024)
 
 /* External SDRAM: 64 MB device, mapped on bus CS3. (fw) */
 #define RZA1L_SDRAM_BASE  0x0C000000
@@ -216,6 +221,7 @@ struct RzA1lSocState {
     /*< public >*/
     ARMCPU cpu;
 
+    uint32_t sram_size; /* "sram-size" property, RZA1L_SRAM_SIZE by default */
     MemoryRegion sram;
     MemoryRegion sdram;
     MemoryRegion sram_mirror;
