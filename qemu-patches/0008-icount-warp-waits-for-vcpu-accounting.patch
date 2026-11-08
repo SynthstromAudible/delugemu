@@ -1,0 +1,87 @@
+diff --git a/accel/tcg/icount-common.c b/accel/tcg/icount-common.c
+index b1b6c005fe..4e22ca3deb 100644
+--- a/accel/tcg/icount-common.c
++++ b/accel/tcg/icount-common.c
+@@ -37,6 +37,7 @@
+ #include "hw/core/cpu.h"
+ #include "exec/icount.h"
+ #include "system/cpu-timers-internal.h"
++#include "tcg-accel-ops-icount.h"
+ 
+ /*
+  * ICOUNT: Instruction Counter
+@@ -314,6 +315,25 @@ void icount_start_warp_timer(void)
+             return;
+         }
+ 
++        /*
++         * delugemu: a vCPU that halts mid-slice (WFI, WFE) looks idle before
++         * icount_process_data() has added the slice's instructions to the
++         * icount. A deadline computed now would be measured from that stale
++         * count and warp the clock past the next timer by the uncounted
++         * instructions, an amount set by host scheduling. Skip the warp: once
++         * the vCPU has accounted the slice, rr_cpu_thread_fn() sees every CPU
++         * idle and calls qemu_notify_event(), and this runs again from the
++         * accounted clock. Record and replay never get here mid-slice: the
++         * vCPU holds the replay mutex for the whole slice.
++         *
++         * The read barrier orders this load after all_cpu_threads_idle()'s
++         * read of cpu->halted; pairs with icount_prepare_for_run().
++         */
++        smp_rmb();
++        if (qatomic_load_acquire(&icount_slice_unaccounted)) {
++            return;
++        }
++
+         replay_checkpoint(CHECKPOINT_CLOCK_WARP_START);
+     } else {
+         /* warp clock deterministically in record/replay mode */
+diff --git a/accel/tcg/tcg-accel-ops-icount.c b/accel/tcg/tcg-accel-ops-icount.c
+index d0f7b410fa..39397941ce 100644
+--- a/accel/tcg/tcg-accel-ops-icount.c
++++ b/accel/tcg/tcg-accel-ops-icount.c
+@@ -102,10 +102,18 @@ int64_t icount_percpu_budget(int cpu_count)
+     return timeslice;
+ }
+ 
++bool icount_slice_unaccounted;
++
+ void icount_prepare_for_run(CPUState *cpu, int64_t cpu_budget)
+ {
+     int insns_left;
+ 
++    /*
++     * delugemu: the full barrier orders this store before any store the
++     * slice makes, cpu->halted included.
++     */
++    qatomic_set_mb(&icount_slice_unaccounted, true);
++
+     /*
+      * These should always be cleared by icount_process_data after
+      * each vCPU execution. However u16.high can be raised
+@@ -136,6 +144,8 @@ void icount_process_data(CPUState *cpu)
+ {
+     /* Account for executed instructions */
+     icount_update(cpu);
++    /* delugemu: publishes the updated icount with the cleared flag. */
++    qatomic_store_release(&icount_slice_unaccounted, false);
+ 
+     /* Reset the counters */
+     cpu->neg.icount_decr.u16.low = 0;
+diff --git a/accel/tcg/tcg-accel-ops-icount.h b/accel/tcg/tcg-accel-ops-icount.h
+index 16a301b6dc..cdcd8cc45d 100644
+--- a/accel/tcg/tcg-accel-ops-icount.h
++++ b/accel/tcg/tcg-accel-ops-icount.h
+@@ -14,6 +14,12 @@ void icount_handle_deadline(void);
+ void icount_prepare_for_run(CPUState *cpu, int64_t cpu_budget);
+ int64_t icount_percpu_budget(int cpu_count);
+ void icount_process_data(CPUState *cpu);
++/*
++ * delugemu: true from icount_prepare_for_run() until icount_process_data()
++ * has added the slice's executed instructions to the global icount. See
++ * icount_start_warp_timer().
++ */
++extern bool icount_slice_unaccounted;
+ 
+ void icount_handle_interrupt(CPUState *cpu, int mask);
+ 
