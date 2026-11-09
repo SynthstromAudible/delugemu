@@ -42,7 +42,7 @@ command -v python3 >/dev/null 2>&1 || skip "python3 not available"
 FIRMWARE="${DELUGEMU_FIRMWARE:-${DELUGE_FIRMWARE:-}}"
 FIRMWARE_DIR="${DELUGEMU_FIRMWARE_DIR:-${REPO_ROOT}/firmware}"
 if [ -z "${FIRMWARE}" ] && [ -d "${FIRMWARE_DIR}" ]; then
-    FIRMWARE="$(find "${FIRMWARE_DIR}" -type f -iname '*.bin' 2>/dev/null \
+    FIRMWARE="$(find "${FIRMWARE_DIR}" -not -path '*/__MACOSX/*' ! -name '._*' -type f -iname '*.bin' 2>/dev/null \
                 | LC_ALL=C sort | head -n1 || true)"
 fi
 if [ -z "${FIRMWARE}" ] \

@@ -81,10 +81,11 @@ runs:
       shell: bash
       run: |
         # Prefer an .elf (its symbols let the audio tests find the render head),
-        # else the OLED .bin, else the 7-segment .bin.
-        fw="$(find firmware -type f -iname '*.elf' | LC_ALL=C sort | head -n1)"
-        [ -n "${fw}" ] || fw="$(find firmware -type f -iname '*.bin' ! -iname '*7seg*' | LC_ALL=C sort | head -n1)"
-        [ -n "${fw}" ] || fw="$(find firmware -type f -iname '*.bin' | LC_ALL=C sort | head -n1)"
+        # else the OLED .bin, else the 7-segment .bin. Release zips made on macOS
+        # carry __MACOSX/ AppleDouble stubs (._name.bin) that sort first: skip them.
+        fw="$(find firmware -not -path '*/__MACOSX/*' ! -name '._*' -type f -iname '*.elf' | LC_ALL=C sort | head -n1)"
+        [ -n "${fw}" ] || fw="$(find firmware -not -path '*/__MACOSX/*' ! -name '._*' -type f -iname '*.bin' ! -iname '*7seg*' | LC_ALL=C sort | head -n1)"
+        [ -n "${fw}" ] || fw="$(find firmware -not -path '*/__MACOSX/*' ! -name '._*' -type f -iname '*.bin' | LC_ALL=C sort | head -n1)"
         [ -n "${fw}" ] || { echo "::error::no firmware image after download"; exit 1; }
         echo "DELUGE_FIRMWARE=${fw}" >> "$GITHUB_ENV"
         echo "DELUGE_FIRMWARE=${fw}"
