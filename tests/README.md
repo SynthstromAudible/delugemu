@@ -75,14 +75,21 @@ The scripted-run determinism test. Scripted runs (pylib's `run_until`, the
 `dz-stop-at-ns` property) pause the VM at exact virtual times under
 `-icount sleep=off` and inject input there, so two runs of one script must see
 the same guest however busy the host is. The test keeps every host CPU busy,
-runs two emulators at once, steps both in 10 ms of virtual time, presses Play
-halfway, and asserts that both runs pause at the same virtual times and show
-the same panel (OLED, pads, LEDs, gold knobs) at every step.
+runs four emulators of each firmware at once, steps them in 10 ms of virtual
+time, presses Play halfway, and asserts that every run pauses at the same
+virtual times, shows the same panel (OLED, pads, LEDs, gold knobs) at every
+step, and returns from every interrupt to the same PC (`-d int`).
+
+The published firmware busy-polls and never halts the CPU. Give the test a
+firmware that idles in WFE as well (the Rust/Embassy-BSP firmware) with
+`DELUGE_WFE_FIRMWARE`: only a halting guest exercises the clock warp that
+`qemu-patches/0008` guards.
 
 ```sh
 DELUGE_FIRMWARE=path ./tests/determinism.sh
 DELUGE_FIRMWARE=path DELUGE_SD_IMG=img ./tests/determinism.sh
-DET_SECONDS=12 ./tests/determinism.sh   # a longer run
+DELUGE_WFE_FIRMWARE=embassy.elf ./tests/determinism.sh
+DET_SECONDS=12 DET_RUNS=6 ./tests/determinism.sh   # longer, more runs
 ```
 
 Like `boot.sh`, it **skips cleanly** (exit 0) when no firmware image is present.
