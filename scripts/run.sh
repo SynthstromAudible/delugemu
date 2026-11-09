@@ -276,11 +276,11 @@ SD_DIR="${DELUGEMU_SD_DIR:-sdcard}"
 find_local_firmware() {
     [ -d "${FIRMWARE_DIR}" ] || return 0
     local f
-    f="$(find "${FIRMWARE_DIR}" -type f -iname '*.bin' ! -iname '*7seg*' \
+    f="$(find "${FIRMWARE_DIR}" -not -path '*/__MACOSX/*' ! -name '._*' -type f -iname '*.bin' ! -iname '*7seg*' \
             2>/dev/null | LC_ALL=C sort | head -n1 || true)"
-    [ -n "${f}" ] || f="$(find "${FIRMWARE_DIR}" -type f -iname '*.bin' \
+    [ -n "${f}" ] || f="$(find "${FIRMWARE_DIR}" -not -path '*/__MACOSX/*' ! -name '._*' -type f -iname '*.bin' \
             2>/dev/null | LC_ALL=C sort | head -n1 || true)"
-    [ -n "${f}" ] || f="$(find "${FIRMWARE_DIR}" -type f -iname '*.elf' \
+    [ -n "${f}" ] || f="$(find "${FIRMWARE_DIR}" -not -path '*/__MACOSX/*' ! -name '._*' -type f -iname '*.elf' \
             2>/dev/null | LC_ALL=C sort | head -n1 || true)"
     [ -n "${f}" ] && printf '%s\n' "${f}"
     return 0
