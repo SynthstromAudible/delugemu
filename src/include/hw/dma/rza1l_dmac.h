@@ -10,6 +10,7 @@
 #define HW_DMA_RZA1L_DMAC_H
 
 #include "hw/core/sysbus.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
 
 #define TYPE_RZA1L_DMAC "rza1l-dmac"
@@ -30,6 +31,9 @@ typedef uint32_t RzA1lDmacPullFn(void *opaque, uint8_t *buf, uint32_t len);
 
 /* Most a pull is asked for at once: one SD block. */
 #define RZA1L_DMAC_PULL_MAX 512
+
+/* Most descriptors an audio ring's loop may have (one per block). */
+#define RZA1L_DMAC_RING_MAX_BLOCKS 64
 
 typedef struct RzA1lDmacChannel {
     uint32_t n0sa;   /* next-0 source address */
@@ -90,6 +94,23 @@ typedef struct RzA1lDmacChannel {
     uint32_t rx_audio_base;
     uint32_t rx_audio_size;
     int64_t  rx_audio_start_ns;
+
+    /*
+     * Block ends of an audio ring (either direction). The ring is a loop of
+     * link descriptors, one per block, and the DMAC finishes each in turn as
+     * the synthesised play head (CRSA/CRDA) moves through the buffer. A
+     * descriptor whose CHCFG (word 4) has DEM clear raises the channel's
+     * DMAINT at its end, as on hardware; the firmware counts and waits on
+     * those interrupts. ring_block_end[i] is the byte offset in the ring at
+     * which descriptor i ends, ring_irq_blocks bit i is set when it raises the
+     * interrupt, and ring_blocks_done counts the descriptor ends the ring has
+     * passed since it started. ring_nblocks is 0 when no ring is running.
+     * Each end is raised on time by RzA1lDmacState::ring_timer.
+     */
+    uint32_t ring_nblocks;
+    uint32_t ring_block_end[RZA1L_DMAC_RING_MAX_BLOCKS];
+    uint64_t ring_irq_blocks;
+    uint64_t ring_blocks_done;
 
     /*
      * MIDI receive timing-capture ring (the SCIF MIDI timing channel, ch14).
@@ -187,6 +208,16 @@ struct RzA1lDmacState {
      */
     void (*tx_audio_pump)(void *opaque);
     void *tx_audio_pump_opaque;
+
+    /*
+     * Per channel: fires at an audio ring's next descriptor end (see
+     * RzA1lDmacChannel::ring_nblocks), and the channel it serves.
+     */
+    QEMUTimer *ring_timer[RZA1L_DMAC_NUM_CH];
+    struct RzA1lDmacRingTick {
+        RzA1lDmacState *s;
+        int ch;
+    } ring_tick[RZA1L_DMAC_NUM_CH];
 };
 
 /*
