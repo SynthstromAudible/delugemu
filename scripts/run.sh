@@ -62,7 +62,7 @@
 #                           (host-clocked, like Windows) instead of the default
 #                           implicit-feedback one. Only affects --usb-audio-in.
 #   --usb-audio-multitrack  The firmware is in its multitrack USB audio configuration
-#                           (8ch 16-bit to host, 2ch 16-bit from host).
+#                           (8ch 16-bit to host, 4ch 16-bit from host).
 #   --audio <driver>        Select a non-default host audio backend for the
 #                           SSIF (I2S) output (-audiodev <driver>). Audio is on
 #                           by default using the OS default backend (coreaudio

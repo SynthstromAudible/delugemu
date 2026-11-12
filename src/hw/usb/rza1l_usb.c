@@ -190,8 +190,8 @@
 /* UAC1 stream format: 44.1 kHz, 2 channels, 24-in-32 MSB subframes. */
 #define USB_PAUDIO_SAMPLE_RATE  44100
 #define USB_PAUDIO_FRAME_BYTES  8       /* 2 channels x 4-byte subframe       */
-/* Multitrack configuration, from host: 2 channels x 2-byte subframe */
-#define USB_PAUDIO_MT_FRAME_BYTES 4
+/* Multitrack configuration, from host: 4 channels x 2-byte subframe */
+#define USB_PAUDIO_MT_FRAME_BYTES 8
 
 /* From-host audio source kinds (resolved from the "audio-in" property). */
 enum { AUDIO_IN_NONE = 0, AUDIO_IN_TONE, AUDIO_IN_FILE };
@@ -516,6 +516,10 @@ static void rza1l_usb_wav_close(RzA1lUsbState *s)
         rza1l_usb_wav_close_file(&s->wav, &s->wav_data_bytes);
         USB_DBG("USB-audio: to-host WAV sink closed, %" PRIu64 " data bytes",
                 s->wav_data_bytes);
+        if (s->tohost_empty_frames) {
+            info_report("rza1l-usb: %" PRIu64 " USB frames had no to-host packet waiting",
+                        s->tohost_empty_frames);
+        }
     }
 }
 
@@ -668,11 +672,16 @@ static void rza1l_usb_fromhost_fill(RzA1lUsbState *s, uint8_t *buf,
         }
 
         if (s->audio_multitrack) {
-            /* 16-bit little-endian: the top half of each q31 sample */
-            buf[i * 4 + 0] = (l >> 16) & 0xff;
-            buf[i * 4 + 1] = (l >> 24) & 0xff;
-            buf[i * 4 + 2] = (r >> 16) & 0xff;
-            buf[i * 4 + 3] = (r >> 24) & 0xff;
+            /* 16-bit little-endian: the top half of each q31 sample. Channels
+             * 3/4 (the second stereo input) are the same audio at -1/2, so a
+             * test can tell the two apart */
+            int16_t ch[4] = { (int16_t)(l >> 16), (int16_t)(r >> 16),
+                              (int16_t)(-(l >> 16) / 2), (int16_t)(-(r >> 16) / 2) };
+            int c;
+            for (c = 0; c < 4; c++) {
+                buf[i * 8 + c * 2 + 0] = (uint16_t)ch[c] & 0xff;
+                buf[i * 8 + c * 2 + 1] = ((uint16_t)ch[c] >> 8) & 0xff;
+            }
             continue;
         }
         buf[i * 8 + 0] = l & 0xff;
@@ -697,7 +706,7 @@ static void rza1l_usb_fromhost_present(RzA1lUsbState *s)
     uint16_t bit = (uint16_t)(1u << USB_PAUDIO_PIPE_FROM_HOST);
     uint32_t frames;
 
-    if (s->audio_in_kind == AUDIO_IN_NONE || s->fromhost_pending) {
+    if (s->audio_in_kind == AUDIO_IN_NONE) {
         return;
     }
     if (!(s->regs[USB_BRDYENB >> 1] & bit)) {
@@ -711,11 +720,26 @@ static void rza1l_usb_fromhost_present(RzA1lUsbState *s)
         frames = RZA1L_USB_AUDIO_PKT_MAX / fromhost_frame_bytes(s);
     }
 
-    rza1l_usb_fromhost_fill(s, s->fromhost, frames);
-    s->fromhost_len = frames * fromhost_frame_bytes(s);
-    s->fromhost_pos = 0;
-    s->fromhost_pending = true;
-    s->regs[USB_BRDYSTS >> 1] |= bit;
+    if (!s->fromhost_pending) {
+        rza1l_usb_fromhost_fill(s, s->fromhost, frames);
+        s->fromhost_len = frames * fromhost_frame_bytes(s);
+        s->fromhost_pos = 0;
+        s->fromhost_pending = true;
+        s->regs[USB_BRDYSTS >> 1] |= bit;
+    } else if (!s->fromhost_next_ready) {
+        /* The other buffer - it's ready once the staged one's drained */
+        rza1l_usb_fromhost_fill(s, s->fromhost_next, frames);
+        s->fromhost_next_len = frames * fromhost_frame_bytes(s);
+        s->fromhost_next_ready = true;
+    } else {
+        /* Both buffers full: the host's packet is lost. Generate it anyway, so
+         * the source keeps time and the loss shows as a discontinuity */
+        uint8_t discard[RZA1L_USB_AUDIO_PKT_MAX];
+        rza1l_usb_fromhost_fill(s, discard, frames);
+        s->fromhost_lost++;
+        info_report("rza1l-usb: from-host packet lost, both buffers full (%" PRIu64 " so far)",
+                    s->fromhost_lost);
+    }
 }
 
 /* D1FIFO read: hand the DMAC the next word of the staged from-host packet.
@@ -737,11 +761,24 @@ static uint32_t rza1l_usb_read_d1fifo(RzA1lUsbState *s)
         rza1l_usb_wav_append(s->wav_in_cap, &s->wav_in_cap_bytes,
                              s->fromhost, s->fromhost_len);
         s->fromhost_pending = false;
+        if (s->fromhost_next_ready) {
+            /* The controller switches to the other buffer, and flags it */
+            memcpy(s->fromhost, s->fromhost_next, s->fromhost_next_len);
+            s->fromhost_len = s->fromhost_next_len;
+            s->fromhost_pos = 0;
+            s->fromhost_pending = true;
+            s->fromhost_next_ready = false;
+            s->regs[USB_BRDYSTS >> 1] |= (uint16_t)(1u << USB_PAUDIO_PIPE_FROM_HOST);
+            rza1l_usb_update_irq(s);
+        }
     }
     return v;
 }
 
 /* ---- Peripheral-mode USB-audio: 1 ms SOF clock -------------------------- */
+
+static void rza1l_usb_tohost_collect(RzA1lUsbState *s);
+static void rza1l_usb_tohost_reset(RzA1lUsbState *s);
 
 static void rza1l_usb_sof_tick(void *opaque)
 {
@@ -754,6 +791,7 @@ static void rza1l_usb_sof_tick(void *opaque)
      * raise SOFR. The firmware's handler pumps usbAudioHandleSof(), which
      * services both directions, and usbAudioHandleBrdy() starts the receive
      * DMA for the packet just presented. */
+    rza1l_usb_tohost_collect(s);
     rza1l_usb_fromhost_present(s);
     s->regs[USB_INTSTS0 >> 1] |= USB_SOFR;
     rza1l_usb_update_irq(s);
@@ -776,6 +814,7 @@ static void rza1l_usb_sof_update(RzA1lUsbState *s)
     } else if (!want && s->sof_running) {
         s->sof_running = false;
         timer_del(s->sof_timer);
+        rza1l_usb_tohost_reset(s);
         USB_DBG("USB-audio: SOF clock stopped");
     }
 }
@@ -908,12 +947,14 @@ static void rza1l_usb_peri_kick(RzA1lUsbState *s)
     s->fromhost_frac = 0;
     s->fromhost_frames = 0;
     s->fromhost_pending = false;
+    s->fromhost_next_ready = false;
     s->fromhost_pos = s->fromhost_len = 0;
     if (s->wav_in) {
         fseek(s->wav_in, s->wav_in_data_off, SEEK_SET);
     }
     if (s->audio_in_kind != AUDIO_IN_NONE) {
-        s->wav_in_cap = rza1l_usb_wav_open_file(s->audio_in_capture, 2,
+        s->wav_in_cap = rza1l_usb_wav_open_file(s->audio_in_capture,
+                                                s->audio_multitrack ? 4 : 2,
                                                 s->audio_multitrack ? 16 : 32);
         s->wav_in_cap_bytes = 0;
     }
@@ -1022,13 +1063,58 @@ static void rza1l_usb_d0fifo_write(RzA1lUsbState *s, uint32_t value)
     }
 }
 
-/* Commit the accumulated to-host packet (D0FIFOCTR.BVAL) to the WAV sink. */
+/* Commit the accumulated to-host packet (D0FIFOCTR.BVAL) to the pipe's next
+ * free buffer, to wait there for the host. */
 static void rza1l_usb_d0fifo_commit(RzA1lUsbState *s)
 {
     if (s->tohost_len) {
-        rza1l_usb_wav_write(s, s->tohost, s->tohost_len);
+        if (s->tohost_queued_count < 2) {
+            uint32_t slot = (s->tohost_queued_head + s->tohost_queued_count) & 1;
+            memcpy(s->tohost_queued[slot], s->tohost, s->tohost_len);
+            s->tohost_queued_len[slot] = s->tohost_len;
+            s->tohost_queued_count++;
+        } else {
+            /* The real controller wouldn't have shown FRDY to write it */
+            warn_report("rza1l-usb: to-host packet committed with both buffers full - dropped");
+        }
         s->tohost_len = 0;
     }
+}
+
+/* The host's IN transaction for the USB frame just ended: it collects the
+ * oldest waiting packet, or gets nothing (a zero-length packet). */
+static void rza1l_usb_tohost_collect(RzA1lUsbState *s)
+{
+    uint16_t ctr = s->regs[(USB_PIPE1CTR + 2 * (USB_PAUDIO_PIPE_TO_HOST - 1)) >> 1];
+
+    if ((ctr & USB_PID) != USB_PID_BUF) {
+        /* Not streaming to the host: the firmware NAKs the pipe, and resets it
+         * before starting again */
+        s->tohost_queued_count = 0;
+        s->tohost_started = false;
+        return;
+    }
+    if (s->tohost_queued_count) {
+        uint32_t slot = s->tohost_queued_head;
+        rza1l_usb_wav_write(s, s->tohost_queued[slot], s->tohost_queued_len[slot]);
+        s->tohost_queued_head ^= 1;
+        s->tohost_queued_count--;
+        s->tohost_started = true;
+    } else if (s->tohost_started) {
+        /* The firmware didn't get a packet queued in time - the host's audio
+         * has a gap. Logged as it happens, so tests can count them */
+        s->tohost_empty_frames++;
+        info_report("rza1l-usb: no to-host packet waiting (%" PRIu64 " so far)",
+                    s->tohost_empty_frames);
+    }
+}
+
+static void rza1l_usb_tohost_reset(RzA1lUsbState *s)
+{
+    s->tohost_len = 0;
+    s->tohost_queued_count = 0;
+    s->tohost_queued_head = 0;
+    s->tohost_started = false;
 }
 
 /* ---- Bulk MIDI data bridge ---------------------------------------------- */
@@ -1351,10 +1437,8 @@ static uint16_t rza1l_usb_read16(RzA1lUsbState *s, hwaddr offset)
     }
 
     case USB_D0FIFOCTR:
-        /* To-host audio buffer: always report FRDY (a buffer is free). The WAV
-         * sink consumes each committed packet immediately, so there is no
-         * back-pressure to model. */
-        return USB_FRDY;
+        /* To-host audio: FRDY while one of the pipe's two buffers is free. */
+        return (s->tohost_queued_count < 2) ? USB_FRDY : 0;
 
     case USB_D1FIFOCTR:
         /* From-host audio buffer: report FRDY and the staged packet's byte
@@ -1581,6 +1665,7 @@ static void rza1l_usb_write16(RzA1lUsbState *s, hwaddr offset, uint16_t value)
             if ((value & fb) != (before & fb)) {
                 s->fromhost_frac = 0;
                 s->fromhost_pending = false;
+                s->fromhost_next_ready = false;
                 s->fromhost_pos = s->fromhost_len = 0;
             }
         }
@@ -1829,7 +1914,7 @@ static void rza1l_usb_reset(DeviceState *dev)
     s->peri_kicked = false;
     s->peri_wait = 0;
     s->peri_ctrl_wait = false;
-    s->tohost_len = 0;
+    rza1l_usb_tohost_reset(s);
     if (s->sof_running && s->sof_timer) {
         timer_del(s->sof_timer);
     }
@@ -1843,6 +1928,7 @@ static void rza1l_usb_reset(DeviceState *dev)
     }
     rza1l_usb_wav_close_file(&s->wav_in_cap, &s->wav_in_cap_bytes);
     s->fromhost_pending = false;
+    s->fromhost_next_ready = false;
     s->fromhost_pos = s->fromhost_len = 0;
     s->fromhost_frac = 0;
     s->fromhost_frames = 0;
