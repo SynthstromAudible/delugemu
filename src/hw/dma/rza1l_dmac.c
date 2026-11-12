@@ -16,6 +16,11 @@
  * interrupts are not modelled; synchronous completion is sufficient for the
  * firmware's polled transfers and keeps boot moving.
  *
+ * The SSI audio rings are modelled as running continuously: their play head
+ * moves with virtual time, and each descriptor of the ring's loop raises the
+ * channel's end interrupt as the head passes its end, unless the descriptor
+ * masks it (see rza1l_dmac_ring_tick).
+ *
  * The exception is channels registered as DREQ-paced (the SDHI data channel):
  * those transfer only while the peripheral asserts its request line, so the
  * transfer's duration is set by the peripheral's own timing model (see
@@ -369,15 +374,21 @@ static void rza1l_dmac_dreq_set(void *opaque, int ch, int level)
  * moves through the buffer at the sample rate and wraps to its start. Returns
  * false for anything else. A loop whose byte counts sum to zero is still a
  * ring: the caller latches it as an inactive one.
+ *
+ * On success the channel's block ends are recorded too: where in the ring
+ * each descriptor ends, and whether its CHCFG (word 4) leaves DEM clear, so
+ * that its end raises the transfer-end interrupt (see rza1l_dmac_ring_tick).
  */
-static bool rza1l_dmac_audio_ring(uint32_t head, int addr_off,
-                                  uint32_t *base, uint32_t *size)
+static bool rza1l_dmac_audio_ring(RzA1lDmacChannel *c, uint32_t head,
+                                  int addr_off, uint32_t *base, uint32_t *size)
 {
     uint32_t link = head;
     uint32_t next_addr = 0;
     uint32_t total = 0;
+    uint32_t ends[RZA1L_DMAC_RING_MAX_BLOCKS];
+    uint64_t irq_blocks = 0;
 
-    for (int i = 0; i < 64; i++) {
+    for (int i = 0; i < RZA1L_DMAC_RING_MAX_BLOCKS; i++) {
         uint8_t d[32];
         uint32_t addr, bytes;
 
@@ -392,13 +403,123 @@ static bool rza1l_dmac_audio_ring(uint32_t head, int addr_off,
         }
         next_addr = addr + bytes;
         total += bytes;
+        ends[i] = total;
+        if (!(ldl_le_p(d + 16) & CHCFG_DEM)) {
+            irq_blocks |= 1ull << i;
+        }
         link = ldl_le_p(d + 28);
         if (link == head) {
             *size = total;
+            memcpy(c->ring_block_end, ends, (i + 1) * sizeof(ends[0]));
+            c->ring_nblocks = i + 1;
+            c->ring_irq_blocks = irq_blocks;
+            c->ring_blocks_done = 0;
             return true;
         }
     }
     return false;
+}
+
+/*
+ * Audio ring block ends. The play head of an audio ring is a function of
+ * virtual time (bytes = elapsed_ns * RZA1L_DMAC_AUDIO_BYTES_PER_SEC / 1e9,
+ * see rza1l_dmac_tx_audio_crsa), so the moment it passes each descriptor's end
+ * is known in advance: a timer fires then and raises the end interrupt of a
+ * descriptor that leaves DEM clear, setting TC, which the firmware's handler
+ * clears (CHCTRL.CLRTC) while the ring runs on. The firmware counts these
+ * interrupts against the play head and waits on them for the next block.
+ *
+ * Several ends passed at once (a late timer) raise one interrupt, as two block
+ * ends inside one window do on hardware: DMAINT is edge triggered.
+ */
+static int64_t rza1l_dmac_ring_start_ns(RzA1lDmacChannel *c)
+{
+    return c->tx_audio_active ? c->tx_audio_start_ns : c->rx_audio_start_ns;
+}
+
+static uint32_t rza1l_dmac_ring_size(RzA1lDmacChannel *c)
+{
+    return c->tx_audio_active ? c->tx_audio_size : c->rx_audio_size;
+}
+
+/* Bytes into the ring, since it started, at which descriptor end `n` falls. */
+static uint64_t rza1l_dmac_ring_end_bytes(RzA1lDmacChannel *c, uint64_t n)
+{
+    return (n / c->ring_nblocks) * rza1l_dmac_ring_size(c) +
+           c->ring_block_end[n % c->ring_nblocks];
+}
+
+/* Bytes the ring has moved by virtual time `now`, as CRSA/CRDA report. */
+static uint64_t rza1l_dmac_ring_bytes_at(RzA1lDmacChannel *c, int64_t now)
+{
+    int64_t elapsed = now - rza1l_dmac_ring_start_ns(c);
+
+    if (elapsed < 0) {
+        return 0;
+    }
+    return muldiv64(elapsed, RZA1L_DMAC_AUDIO_BYTES_PER_SEC,
+                    NANOSECONDS_PER_SECOND);
+}
+
+/* The first virtual time at which the ring has moved `bytes`. */
+static int64_t rza1l_dmac_ring_ns_of(RzA1lDmacChannel *c, uint64_t bytes)
+{
+    int64_t t =
+        muldiv64(bytes, NANOSECONDS_PER_SECOND, RZA1L_DMAC_AUDIO_BYTES_PER_SEC);
+
+    while (rza1l_dmac_ring_bytes_at(c, rza1l_dmac_ring_start_ns(c) + t) <
+           bytes) {
+        t++;
+    }
+    return rza1l_dmac_ring_start_ns(c) + t;
+}
+
+/* Arm the channel's timer for its ring's next descriptor end. */
+static void rza1l_dmac_ring_arm(RzA1lDmacState *s, int ch)
+{
+    RzA1lDmacChannel *c = &s->ch[ch];
+
+    if (!c->ring_nblocks || !c->ring_irq_blocks || !rza1l_dmac_ring_size(c)) {
+        timer_del(s->ring_timer[ch]);
+        return;
+    }
+    timer_mod(s->ring_timer[ch],
+              rza1l_dmac_ring_ns_of(
+                  c, rza1l_dmac_ring_end_bytes(c, c->ring_blocks_done)));
+}
+
+static void rza1l_dmac_ring_tick(void *opaque)
+{
+    struct RzA1lDmacRingTick *tick = opaque;
+    RzA1lDmacState *s = tick->s;
+    int ch = tick->ch;
+    RzA1lDmacChannel *c = &s->ch[ch];
+    uint64_t moved;
+    bool raise = false;
+
+    if (!c->ring_nblocks || !rza1l_dmac_ring_size(c)) {
+        return;
+    }
+    moved = rza1l_dmac_ring_bytes_at(c, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    while (rza1l_dmac_ring_end_bytes(c, c->ring_blocks_done) <= moved) {
+        if (c->ring_irq_blocks &
+            (1ull << (c->ring_blocks_done % c->ring_nblocks))) {
+            raise = true;
+        }
+        c->ring_blocks_done++;
+    }
+    if (raise) {
+        c->chstat |= CHSTAT_TC;
+        qemu_irq_pulse(s->irq[ch]);
+    }
+    rza1l_dmac_ring_arm(s, ch);
+}
+
+/* Stop a channel's audio ring raising block ends (the channel halted). */
+static void rza1l_dmac_ring_stop(RzA1lDmacState *s, int ch)
+{
+    s->ch[ch].ring_nblocks = 0;
+    timer_del(s->ring_timer[ch]);
 }
 
 /*
@@ -536,9 +657,11 @@ static void rza1l_dmac_chctrl_write(RzA1lDmacState *s, int ch, uint32_t val)
     if (val & CHCTRL_SWRST) {
         c->chstat &= ~(CHSTAT_EN | CHSTAT_TACT | CHSTAT_ER |
                        CHSTAT_END | CHSTAT_TC);
+        rza1l_dmac_ring_stop(s, ch);
     }
     if (val & CHCTRL_CLREN) {
         c->chstat &= ~CHSTAT_EN;
+        rza1l_dmac_ring_stop(s, ch);
     }
     if (val & CHCTRL_CLREND) {
         c->chstat &= ~CHSTAT_END;
@@ -592,10 +715,8 @@ static void rza1l_dmac_chctrl_write(RzA1lDmacState *s, int ch, uint32_t val)
          * runs both halves here, fire the interrupt for a chained transfer
          * regardless of DEM, and honour DEM only for a plain single transfer.
          */
-        if (((c->chcfg & CHCFG_REN) && (c->chcfg & CHCFG_RSW)) ||
-            !(c->chcfg & CHCFG_DEM)) {
-            qemu_irq_pulse(s->irq[ch]);
-        }
+        bool end_irq = ((c->chcfg & CHCFG_REN) && (c->chcfg & CHCFG_RSW)) ||
+                       !(c->chcfg & CHCFG_DEM);
 
         /*
          * A channel registered as a peripheral receive ring is additionally
@@ -629,12 +750,19 @@ static void rza1l_dmac_chctrl_write(RzA1lDmacState *s, int ch, uint32_t val)
              */
             uint32_t base, size;
 
-            if (rza1l_dmac_audio_ring(c->nxla, 4, &base, &size)) {
+            rza1l_dmac_ring_stop(s, ch);
+            if (rza1l_dmac_audio_ring(c, c->nxla, 4, &base, &size)) {
                 c->tx_audio_base = base;
                 c->tx_audio_size = size;
                 c->tx_audio_active = (size != 0);
                 c->tx_audio_start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
                 c->crsa = c->tx_audio_base;
+                /*
+                 * A running ring raises its end interrupts per block, from
+                 * its descriptors (rza1l_dmac_ring_tick), not on enable.
+                 */
+                end_irq = false;
+                rza1l_dmac_ring_arm(s, ch);
             }
         } else if (c->rx_audio_ring && c->nxla != 0) {
             /*
@@ -645,12 +773,15 @@ static void rza1l_dmac_chctrl_write(RzA1lDmacState *s, int ch, uint32_t val)
              */
             uint32_t base, size;
 
-            if (rza1l_dmac_audio_ring(c->nxla, 8, &base, &size)) {
+            rza1l_dmac_ring_stop(s, ch);
+            if (rza1l_dmac_audio_ring(c, c->nxla, 8, &base, &size)) {
                 c->rx_audio_base = base;
                 c->rx_audio_size = size;
                 c->rx_audio_active = (size != 0);
                 c->rx_audio_start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
                 c->crda = c->rx_audio_base;
+                end_irq = false;
+                rza1l_dmac_ring_arm(s, ch);
             }
         } else if (c->timing_ring && rza1l_dmac_dmars_is_scif_rx(c->dmars) &&
                    c->nxla != 0) {
@@ -670,6 +801,10 @@ static void rza1l_dmac_chctrl_write(RzA1lDmacState *s, int ch, uint32_t val)
                 c->timing_active = (c->timing_size != 0);
                 c->timing_cursor = c->timing_base;
             }
+        }
+
+        if (end_irq) {
+            qemu_irq_pulse(s->irq[ch]);
         }
     }
 }
@@ -1055,6 +1190,9 @@ static void rza1l_dmac_reset(DeviceState *dev)
         pull_opaque[i] = s->ch[i].pull_opaque;
     }
 
+    for (int i = 0; i < RZA1L_DMAC_NUM_CH; i++) {
+        timer_del(s->ring_timer[i]);
+    }
     memset(s->ch, 0, sizeof(s->ch));
     memset(s->dctrl, 0, sizeof(s->dctrl));
 
@@ -1143,6 +1281,10 @@ static void rza1l_dmac_realize(DeviceState *dev, Error **errp)
 
     for (int i = 0; i < RZA1L_DMAC_NUM_CH; i++) {
         sysbus_init_irq(sbd, &s->irq[i]);
+        s->ring_tick[i].s = s;
+        s->ring_tick[i].ch = i;
+        s->ring_timer[i] = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                        rza1l_dmac_ring_tick, &s->ring_tick[i]);
     }
     qdev_init_gpio_in_named(dev, rza1l_dmac_dreq_set, RZA1L_DMAC_DREQ,
                             RZA1L_DMAC_NUM_CH);
@@ -1153,8 +1295,8 @@ static void rza1l_dmac_realize(DeviceState *dev, Error **errp)
 
 static const VMStateDescription vmstate_rza1l_dmac_channel = {
     .name = "rza1l-dmac-channel",
-    .version_id = 4,
-    .minimum_version_id = 4,
+    .version_id = 5,
+    .minimum_version_id = 5,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(n0sa, RzA1lDmacChannel),
         VMSTATE_UINT32(n0da, RzA1lDmacChannel),
@@ -1190,14 +1332,31 @@ static const VMStateDescription vmstate_rza1l_dmac_channel = {
         VMSTATE_UINT32(timing_size, RzA1lDmacChannel),
         VMSTATE_UINT32(timing_cursor, RzA1lDmacChannel),
         VMSTATE_BOOL(dreq_level, RzA1lDmacChannel),
+        VMSTATE_UINT32(ring_nblocks, RzA1lDmacChannel),
+        VMSTATE_UINT32_ARRAY(ring_block_end, RzA1lDmacChannel,
+                             RZA1L_DMAC_RING_MAX_BLOCKS),
+        VMSTATE_UINT64(ring_irq_blocks, RzA1lDmacChannel),
+        VMSTATE_UINT64(ring_blocks_done, RzA1lDmacChannel),
         VMSTATE_END_OF_LIST()
     },
 };
+
+/* Re-arm each running audio ring's next block end (rza1l_dmac_ring_tick). */
+static int rza1l_dmac_post_load(void *opaque, int version_id)
+{
+    RzA1lDmacState *s = opaque;
+
+    for (int i = 0; i < RZA1L_DMAC_NUM_CH; i++) {
+        rza1l_dmac_ring_arm(s, i);
+    }
+    return 0;
+}
 
 static const VMStateDescription vmstate_rza1l_dmac = {
     .name = TYPE_RZA1L_DMAC,
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = rza1l_dmac_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_ARRAY(ch, RzA1lDmacState, RZA1L_DMAC_NUM_CH, 1,
                              vmstate_rza1l_dmac_channel, RzA1lDmacChannel),

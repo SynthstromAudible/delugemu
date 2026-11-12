@@ -68,7 +68,14 @@ Base `0xE8200000` · size `0x800` · 16 channels (0x40-byte blocks), group commo
 
 On `CHCTRL.SETEN` it synchronously copies `N0TB` bytes `N0SA → N0DA` honouring
 addr modes, then sets `END|TC` and pulses the per-channel DMAINT (if `DEM` clear).
-Channel 6 is a self-advancing audio TX ring; channel 12 is the PIC RX ring.
+Channel 6 is a self-advancing audio TX ring (channel 7 the RX ring, CRDA
+advancing likewise); channel 12 is the PIC RX ring. An audio ring is a loop of
+link descriptors, one per block: as the play head passes a descriptor's end, a
+virtual-clock timer sets `TC` and pulses the channel's DMAINT if that
+descriptor's `CHCFG` (word 4) leaves `DEM` clear, as the Deluge SDK's block rings
+do (the firmware renders on the TX block interrupt). The stock firmware's single
+self-linking descriptors set `DEM`, so it gets none, and a ring's `SETEN` raises
+no interrupt of its own. `SWRST` or `CLREN` stops a ring's block interrupts.
 A channel whose `DMARS` selects SDHI0/1 transmit or receive (`0xC1/0xC2/0xC5/0xC6`)
 is **DREQ-paced**, whichever channel the firmware chose (and so is channel 2 while
 its `DMARS` is unset: the stock firmware's SD channel, whose card bring-up never
