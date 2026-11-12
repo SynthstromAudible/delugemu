@@ -455,7 +455,21 @@ static void rza1l_gpio_reset(DeviceState *dev)
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->in_drive, 0, sizeof(s->in_drive));
     memset(s->in_mask, 0, sizeof(s->in_mask));
+    /*
+     * The black detented encoders rest in a detent with both contacts open, A
+     * and B pulled high (phase 2), and firmwares from DelugeFirmware #5240 on
+     * start their decoders from that state rather than from the pins (1.x
+     * hard-coded the same rest state). Phase 0 (both low) put each scripted
+     * detent half a cycle out of step, so the first one after boot reported
+     * nothing. The gold knobs have no detent; they start high too, harmlessly,
+     * since firmwares read their pins at boot.
+     */
     s->enc_phase = 0;
+    for (unsigned e = 0; e < DELUGE_ENC_COUNT; e++) {
+        s->enc_phase |= (uint16_t)(2u << (2u * e));
+        rza1l_gpio_set_input_pin(s, 1, rza1l_encoder_map[e].irq_pin, true);
+        rza1l_gpio_set_input_pin(s, 1, rza1l_encoder_map[e].comp_pin, true);
+    }
     s->icr0 = 0;
     s->icr1 = 0;
     s->irqrr = 0;
