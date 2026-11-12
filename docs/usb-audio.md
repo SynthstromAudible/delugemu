@@ -246,6 +246,12 @@ comes up as one. The flags layer onto that:
 - `--usb-audio-in <source>` — from-host source: `tone[:freq]` or an input WAV.
   `--usb-audio-adaptive` picks the adaptive (host-clocked) alternate setting;
   `--usb-audio-in-capture <wav>` saves the frames the firmware consumed.
+- `--usb-audio-multitrack` — the firmware is in its multitrack configuration
+  (8 channels of 16-bit to the host, 4 from it). The to-host WAV is then
+  8-channel 16-bit, and the from-host source is sent on channels 1/2 with the
+  same audio at −½ on channels 3/4, so a test can tell the two inputs apart.
+  The firmware picks the configuration from its own setting; this only tells
+  the model which format to expect.
 
 ## 6. Phasing
 
@@ -317,7 +323,24 @@ comes up as one. The flags layer onto that:
    (`--usb-audio-adaptive`), alt 2 (adaptive). MIDI needs no alt setting.
    `usbAudioStopAll` on bus reset / reconfigure is honoured by the firmware; the
    model tears the from-host stream down when `BRDYENB` bit 1 clears.
-4. **CoreAudio bridge + docs.** Live host-audio routing to a QEMU `audiodev`
+4. **Double-buffered isochronous pipes + multitrack. ✅ DONE.** Both audio pipes
+   are double buffered on the real controller, and the model now has both
+   buffers of each:
+   - **To host:** a packet committed with `D0FIFOCTR.BVAL` waits in one of two
+     buffers. The host collects one per USB frame, at the SOF tick, and that's
+     when it reaches the WAV. `D0FIFOCTR.FRDY` is only set while a buffer is
+     free. Firmware that keeps both buffers full (so a late SOF interrupt
+     doesn't cost a packet) needs this - with `FRDY` always set it would send
+     endlessly. A frame with nothing to collect, once the stream has started,
+     is logged as `no to-host packet waiting`: a gap in the host's audio.
+   - **From host:** a packet arriving while the previous one is still staged
+     waits in the second buffer and is staged (with its own BRDY) once the
+     first is drained. One arriving with both full is logged as
+     `from-host packet lost`.
+   - **Multitrack** (`audio-multitrack`, `--usb-audio-multitrack`): the formats
+     above. Only the frame sizes and the WAV headers differ - the pipes, DMA
+     and enumeration are the same.
+5. **CoreAudio bridge + docs.** Live host-audio routing to a QEMU `audiodev`
    remains optional/future; docs updated here and in `register-coverage.md` /
    `architecture.md`. Host-mode MIDI (`midi=on`) and peripheral mode (`audio=on`)
    are both kept as equally supported roles (§9).
@@ -430,9 +453,11 @@ re-read `INTSTS0` for the live CTSQ field.
   frames and `startDma(ch0,…,&D0FIFO,n)`.
 - DMAC writes n bytes to D0FIFO (model accumulates), pulses DMAINT0 →
   `toHostDmaComplete` clears `DREQE`, writes `D0FIFOCTR.BVAL` (`0x8000`).
-- Model commits the accumulated packet on `BVAL`: 24-in-32 samples → WAV sink.
-  `D0FIFOCTR` reads back `FRDY` (`0x2000`) when a buffer is free (back-pressure
-  by withholding it until the prior packet is consumed).
+- Model commits the accumulated packet on `BVAL` to one of the pipe's two
+  buffers; the host collects one per SOF, and it goes to the WAV sink then
+  (24-in-32 samples, or 16-bit in multitrack). `D0FIFOCTR` reads back `FRDY`
+  (`0x2000`) while a buffer is free (back-pressure by withholding it while both
+  hold packets).
 
 ## 10. Out of scope
 

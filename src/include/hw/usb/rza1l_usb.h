@@ -36,7 +36,8 @@
 OBJECT_DECLARE_SIMPLE_TYPE(RzA1lUsbState, RZA1L_USB)
 
 /* Largest UAC1 isochronous packet (48 frames x 2ch x 4-byte subframe). */
-#define RZA1L_USB_AUDIO_PKT_MAX 384
+/* Big enough for the multitrack configuration's 720-byte to-host packets */
+#define RZA1L_USB_AUDIO_PKT_MAX 768
 
 /* MMIO register window for one USB controller (covers SYSCFG0..PIPExCTR). */
 #define RZA1L_USB_MMIO_SIZE 0x200
@@ -82,6 +83,7 @@ struct RzA1lUsbState {
     char *audio_in;     /* from-host source: "tone[:freq]" or an input WAV path */
     char *audio_in_capture; /* optional WAV sink: frames the firmware consumed */
     bool audio_adaptive; /* from-host uses the adaptive alt setting (2), not implicit (1) */
+    bool audio_multitrack; /* firmware's multitrack configuration: 8ch 16-bit to host, 4ch 16-bit from host */
 
     /* ---- Peripheral-mode USB-audio (only used when audio == true) -------- */
 
@@ -94,10 +96,17 @@ struct RzA1lUsbState {
     bool     peri_ctrl_wait;/* a control write is awaiting its CCPL completion */
 
     /* To-host isochronous stream (pipe 2 / D0FIFO). The DMAC writes one packet
-     * here via repeated fixed-address stores; committed to the WAV sink on
-     * D0FIFOCTR.BVAL. */
+     * here via repeated fixed-address stores; D0FIFOCTR.BVAL commits it to one
+     * of the pipe's two buffers (it's double buffered), where it waits for the
+     * host, which collects one per USB frame - written to the WAV sink then. */
     uint8_t  tohost[RZA1L_USB_AUDIO_PKT_MAX];
     uint32_t tohost_len;
+    uint8_t  tohost_queued[2][RZA1L_USB_AUDIO_PKT_MAX];
+    uint32_t tohost_queued_len[2];
+    uint32_t tohost_queued_head;   /* the buffer the host collects next */
+    uint32_t tohost_queued_count;  /* 0..2 buffers holding a packet */
+    bool     tohost_started;       /* a packet has been sent since SOF started */
+    uint64_t tohost_empty_frames;  /* USB frames with nothing for the host, after that */
     QEMUTimer *sof_timer;   /* 1 ms Start-Of-Frame clock while streaming */
     bool     sof_running;
 
@@ -119,6 +128,12 @@ struct RzA1lUsbState {
     uint32_t fromhost_len;    /* bytes staged in the current from-host packet */
     uint32_t fromhost_pos;    /* DMA read cursor within fromhost[] */
     bool     fromhost_pending;/* a packet is staged for the DMA to drain */
+    /* The pipe is double buffered: a packet arriving while one is still
+     * staged waits here, and becomes the staged one once that's drained */
+    uint8_t  fromhost_next[RZA1L_USB_AUDIO_PKT_MAX];
+    uint32_t fromhost_next_len;
+    bool     fromhost_next_ready;
+    uint64_t fromhost_lost;   /* packets that arrived with both buffers full */
     uint32_t fromhost_frac;   /* 44.1 frames/ms pacing accumulator */
     uint64_t fromhost_frames; /* total frames the firmware has drained */
     FILE    *wav_in_cap;      /* capture sink for consumed from-host frames */

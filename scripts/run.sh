@@ -61,6 +61,8 @@
 #   --usb-audio-adaptive    Use the from-host stream's adaptive alternate setting
 #                           (host-clocked, like Windows) instead of the default
 #                           implicit-feedback one. Only affects --usb-audio-in.
+#   --usb-audio-multitrack  The firmware is in its multitrack USB audio configuration
+#                           (8ch 16-bit to host, 4ch 16-bit from host).
 #   --audio <driver>        Select a non-default host audio backend for the
 #                           SSIF (I2S) output (-audiodev <driver>). Audio is on
 #                           by default using the OS default backend (coreaudio
@@ -516,6 +518,7 @@ USB_AUDIO=""
 USB_AUDIO_IN=""
 USB_AUDIO_IN_CAPTURE=""
 USB_AUDIO_ADAPTIVE=0
+USB_AUDIO_MULTITRACK=0
 USB_HOST=0
 AUDIO=""
 AUDIO_BUFFER=""
@@ -614,6 +617,7 @@ while [ $# -gt 0 ]; do
             ;;
         --usb-audio-in-capture=*) USB_AUDIO_IN_CAPTURE="${1#--usb-audio-in-capture=}"; shift ;;
         --usb-audio-adaptive) USB_AUDIO_ADAPTIVE=1; shift ;;
+        --usb-audio-multitrack) USB_AUDIO_MULTITRACK=1; shift ;;
         --usb-host) USB_HOST=1; shift ;;
         --audio)
             [ -n "${2:-}" ] || die "--audio requires a driver name"
@@ -813,6 +817,9 @@ fi
 USB_AUDIO_ARGS=()
 if [ -n "${USB_AUDIO}" ] || [ -n "${USB_AUDIO_IN}" ]; then
     USB_AUDIO_ARGS=(-global "rza1l-usb.audio=on")
+    if [ "${USB_AUDIO_MULTITRACK}" -eq 1 ]; then
+        USB_AUDIO_ARGS+=(-global "rza1l-usb.audio-multitrack=on")
+    fi
     if [ -n "${USB_AUDIO}" ]; then
         USB_AUDIO_ARGS+=(-global "rza1l-usb.audio-out=${USB_AUDIO}")
         log "Capturing USB-audio to-host stream to WAV: ${USB_AUDIO}"
