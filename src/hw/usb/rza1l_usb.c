@@ -190,6 +190,8 @@
 /* UAC1 stream format: 44.1 kHz, 2 channels, 24-in-32 MSB subframes. */
 #define USB_PAUDIO_SAMPLE_RATE  44100
 #define USB_PAUDIO_FRAME_BYTES  8       /* 2 channels x 4-byte subframe       */
+/* Multitrack configuration, from host: 2 channels x 2-byte subframe */
+#define USB_PAUDIO_MT_FRAME_BYTES 4
 
 /* From-host audio source kinds (resolved from the "audio-in" property). */
 enum { AUDIO_IN_NONE = 0, AUDIO_IN_TONE, AUDIO_IN_FILE };
@@ -432,11 +434,10 @@ static void rza1l_usb_wav_patch_u32(FILE *fp, long off, uint32_t v)
  * killed). Both audio sinks carry the Deluge's q31 samples (24-bit MSB-aligned
  * in 32-bit subframes) verbatim. Returns the open file, or NULL.
  */
-static FILE *rza1l_usb_wav_open_file(const char *path)
+static FILE *rza1l_usb_wav_open_file(const char *path, uint16_t channels,
+                                     uint16_t bits)
 {
     static const uint32_t rate = USB_PAUDIO_SAMPLE_RATE;
-    static const uint16_t channels = 2;
-    static const uint16_t bits = 32;
     uint32_t byte_rate = rate * channels * (bits / 8);
     uint16_t block_align = channels * (bits / 8);
     uint8_t hdr[44] = {
@@ -494,7 +495,9 @@ static void rza1l_usb_wav_close_file(FILE **fp, uint64_t *data_bytes)
 /* Open the to-host WAV sink (Deluge -> host stream capture). */
 static void rza1l_usb_wav_open(RzA1lUsbState *s)
 {
-    s->wav = rza1l_usb_wav_open_file(s->audio_out);
+    /* Multitrack: 8 channels of 16-bit; stereo: the q31 samples verbatim */
+    s->wav = rza1l_usb_wav_open_file(s->audio_out, s->audio_multitrack ? 8 : 2,
+                                     s->audio_multitrack ? 16 : 32);
     s->wav_data_bytes = 0;
     if (s->wav) {
         USB_DBG("USB-audio: to-host WAV sink open '%s'", s->audio_out);
@@ -638,6 +641,11 @@ static void rza1l_usb_wav_in_frame(RzA1lUsbState *s, int32_t *l, int32_t *r)
     *r = (s->wav_in_ch == 2) ? ch[1] : ch[0]; /* mono -> both channels */
 }
 
+static uint32_t fromhost_frame_bytes(const RzA1lUsbState *s)
+{
+    return s->audio_multitrack ? USB_PAUDIO_MT_FRAME_BYTES : USB_PAUDIO_FRAME_BYTES;
+}
+
 /* Produce `frames` stereo frames of from-host audio into buf: interleaved
  * left/right, each a 4-byte little-endian q31 sample (24-bit MSB-aligned). */
 static void rza1l_usb_fromhost_fill(RzA1lUsbState *s, uint8_t *buf,
@@ -659,6 +667,14 @@ static void rza1l_usb_fromhost_fill(RzA1lUsbState *s, uint8_t *buf,
             rza1l_usb_wav_in_frame(s, &l, &r);
         }
 
+        if (s->audio_multitrack) {
+            /* 16-bit little-endian: the top half of each q31 sample */
+            buf[i * 4 + 0] = (l >> 16) & 0xff;
+            buf[i * 4 + 1] = (l >> 24) & 0xff;
+            buf[i * 4 + 2] = (r >> 16) & 0xff;
+            buf[i * 4 + 3] = (r >> 24) & 0xff;
+            continue;
+        }
         buf[i * 8 + 0] = l & 0xff;
         buf[i * 8 + 1] = (l >> 8) & 0xff;
         buf[i * 8 + 2] = (l >> 16) & 0xff;
@@ -691,12 +707,12 @@ static void rza1l_usb_fromhost_present(RzA1lUsbState *s)
     s->fromhost_frac += USB_PAUDIO_SAMPLE_RATE / 100; /* 441 per frame */
     frames = s->fromhost_frac / 10;
     s->fromhost_frac %= 10;
-    if (frames * USB_PAUDIO_FRAME_BYTES > RZA1L_USB_AUDIO_PKT_MAX) {
-        frames = RZA1L_USB_AUDIO_PKT_MAX / USB_PAUDIO_FRAME_BYTES;
+    if (frames * fromhost_frame_bytes(s) > RZA1L_USB_AUDIO_PKT_MAX) {
+        frames = RZA1L_USB_AUDIO_PKT_MAX / fromhost_frame_bytes(s);
     }
 
     rza1l_usb_fromhost_fill(s, s->fromhost, frames);
-    s->fromhost_len = frames * USB_PAUDIO_FRAME_BYTES;
+    s->fromhost_len = frames * fromhost_frame_bytes(s);
     s->fromhost_pos = 0;
     s->fromhost_pending = true;
     s->regs[USB_BRDYSTS >> 1] |= bit;
@@ -717,7 +733,7 @@ static uint32_t rza1l_usb_read_d1fifo(RzA1lUsbState *s)
     }
     if (s->fromhost_pending && s->fromhost_pos >= s->fromhost_len) {
         /* The firmware's DMA has drained the whole packet. */
-        s->fromhost_frames += s->fromhost_len / USB_PAUDIO_FRAME_BYTES;
+        s->fromhost_frames += s->fromhost_len / fromhost_frame_bytes(s);
         rza1l_usb_wav_append(s->wav_in_cap, &s->wav_in_cap_bytes,
                              s->fromhost, s->fromhost_len);
         s->fromhost_pending = false;
@@ -897,7 +913,8 @@ static void rza1l_usb_peri_kick(RzA1lUsbState *s)
         fseek(s->wav_in, s->wav_in_data_off, SEEK_SET);
     }
     if (s->audio_in_kind != AUDIO_IN_NONE) {
-        s->wav_in_cap = rza1l_usb_wav_open_file(s->audio_in_capture);
+        s->wav_in_cap = rza1l_usb_wav_open_file(s->audio_in_capture, 2,
+                                                s->audio_multitrack ? 16 : 32);
         s->wav_in_cap_bytes = 0;
     }
 
@@ -1934,6 +1951,7 @@ static const Property rza1l_usb_properties[] = {
     DEFINE_PROP_STRING("audio-in", RzA1lUsbState, audio_in),
     DEFINE_PROP_STRING("audio-in-capture", RzA1lUsbState, audio_in_capture),
     DEFINE_PROP_BOOL("audio-in-adaptive", RzA1lUsbState, audio_adaptive, false),
+    DEFINE_PROP_BOOL("audio-multitrack", RzA1lUsbState, audio_multitrack, false),
 };
 
 static void rza1l_usb_class_init(ObjectClass *klass, const void *data)

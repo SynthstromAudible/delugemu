@@ -36,7 +36,8 @@
 OBJECT_DECLARE_SIMPLE_TYPE(RzA1lUsbState, RZA1L_USB)
 
 /* Largest UAC1 isochronous packet (48 frames x 2ch x 4-byte subframe). */
-#define RZA1L_USB_AUDIO_PKT_MAX 384
+/* Big enough for the multitrack configuration's 720-byte to-host packets */
+#define RZA1L_USB_AUDIO_PKT_MAX 768
 
 /* MMIO register window for one USB controller (covers SYSCFG0..PIPExCTR). */
 #define RZA1L_USB_MMIO_SIZE 0x200
@@ -82,6 +83,7 @@ struct RzA1lUsbState {
     char *audio_in;     /* from-host source: "tone[:freq]" or an input WAV path */
     char *audio_in_capture; /* optional WAV sink: frames the firmware consumed */
     bool audio_adaptive; /* from-host uses the adaptive alt setting (2), not implicit (1) */
+    bool audio_multitrack; /* firmware's multitrack configuration: 8ch 16-bit to host, 2ch 16-bit from host */
 
     /* ---- Peripheral-mode USB-audio (only used when audio == true) -------- */
 
