@@ -109,6 +109,7 @@ struct RzA1lUsbState {
     uint64_t tohost_empty_frames;  /* USB frames with nothing for the host, after that */
     QEMUTimer *sof_timer;   /* 1 ms Start-Of-Frame clock while streaming */
     bool     sof_running;
+    bool     streams_up;   /* the host has the audio streams selected */
 
     /* WAV sink for the to-host stream. */
     FILE    *wav;

@@ -709,7 +709,11 @@ static void rza1l_usb_fromhost_present(RzA1lUsbState *s)
     if (s->audio_in_kind == AUDIO_IN_NONE) {
         return;
     }
-    if (!(s->regs[USB_BRDYENB >> 1] & bit)) {
+    /* The pipe takes the host's packets while its PID is BUF, as on hardware -
+     * whether or not the firmware enables its BRDY interrupt (firmware that
+     * polls the pipe from a timer of its own doesn't) */
+    if ((s->regs[(USB_PIPE1CTR + 2 * (USB_PAUDIO_PIPE_FROM_HOST - 1)) >> 1] & USB_PID) !=
+        USB_PID_BUF) {
         return; /* firmware has not armed the from-host pipe */
     }
 
@@ -800,10 +804,14 @@ static void rza1l_usb_sof_tick(void *opaque)
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + NANOSECONDS_PER_SECOND / 1000);
 }
 
-/* Start/stop the SOF clock to track INTENB0.SOFE (set by startToHost()). */
+/* Run the SOF clock while the host has the audio streams selected - a real
+ * host sends a SOF every frame whether or not the device enables its SOF
+ * interrupt, and firmware that paces its pipes from a timer of its own never
+ * does - or while the firmware has INTENB0.SOFE set. */
 static void rza1l_usb_sof_update(RzA1lUsbState *s)
 {
-    bool want = s->audio && (s->regs[USB_INTENB0 >> 1] & USB_SOFE);
+    bool want = s->audio &&
+                (s->streams_up || (s->regs[USB_INTENB0 >> 1] & USB_SOFE));
 
     if (want && !s->sof_running) {
         s->sof_running = true;
@@ -1000,12 +1008,16 @@ static void rza1l_usb_peri_advance(RzA1lUsbState *s)
         } else {
             s->peri_step = PERI_STREAMING;
             USB_DBG("USB-audio enum: configured, streaming (from-host only)");
+            s->streams_up = true;
+            rza1l_usb_sof_update(s);
             return;
         }
         break;
     case PERI_SET_IFACE_IN:
         s->peri_step = PERI_STREAMING;
         USB_DBG("USB-audio enum: configured, streaming");
+        s->streams_up = true;
+        rza1l_usb_sof_update(s);
         return;
     default:
         return;
@@ -1911,6 +1923,7 @@ static void rza1l_usb_reset(DeviceState *dev)
 
     /* Peripheral-mode USB-audio state. */
     s->peri_step = PERI_IDLE;
+    s->streams_up = false;
     s->peri_kicked = false;
     s->peri_wait = 0;
     s->peri_ctrl_wait = false;
