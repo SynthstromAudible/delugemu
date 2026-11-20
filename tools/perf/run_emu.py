@@ -3,12 +3,16 @@
 
 The probe firmware loads and plays its song by itself, so no input is needed. Host audio is never connected.
 Writes <out>/plugin.log (SLICE/MARK/R/SCOPE lines), <out>/probe.bin (the probe's window ring) and <out>/run.log.
+With the tick probe (tools/perf/firmware/tick-probe.patch) it also writes <out>/renders.bin, its per-render ring
+(dzRenders, ~8 s of renders), and with --all-renders <out>/renders_all.bin, the same ring dumped every poll and merged
+so it covers the whole run (read either with tools/perf/ticks.py).
 
   tools/perf/run_emu.py --elf probe.elf --out runs/cpi145 --plugin timectl=1,cachesim=0,cpi=1.45 --lean
   tools/perf/run_emu.py --elf probe.elf --out runs/ic1 --icount 1 --plugin cachesim=0
 """
 import argparse
 import os
+import struct
 import sys
 import time
 
@@ -35,6 +39,10 @@ def main():
                          "<out>/plugin.log <elf>")
     ap.add_argument("--lean", action="store_true",
                     help="fast flat-CPI timing (timectl=1,cachesim=0 in --plugin): no per-render/per-function accounting")
+    ap.add_argument("--all-renders", action="store_true",
+                    help="tick probe: dump the per-render ring every poll (the VM is stopped for each dump, which "
+                         "time control and icount don't notice) and merge the dumps into <out>/renders_all.bin")
+    ap.add_argument("--poll", type=float, default=10, help="seconds between checks (and ring dumps)")
     args = ap.parse_args()
 
     a = dzprobe.probe_addresses(args.elf)
@@ -66,15 +74,64 @@ def main():
         m = text.find("MARK")
         return text[m:].count("SLICE") if m >= 0 else -1
 
+    dumps = []
+
+    def memsave(dz, addr, size, path):
+        dz.q.execute("memsave", val=addr, size=size, filename=os.path.abspath(path), **{"cpu-index": 0})
+
+    def dump_ring(dz):
+        path = os.path.join(args.out, "rings", "r%04d.bin" % len(dumps))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        dz.q.execute("stop")
+        try:
+            memsave(dz, a["renders"], a["renders_size"], path)
+        finally:
+            dz.q.execute("cont")
+        dumps.append(path)
+
     with DelugeSession.launch(firmware=args.elf, sd=args.sd, icount=args.icount, headless=True, audio="none",
                               sock=sock, run_log=os.path.join(args.out, "run.log"), boot_wait=5,
                               extra_qemu=extra) as dz:
         t0 = time.time()
         while slices_after_mark() < args.slices and time.time() - t0 < args.timeout:
-            time.sleep(10)
-        dz.q.execute("memsave", val=a["probe"], size=a["probe_size"],
-                     filename=os.path.abspath(os.path.join(args.out, "probe.bin")), **{"cpu-index": 0})
+            time.sleep(args.poll)
+            if args.all_renders and a["tick_probe"] and slices_after_mark() >= 0:
+                dump_ring(dz)
+        dz.q.execute("stop")
+        memsave(dz, a["probe"], a["probe_size"], os.path.join(args.out, "probe.bin"))
+        if a["tick_probe"]:
+            memsave(dz, a["renders"], a["renders_size"], os.path.join(args.out, "renders.bin"))
+            if args.all_renders:
+                dumps.append(os.path.join(args.out, "renders.bin"))
+                merge_rings(dumps, os.path.join(args.out, "renders_all.bin"))
         print("%s: %d slices after PLAY, %.0f s wall" % (args.out, slices_after_mark(), time.time() - t0))
+
+
+def merge_rings(paths, out):
+    """Merge dumps of the per-render ring into one ring, in the same format, holding every render they cover."""
+    entries = {}
+    esize = None
+    for p in paths:
+        raw = open(p, "rb").read()
+        magic, index, esize, n = struct.unpack_from("<IIII", raw)
+        if magic != dzprobe.RENDER_MAGIC:
+            continue
+        for k in range(max(0, index - n), index):
+            entries[k] = raw[16 + (k % n) * esize:16 + (k % n + 1) * esize]
+    if not entries:
+        return
+    lo, hi = min(entries), max(entries)
+    n = hi - lo + 1
+    missing = n - len(entries)
+    if missing:
+        print("merge_rings: %d renders missing (poll less often than the ring wraps, or use --poll)" % missing)
+    slots = [b"\0" * esize] * n
+    for k, e in entries.items():
+        slots[k % n] = e  # render k lives at slot k % n, as in the firmware's ring
+    with open(out, "wb") as f:
+        f.write(struct.pack("<IIII", dzprobe.RENDER_MAGIC, hi + 1, esize, n))
+        f.write(b"".join(slots))
+    print("merge_rings: renders %d..%d -> %s" % (lo, hi, out))
 
 
 if __name__ == "__main__":

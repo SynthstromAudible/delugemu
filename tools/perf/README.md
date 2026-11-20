@@ -12,6 +12,10 @@ roughly the speed a real Deluge would, so CPU-bound behaviour (voice culling) ca
 | `tools/perf/summarize.py` | Side-by-side table of runs and a hardware dump; per-function cost per active call. |
 | `tools/perf/cache_report.py` | Functions ranked by modelled cache stall, and which data the misses hit. |
 | `tools/perf/icache_replay.c` | Replays an instruction-fetch trace (`itrace=`) through L1I size/replacement/fetch-ahead variants. |
+| `tools/perf/firmware/tick-probe.patch` | The song-tick probe: a DelugeFirmware patch that records tick vs render cost, voice starts and culls (see below). |
+| `tools/perf/ticks.py` | Reads the tick probe's per-render ring: do culls line up with song ticks? |
+| `tools/perf/set_song.py` | Patches the song the probe autoplays (`dzSongPath`) in a probe ELF, without rebuilding. |
+| `tools/perf/gen_tickload.py` | Writes test songs that start many voices on every sequencer step, optionally with effects. |
 
 The firmware side is the DelugeFirmware branch `debug/pmu-render-probe`: a probe that records 100 ms windows of
 render timing, culls, A9 PMU counters (cycles, instructions, L1 refills, I/D-cache stall cycles), inclusive costs of
@@ -77,6 +81,56 @@ and voice count (2.1) match the hardware.
 
 The PL310 is r3p2, 128 KiB, 8-way, 32-byte lines, round-robin replacement, next-line I and D prefetch; its event
 counters read zero because AUX_CONTROL bit 20 (event monitor bus) is off and can only be set with L2 disabled.
+
+## Song-tick probe
+
+The render probe answers "how expensive is the render". The tick probe answers "how much does the song tick add on
+top, and is that what culls voices". Each song tick (`AudioEngine::tickSongFinalizeWindows()` ->
+`PlaybackHandler::actionTimerTick()` / `actionSwungTick()`) runs just before a render and starts that tick's notes,
+so a tick that starts many voices lands as a spike on one render.
+
+`tools/perf/firmware/tick-probe.patch` is one commit against DelugeFirmware main (680b93c). Everything is in
+`src/deluge/io/debug/dz_probe.{h,cpp}` behind `DZ_PROBE`, plus small hooks; it is not for merging.
+
+```sh
+cd DelugeFirmware && git checkout -b perf/tick-probe 680b93c && git am <delugemu>/tools/perf/firmware/tick-probe.patch
+./dbt build release            # or cherry-pick the commit onto the branch you want to measure
+```
+
+It keeps the render probe's ring (`dzProbe`, so `run_emu.py` and `summarize.py` work unchanged) and adds:
+
+- per-window tick fields (`dzprobe.TICK_FIELDS`): ticks, tick cycles, render cycles of renders with and without a
+  tick, voices started in the tick / from pending / refused by `allowedToStartVoice()`, culls split into kill /
+  terminate / force-release and hard / soft events, culls by renders since the last tick, direness, margin, and
+  `songTickCost`;
+- `dzRenders`, a ring of the last 16,384 renders (about 8 s): tick and render cycles, buffer space, samples, voices
+  started, culls, voices, direness and predicted margin for each render;
+- DzScope on six tick-path functions instead of the DSP ones: `actionSwungTick`, `InstrumentClip::processCurrentPos`,
+  `NoteRow::processCurrentPos`, `Sound::noteOnPostArpeggiator`, `Voice::noteOn` and the pending-note start;
+- autoplay: once the card is ready it loads the alphabetically first `/SONGS/*.XML` whose name contains `dzSongPath`
+  (default `TICKLOAD`), then presses play.
+
+```sh
+tools/perf/gen_tickload.py --stage-all sdcard/SONGS    # or pick variants; see its --help
+scripts/mksd.sh sdcard build/deluge_sd_tick.img
+tools/perf/set_song.py probe.elf TICKLOAD_N30          # optional: pick another song
+tools/perf/run_emu.py --elf $PWD/probe.elf --sd build/deluge_sd_tick.img --out runs/n30 \
+    --plugin timectl=1,cachesim=0,cpi=1.45 --lean --all-renders
+tools/perf/summarize.py runs/n30 --skip 5              # adds a song-tick table
+tools/perf/ticks.py runs/n30/renders_all.bin --list 10 # culls by renders since the last tick, renders around culls
+```
+
+`--all-renders` dumps the per-render ring at every poll and merges the dumps, so `renders_all.bin` covers the whole
+run instead of the last 8 s. In lean mode the guest clock advances every few thousand instructions, so a single
+short interval (one note-on) reads quantised to ~10 us; use sums and averages, or full mode, for those.
+
+### Test songs
+
+`gen_tickload.py` writes songs that start N voices together on every 16th step (default 20: 5 synth clips x 4-note
+chords, 120 BPM, one-bar loop), with notes one step long and no release, so the voice count stays near N and the
+load comes in spikes at each step. Sounds are subtractive synths, so nothing streams from the card. Options vary the
+voice count, clips, chord size, unison, a kit of synth drum rows, and effects. Every name contains `TICKLOAD`, and each
+variant's suffix is unique, so `set_song.py` can select it.
 
 ## Caveats
 
