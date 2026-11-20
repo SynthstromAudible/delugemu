@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Do culls line up with song ticks? Reads the tick probe's per-render ring (renders.bin, a dump of dzRenders).
 
   ticks.py runs/base/renders.bin [--list 40]

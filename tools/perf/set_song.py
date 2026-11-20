@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Patch dzSongPath (the file-name substring of the song the probe autoplays) in a probe ELF, in place.
 
   set_song.py probe.elf KIT20
