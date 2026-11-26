@@ -78,6 +78,46 @@ and voice count (2.1) match the hardware.
 The PL310 is r3p2, 128 KiB, 8-way, 32-byte lines, round-robin replacement, next-line I and D prefetch; its event
 counters read zero because AUX_CONTROL bit 20 (event monitor bus) is off and can only be set with L2 disabled.
 
+### Data-miss cost by memory (November 2026)
+
+The defaults charge every modelled L1D miss the same `pd=25.6`, so where data lives doesn't matter to the model. On
+the hardware it does. Measured on a Deluge (J-Link, probe build with boot micro-benchmarks and a placement switch that
+fills internal RAM at boot so a song's objects go to SDRAM; harness in `build/perf/hwsd/`):
+
+| load-to-use, 400 MHz cycles | internal SRAM | SDRAM, L2-cached heap | SDRAM, stealable (no L2) |
+| --------------------------- | ------------- | --------------------- | ------------------------ |
+| L1 hit (16 KiB set) | 4 | 4 | 4 |
+| dependent chase, 64 KiB set | 26 | 48 | 180 |
+| dependent chase, 1 MiB set | 29 | 296 | 218 |
+| sequential, one read per 32-byte line | 10 | 155 | 238 |
+| sequential, one store per line | 18 | 276 | 330 |
+
+During playback (SD and audio DMA running) an SDRAM chase is unchanged at the median, about 1.6x at the worst.
+
+Placement A/Bs (same song, normal vs internal RAM filled at boot, 2 runs each, very repeatable): MYAD2 voices 8.9 ->
+7.4, data stalls 13.8% -> 15.6% of render cycles; Wake Up 2 voices 12.9 -> 10.9 and hard culls 1.3 -> 6.0 per 5 s,
+stalls 16.5% -> 21.6%; Glitchy_2 (sample-heavy) stalls 22.5% -> 24.1%. Fitting the hardware's data-stall cycles per L1D
+refill against the model's render L1D misses by memory (`HEATR` lines) over all six runs gives, per L1D miss:
+internal SRAM 17.9, L2-cacheable SDRAM 46.2, stealable SDRAM (sample data, bypasses L2) 202.3 - every run within ~1
+cycle. Real code overlaps SDRAM misses, so the heap figure is far below a dependent chase; sample reads don't overlap.
+
+The plugin takes these as `pdrs`/`pdrd`/`pdrn` (cost per L1D miss by memory, whatever L2 does; they replace `pd`), with
+`cpi` retuned to 1.278 so render cycles per instruction match the hardware at normal placement:
+`timectl=1,pfstreams=4,pfdist=4,l2pf=1,cpi=1.278,pdrs=17.9,pdrd=46.2,pdrn=202.3`.
+
+| render cycles/instruction | hardware | calibrated | defaults |
+| ------------------------- | -------- | ---------- | -------- |
+| MYAD2 normal -> in SDRAM | 1.696 -> 1.738 | 1.721 -> 1.763 | 1.738 -> 1.726 |
+| Wake Up 2 normal -> in SDRAM | 1.660 -> 1.791 | 1.647 -> 1.744 | 1.709 -> 1.704 |
+| Glitchy_2 normal -> in SDRAM | 1.865 -> 1.913 | 1.837 -> 1.886 | 1.673 -> 1.669 |
+
+Still off, in both settings: the emulator keeps 15-30% more voices than the hardware at about the same render
+instructions per frame, and so under-reacts in voices and hard culls (Wake Up 2 in SDRAM: hard culls 0.8 -> 1.6 per
+5 s vs the hardware's 1.3 -> 6.0). Likely time the hardware spends outside the render that isn't modelled (USB and SD
+interrupt work). `pdl2`/`pdsram`/`pdsdram` (L2-outcome tiers) are an earlier guess and under-penalise SDRAM; prefer the
+region costs. The PL310 event counters still read zero (the loader enables L2 before the firmware sets AUX_CONTROL
+bit 20).
+
 ## Caveats
 
 - Time control freezes the guest clock while the vCPU is halted (WFE/WFI). The C firmware busy-waits, so that's fine;
