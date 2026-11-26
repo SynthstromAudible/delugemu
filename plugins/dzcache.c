@@ -8,11 +8,12 @@
  * applied: CP15 c7 by MVA and set/way (L1) and the PL310 maintenance, enable and lockdown registers (L2). DMA is
  * invisible to plugins, but the firmware invalidates around every DMA read.
  *
- * Time model (timectl=1, without -icount; needs qemu-patches/0007). The guest clock follows modelled CPU cycles at
- * hz rather than the host clock: cycles = cpi * instructions + pi * L1I misses + pd * L1D misses (cachesim=1), or
+ * Time model (timectl=1, without -icount; needs qemu-patches/0007). The guest clock follows modelled CPU cycles at hz
+ * rather than the host clock: cycles = cpi * instructions + pi * L1I misses + a cost per L1D miss (cachesim=1), or
  * cpi * instructions (cachesim=0, much faster). A flat cpi=1.45 reproduces a Deluge playing a CPU-bound song (render
- * load, culling, voices); see tools/perf/README.md. The clock is frozen while the vCPU is halted (WFE/WFI), so
- * firmware that idles in WFE (the Rust/Embassy BSP) needs -icount instead.
+ * load, culling, voices); see tools/perf/README.md. The L1D miss cost (pdrs/pdrd/pdrn) depends on where the line lives
+ * (internal SRAM, L2-cacheable SDRAM, SDRAM that bypasses L2), fitted to hardware placement A/Bs. The clock is frozen
+ * while the vCPU is halted (WFE/WFI), so firmware that idles in WFE (the Rust/Embassy BSP) needs -icount instead.
  *
  * Reports. SLICE lines every `slice` instructions (counts, render instructions/frames, cycles); a MARK line whenever
  * `mark` executes; an R line per call of `render` (the audio routine) with frames from `timer`
@@ -22,6 +23,7 @@
  * Args: ttb l2c mark slice phasea render timer|head fn0..fn3=lo-hi s0..s5 warm itrace itskip itlen
  *       l1size l1assoc l2size l2assoc line l1repl l2repl (0 LRU, 1 random, 2 round-robin)
  *       pfstreams pfdist l2pf timectl lean cachesim cpi pi pd pdev pnc hz quantum
+ *       pdrs pdrd pdrn (L1D miss cost by memory, the default) pdl2 pdsram pdsdram (by L2 outcome)
  * Build: scripts/build-plugins.sh
  */
 #include <glib.h>
@@ -225,6 +227,7 @@ typedef struct {
 
 /* Data misses by 64 KiB block of address space, after the mark. */
 static uint64_t heat_l1d[65536], heat_l2[65536];
+static uint64_t heat_l1d_render[65536]; /* L1D misses during renders only (render= set), by 64 KiB block */
 
 typedef struct {
     uint32_t vaddr;
@@ -274,19 +277,28 @@ static Cache *l1i, *l1d, *l2;
 
 /*
  * Time control (timectl=1, run without -icount): the guest clock follows modelled CPU cycles,
- *   cycles = cpi0 * instructions + pi * L1I misses + pd * L1D demand misses
- * at hz, rather than the host's clock. Defaults are fitted to a Deluge (RZ/A1L, 400 MHz) render: 1.37 cycles per
- * instruction overall, 3.9% of cycles stalled on the I-cache and 11.6% on the D-cache.
+ *   cycles = cpi0 * instructions + pi * L1I misses + (L1D demand misses, each costing pdrs/pdrd/pdrn by memory)
+ * at hz, rather than the host's clock. Defaults are fitted to a Deluge (RZ/A1L, 400 MHz) render: first (October 2026)
+ * to 1.37 cycles per instruction overall, 3.9% of cycles stalled on the I-cache and 11.6% on the D-cache, then the
+ * data-miss costs and cpi to placement A/Bs (November 2026; tools/perf/README.md).
  */
 static bool timectl;
 static const void *time_handle;
 /*
- * Defaults fitted to a Deluge: pi/pd from the PMU's I/D-cache stall cycles per render instruction divided by the
- * model's demand misses (not the PMU refill counts, which include fetch-ahead), pdev a typical strongly-ordered
- * access, and cpi the base that makes the emulator cull like the hardware on a CPU-bound song.
+ * Defaults fitted to a Deluge: pi from the PMU's I-cache stall cycles per render instruction divided by the model's
+ * demand misses (not the PMU refill counts, which include fetch-ahead), pdev a typical strongly-ordered access, the
+ * data-miss costs by memory (pdrs/pdrd/pdrn below) from data-stall cycles in hardware placement A/Bs, and cpi the base
+ * that makes render cycles per instruction match the hardware. pd is the earlier flat data-miss cost (with cpi=1.30).
  */
-static double cpi0 = 1.30, pen_i = 9.0, pen_d = 25.6, hz = 400e6;
+static double cpi0 = 1.278, pen_i = 9.0, pen_d = 25.6, hz = 400e6;
 static double pen_dev = 60.0, pen_nc = 0.0; /* per strongly-ordered/device access, per Normal uncached access */
+/* Tiered data-miss cost (only when pdl2 is given, which turns the region costs off): every L1D miss pays pen_l2hit,
+ * and one that also misses L2 (or bypasses it) pays pen_sram or pen_sdram on top, by where the line lives. */
+static double pen_l2hit = 0.0, pen_sram = 0.0, pen_sdram = 0.0;
+/* Region data-miss cost, the default: a fixed cost per L1D miss by where the line lives, whatever L2 does - internal
+ * SRAM, L2-cacheable SDRAM, and SDRAM that bypasses L2 (the stealable/sample region). Fitted to hardware data-stall
+ * counts from placement A/Bs (tools/perf/README.md). Giving pd (or pdrs=0) selects the flat pd cost instead. */
+static double pen_r_sram = 17.9, pen_r_sdram = 46.2, pen_r_sdram_nol2 = 202.3;
 static double cycles, cycles_at_update;
 static double quantum = 4000; /* cycles between clock updates (10 us at 400 MHz) */
 static bool cachesim = true;
@@ -406,7 +418,7 @@ static int cur_range = -1;
 static int l2pf;
 static void l2_fill(uint32_t addr, Attr a);
 
-static void to_l2(uint32_t addr, bool write, Attr a, InsnStats *st, int ph)
+static int to_l2(uint32_t addr, bool write, Attr a, InsnStats *st, int ph)
 {
     uint32_t ev;
 
@@ -424,13 +436,15 @@ static void to_l2(uint32_t addr, bool write, Attr a, InsnStats *st, int ph)
         if (in_render && cur_range >= 0) {
             fn_l2[cur_range]++;
         }
-        return;
+        return 0;
     }
     tot.l2_acc++;
+    int l2hit = 1;
     if (!(cache_access(l2, addr, write, !write || a.outer_wa, &ev) & 1)) {
         if (l2pf && !write) {
             l2_fill(addr + (1u << l2->line_bits), a);
         }
+        l2hit = 0;
         tot.l2_miss++;
         if (st) {
             st->l2_miss[ph]++;
@@ -445,6 +459,7 @@ static void to_l2(uint32_t addr, bool write, Attr a, InsnStats *st, int ph)
             fn_l2[cur_range]++;
         }
     }
+    return l2hit;
 }
 
 /* ---- prefetch ---- */
@@ -769,15 +784,32 @@ static void vcpu_mem(unsigned int cpu, qemu_plugin_meminfo_t info, uint64_t vadd
                 tot.l1d_rd_miss++;
             }
             in->st->l1d_miss[ph]++;
-            cycles += pen_d;
+            if (pen_r_sram > 0) {
+                bool sd = addr >= 0x08000000 && addr < 0x10000000;
+                cycles += !sd ? pen_r_sram : (a.outer && l2_enabled) ? pen_r_sdram : pen_r_sdram_nol2;
+            } else if (pen_l2hit <= 0) {
+                cycles += pen_d;
+            }
             if (ph) {
                 heat_l1d[addr >> 16]++;
+                if (in_render) {
+                    heat_l1d_render[addr >> 16]++;
+                }
             }
             l1d_miss_train(addr);
             if (in_render && in->range >= 0) {
                 fn_l1d[in->range]++;
             }
-            to_l2(addr, write, a, in->st, ph);
+            if (pen_r_sram > 0) {
+                to_l2(addr, write, a, in->st, ph);
+            } else if (pen_l2hit > 0) {
+                cycles += pen_l2hit;
+                if (!to_l2(addr, write, a, in->st, ph)) {
+                    cycles += (addr >= 0x08000000 && addr < 0x10000000) ? pen_sdram : pen_sram;
+                }
+            } else {
+                to_l2(addr, write, a, in->st, ph);
+            }
         }
         if (r & 2) {
             tot.l1d_wb++;
@@ -1067,6 +1099,10 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
                                                     b << 16, heat_l1d[b], heat_l2[b]);
             qemu_plugin_outs(line);
         }
+        if (heat_l1d_render[b]) {
+            g_autofree char *rline = g_strdup_printf("HEATR 0x%08x l1d=%" PRIu64 "\n", b << 16, heat_l1d_render[b]);
+            qemu_plugin_outs(rline);
+        }
     }
     g_ptr_array_free(all, TRUE);
 }
@@ -1102,9 +1138,15 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
         else if (!strcmp(t[0], "cachesim")) cachesim = v;
         else if (!strcmp(t[0], "cpi")) cpi0 = g_ascii_strtod(t[1], NULL);
         else if (!strcmp(t[0], "pi")) pen_i = g_ascii_strtod(t[1], NULL);
-        else if (!strcmp(t[0], "pd")) pen_d = g_ascii_strtod(t[1], NULL);
+        else if (!strcmp(t[0], "pd")) { pen_d = g_ascii_strtod(t[1], NULL); pen_r_sram = 0; }
         else if (!strcmp(t[0], "pdev")) pen_dev = g_ascii_strtod(t[1], NULL);
         else if (!strcmp(t[0], "pnc")) pen_nc = g_ascii_strtod(t[1], NULL);
+        else if (!strcmp(t[0], "pdl2")) { pen_l2hit = g_ascii_strtod(t[1], NULL); pen_r_sram = 0; }
+        else if (!strcmp(t[0], "pdrs")) pen_r_sram = g_ascii_strtod(t[1], NULL);
+        else if (!strcmp(t[0], "pdrd")) pen_r_sdram = g_ascii_strtod(t[1], NULL);
+        else if (!strcmp(t[0], "pdrn")) pen_r_sdram_nol2 = g_ascii_strtod(t[1], NULL);
+        else if (!strcmp(t[0], "pdsram")) pen_sram = g_ascii_strtod(t[1], NULL);
+        else if (!strcmp(t[0], "pdsdram")) pen_sdram = g_ascii_strtod(t[1], NULL);
         else if (!strcmp(t[0], "hz")) hz = g_ascii_strtod(t[1], NULL);
         else if (!strcmp(t[0], "quantum")) quantum = v;
         else if (!strcmp(t[0], "l1repl")) l1repl = v;
