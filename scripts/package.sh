@@ -421,7 +421,7 @@ package_linux() {
 
 package_windows() {
     command -v ldd >/dev/null 2>&1 || die "ldd not found (run inside MSYS2)."
-    local mingw="${MINGW_PREFIX:-/mingw64}"
+    local mingw="${MINGW_PREFIX:-/ucrt64}"
 
     local name="DelugEmu-windows-${ARCH}"
     local stage="${OUT_DIR}/${name}"

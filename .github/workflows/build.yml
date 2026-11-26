@@ -171,7 +171,7 @@ jobs:
 
   # Windows build runs under MSYS2/MinGW -- the same toolchain QEMU itself uses
   # for its official Windows binaries. The Bash build scripts run unmodified in
-  # the MINGW64 shell (see docs/windows.md).
+  # the UCRT64 shell (see docs/windows.md).
   build-windows:
     name: Build + tests (Windows/MSYS2, latest firmware)
     runs-on: windows-latest
@@ -184,28 +184,28 @@ jobs:
         with:
           submodules: false
 
-      - name: Set up MSYS2 (MINGW64) with build dependencies
+      - name: Set up MSYS2 (UCRT64) with build dependencies
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
           install: >-
             base-devel
             git
             ninja
-            mingw-w64-x86_64-toolchain
-            mingw-w64-x86_64-meson
-            mingw-w64-x86_64-python
-            mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-glib2
-            mingw-w64-x86_64-pixman
-            mingw-w64-x86_64-gtk3
-            mingw-w64-x86_64-SDL2
-            mingw-w64-x86_64-libpng
-            mingw-w64-x86_64-zstd
-            mingw-w64-x86_64-ccache
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-meson
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-glib2
+            mingw-w64-ucrt-x86_64-pixman
+            mingw-w64-ucrt-x86_64-gtk3
+            mingw-w64-ucrt-x86_64-SDL2
+            mingw-w64-ucrt-x86_64-libpng
+            mingw-w64-ucrt-x86_64-zstd
+            mingw-w64-ucrt-x86_64-ccache
             dosfstools
-            mingw-w64-x86_64-mtools
+            mingw-w64-ucrt-x86_64-mtools
 
       # Reuse the emulator when nothing that feeds its build has changed: the
       # pinned QEMU commit, our device models, patches and build scripts, and
@@ -223,10 +223,10 @@ jobs:
           mkdir -p build
           {
             git rev-parse HEAD:qemu
-            pacman -Q mingw-w64-x86_64-gcc mingw-w64-x86_64-meson mingw-w64-x86_64-python \
-              mingw-w64-x86_64-pkgconf mingw-w64-x86_64-glib2 mingw-w64-x86_64-pixman \
-              mingw-w64-x86_64-gtk3 mingw-w64-x86_64-SDL2 mingw-w64-x86_64-libpng \
-              mingw-w64-x86_64-zstd mingw-w64-x86_64-ccache ninja
+            pacman -Q mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-meson mingw-w64-ucrt-x86_64-python \
+              mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-glib2 mingw-w64-ucrt-x86_64-pixman \
+              mingw-w64-ucrt-x86_64-gtk3 mingw-w64-ucrt-x86_64-SDL2 mingw-w64-ucrt-x86_64-libpng \
+              mingw-w64-ucrt-x86_64-zstd mingw-w64-ucrt-x86_64-ccache ninja
           } > build/qemu-build-inputs.txt
           cat build/qemu-build-inputs.txt
           deps="$(git hash-object build/qemu-build-inputs.txt | cut -c1-16)"
@@ -430,28 +430,28 @@ jobs:
         with:
           submodules: false
 
-      - name: Set up MSYS2 (MINGW64) with build dependencies
+      - name: Set up MSYS2 (UCRT64) with build dependencies
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
           install: >-
             base-devel
             git
             ninja
             zip
-            mingw-w64-x86_64-toolchain
-            mingw-w64-x86_64-meson
-            mingw-w64-x86_64-python
-            mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-glib2
-            mingw-w64-x86_64-pixman
-            mingw-w64-x86_64-gtk3
-            mingw-w64-x86_64-SDL2
-            mingw-w64-x86_64-libpng
-            mingw-w64-x86_64-zstd
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-meson
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-glib2
+            mingw-w64-ucrt-x86_64-pixman
+            mingw-w64-ucrt-x86_64-gtk3
+            mingw-w64-ucrt-x86_64-SDL2
+            mingw-w64-ucrt-x86_64-libpng
+            mingw-w64-ucrt-x86_64-zstd
             dosfstools
-            mingw-w64-x86_64-mtools
+            mingw-w64-ucrt-x86_64-mtools
 
       - name: Bootstrap QEMU submodule
         run: ./scripts/bootstrap.sh

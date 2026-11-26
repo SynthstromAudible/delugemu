@@ -44,6 +44,15 @@ late clusters, PMU counters, per-function costs (`DzScope` on six functions) and
   `DBT_NO_SYNC=1 DBT_TOOLCHAIN_PATH=<main checkout> ./dbt build release`
 - **Copy the ELF** somewhere stable (e.g. `build/perf/elf/<name>.elf`). Rebuilding overwrites `build/Release`.
 
+### Measuring the song tick
+
+To see what the song tick adds on top of the render (voices started on a beat, culls that follow ticks), build the
+**tick probe** instead: `tools/perf/firmware/tick-probe.patch` (one commit on DelugeFirmware main; `git am` it or
+cherry-pick it onto the branch under test). It autoplays the first `/SONGS/*.XML` containing `dzSongPath` (default
+`TICKLOAD`; change it in a built ELF with `tools/perf/set_song.py`). Make test songs with `tools/perf/gen_tickload.py`.
+Run with `--all-renders`, then read `summarize.py` (song-tick table) and `tools/perf/ticks.py <run>/renders_all.bin`.
+See tools/perf/README.md, "Song-tick probe".
+
 ## 3. Pick a mode and run
 
 | Mode | Command flags | Wall time per ~80 s of song | Use for |
