@@ -3,6 +3,10 @@
 
   tools/perf/summarize.py runs/cpi145 runs/cache --hw hw.bin --hw-play 136
 
+With the tick probe (tools/perf/firmware/tick-probe.patch) it takes "playing" windows from the probe's own count
+(rather than "audio clip voices > 0", which is never true for a synth-only song), averages voices over renders, and
+adds a song-tick table: tick cost, voice starts, culls by renders since the last tick.
+
 Skips the first --skip seconds after PLAY. Emulator time comes from the plugin's modelled cycles (time control) or
 from instructions at --ips (icount runs); hardware time from the probe's 100 ms windows.
 """
@@ -36,13 +40,16 @@ def emu_run(path, skip, ips, warm=5_000_000_000):
              l1i=1000 * sum(s["l1i_miss"] for s in slices) / ins,
              l1d=1000 * sum(s["l1d_rd_miss"] + s["l1d_wr_miss"] for s in slices) / ins)
     # Culls, voices and load from the probe ring: windows while playing, after the skip
-    w = [x for x in dzprobe.load_windows(os.path.join(path, "probe.bin")) if x.get("audioVoices")]
+    w = playing_windows(dzprobe.load_windows(os.path.join(path, "probe.bin")))
     w = w[int(skip * 10):]
+    if not w:
+        raise ValueError("%s: no windows while playing after the skip" % path)
+    r["w"] = w
     if not rfr:  # lean run: no per-render accounting, so frames from the probe and instructions per frame overall
         r["frames_s"] = sum(x["frames"] for x in w) / (len(w) * 0.1)
         r["ins_frame"] = float("nan")
     r["culls"] = 50 * sum(x["culls"] for x in w) / len(w)
-    r["voices"] = sum(x["voices"] for x in w) / len(w)
+    r["voices"] = voices(w)
     r["load"] = 100 * sum(x["sum_cyc"] for x in w) / (len(w) * 0.1 * 1e9)  # QEMU's PMU cycle counter runs at 1 GHz
     # SCOPE totals cover calls from `warm` instructions after PLAY; take frames and renders over the same span
     r["scopes"] = {int(i): (int(c), int(n)) for i, c, n in re.findall(r"SCOPE (\d) calls=(\d+) ins=(\d+)", text)}
@@ -62,11 +69,75 @@ def hw_run(path, play, skip):
     fr = S("frames")
     r = dict(name="hardware", frames_s=fr / (len(w) * 0.1), ins_frame=S("sum_ins") / fr,
              l1i=1000 * S("sum_l1i") / S("sum_ins"), l1d=1000 * S("sum_l1d") / S("sum_ins"),
-             culls=50 * S("culls") / len(w), voices=S("voices") / len(w),
+             culls=50 * S("culls") / len(w), voices=voices(w), w=w,
              load=100 * S("sum_cyc") / (len(w) * 0.1 * 400e6), fpr=fr / S("renders"))
     r["scopes"] = {i: (S("scopeCalls%d" % i), S("scopeIns%d" % i)) for i in range(6) if "scopeCalls%d" % i in w[0]}
     r["scope_frames"], r["scope_renders"] = fr, S("renders")
     return r
+
+
+def playing_windows(ws):
+    """Windows while the song was playing: the tick probe counts renders while playing; older probes are taken as
+    playing while there are audio clip voices."""
+    if ws and "playing" in ws[0]:
+        return [x for x in ws if x["playing"]]
+    return [x for x in ws if x.get("audioVoices")]
+
+
+def voices(w):
+    if w and "voiceSum" in w[0]:
+        return sum(x["voiceSum"] for x in w) / max(1, sum(x["renders"] for x in w))
+    return sum(x["voices"] for x in w) / len(w)
+
+
+def tick_table(rows):
+    """Song-tick costs, voice starts and culls from the tick probe's TICK_FIELDS."""
+    rows = [r for r in rows if r.get("w") and "ticks" in r["w"][0]]
+    if not rows:
+        return
+    lines = []
+
+    def row(label, f):
+        lines.append("  %-34s %s" % (label, " ".join("%16s" % f(r) for r in rows)))
+
+    def S(r, k):
+        return sum(x[k] for x in r["w"])
+
+    def secs(r):
+        return len(r["w"]) * 0.1
+
+    def per(a, b):
+        return a / b if b else float("nan")
+
+    row("", lambda r: r["name"])
+    row("ticks/s", lambda r: "%.1f" % (S(r, "ticks") / secs(r)))
+    row("renders with a tick %", lambda r: "%.1f" % (100 * per(S(r, "tickRenders"), S(r, "renders"))))
+    row("tick share of render cycles %", lambda r: "%.1f" % (100 * per(S(r, "sum_tickCyc"), S(r, "sum_cyc"))))
+    row("tick cycles per tick render (avg)", lambda r: "%.0f" % per(S(r, "sum_tickCyc"), S(r, "tickRenders")))
+    row("tick cycles, max in a render", lambda r: "%d" % max(x["max_tickCyc"] for x in r["w"]))
+    row("render cyc/render, tick renders", lambda r: "%.0f" % per(S(r, "sum_renderCycTick"), S(r, "tickRenders")))
+    row("render cyc/render, other renders",
+        lambda r: "%.0f" % per(S(r, "sum_renderCycNoTick"), S(r, "renders") - S(r, "tickRenders")))
+    row("voices started in tick /s", lambda r: "%.1f" % (S(r, "startedTick") / secs(r)))
+    row("voices started from pending /s", lambda r: "%.1f" % (S(r, "startedPending") / secs(r)))
+    row("voices started otherwise /s", lambda r: "%.1f" % (S(r, "startedOther") / secs(r)))
+    row("starts refused in tick /s", lambda r: "%.1f" % (S(r, "refusedTick") / secs(r)))
+    row("max pending (estimate)", lambda r: "%d" % max(x["maxPending"] for x in r["w"]))
+    row("culls kill/term/force per 5 s", lambda r: "%.1f/%.1f/%.1f" % tuple(
+        50 * S(r, k) / len(r["w"]) for k in ("cullKill", "cullTerminate", "cullForceRelease")))
+    row("cull events hard/soft/min per 5 s", lambda r: "%.1f/%.1f/%.1f" % tuple(
+        50 * S(r, k) / len(r["w"]) for k in ("cullEventsHard", "cullEventsSoft", "cullEventsUnderMin")))
+    lines.append("  culls per 1000 renders, by renders since the last tick render (0 = the tick render itself):")
+    for b in dzprobe._BUCKETS:
+        row("    %s" % b, lambda r, b=b: "%.2f (%.0f%%)" % (
+            1000 * per(S(r, "cullsAt" + b), S(r, "rendersAt" + b)),
+            (100 * per(S(r, "cullsAt" + b), sum(S(r, "cullsAt" + c) for c in dzprobe._BUCKETS)))))
+    lines.append("  firmware DzScope, calls/s and inclusive cycles per call:")
+    for i, n in enumerate(dzprobe.scope_names(rows[0]["w"])):
+        row("    " + n[:30], lambda r, i=i: "%.0f/s %.0f" % (
+            S(r, "scopeCalls%d" % i) / secs(r), per(S(r, "scopeCyc%d" % i), S(r, "scopeCalls%d" % i))))
+    print("\nsong tick (cycles are PMU cycles: QEMU 1 GHz, hardware 400 MHz):")
+    print("\n".join(lines))
 
 
 def main():
@@ -89,8 +160,10 @@ def main():
             r["name"], r["frames_s"], r["ins_frame"], r["load"], r["culls"], r["voices"], r["l1i"], r["l1d"], r["fpr"]))
     print("\ninstructions per frame per call, (calls per render):")
     print("  %-38s" % "", " ".join("%16s" % r["name"] for r in rows))
-    for i, n in enumerate(dzprobe.SCOPE_NAMES):
+    names = dzprobe.scope_names(rows[0].get("w")) if rows else dzprobe.SCOPE_NAMES
+    for i, n in enumerate(names):
         print("  %-38s" % n, " ".join(_scope_cell(r, i) for r in rows))
+    tick_table(rows)
 
 
 def _scope_cell(r, i):

@@ -58,13 +58,13 @@ The rest of this document covers building from source under MSYS2.
 ## 1. Install MSYS2
 
 Download and run the installer from <https://www.msys2.org/> and follow its
-first-run update steps. Then open the **"MSYS2 MINGW64"** shell (not the plain
-"MSYS2 MSYS" shell — the MinGW64 environment is the one that produces native
+first-run update steps. Then open the **"MSYS2 UCRT64"** shell (not the plain
+"MSYS2 MSYS" shell — the UCRT64 environment is the one that produces native
 Windows binaries).
 
 ## 2. Install the toolchain and dependencies
 
-In the MINGW64 shell:
+In the UCRT64 shell:
 
 ```sh
 pacman -Syu        # update; may ask you to close and reopen the shell, then:
@@ -73,18 +73,18 @@ pacman -Su
 # Build toolchain + QEMU's build dependencies
 pacman -S --needed \
     base-devel git python ninja \
-    mingw-w64-x86_64-toolchain \
-    mingw-w64-x86_64-meson \
-    mingw-w64-x86_64-pkgconf \
-    mingw-w64-x86_64-glib2 \
-    mingw-w64-x86_64-pixman \
-    mingw-w64-x86_64-gtk3 \
-    mingw-w64-x86_64-SDL2 \
-    mingw-w64-x86_64-libpng \
-    mingw-w64-x86_64-zstd
+    mingw-w64-ucrt-x86_64-toolchain \
+    mingw-w64-ucrt-x86_64-meson \
+    mingw-w64-ucrt-x86_64-pkgconf \
+    mingw-w64-ucrt-x86_64-glib2 \
+    mingw-w64-ucrt-x86_64-pixman \
+    mingw-w64-ucrt-x86_64-gtk3 \
+    mingw-w64-ucrt-x86_64-SDL2 \
+    mingw-w64-ucrt-x86_64-libpng \
+    mingw-w64-ucrt-x86_64-zstd
 
 # Optional: needed only for folder-backed SD cards (--sd <dir>) and write-back
-pacman -S --needed dosfstools mingw-w64-x86_64-mtools
+pacman -S --needed dosfstools mingw-w64-ucrt-x86_64-mtools
 ```
 
 `gtk3` / `SDL2` provide the front-panel skin window, `glib2` and `pixman` are
@@ -114,7 +114,7 @@ This is optional. If you only want to build and run, you can skip it.
 
 ## 4. Build
 
-From the repository root in the MINGW64 shell:
+From the repository root in the UCRT64 shell:
 
 ```sh
 ./scripts/bootstrap.sh     # one-time: fetch the QEMU submodule (large)
@@ -208,12 +208,12 @@ turnkey Windows MIDI bridge is not yet provided; contributions welcome.
 ## Troubleshooting
 
 - **`configure` cannot find a dependency** — re-check the `pacman -S` list
-  above; the `mingw-w64-x86_64-*` packages must be installed from the
-  **MINGW64** shell, not the MSYS shell.
-- **No GUI window appears** — ensure `mingw-w64-x86_64-gtk3` (and/or `SDL2`) is
+  above; the `mingw-w64-ucrt-x86_64-*` packages must be installed from the
+  **UCRT64** shell, not the MSYS shell.
+- **No GUI window appears** — ensure `mingw-w64-ucrt-x86_64-gtk3` (and/or `SDL2`) is
   installed; without a display backend QEMU has no window to open.
 - **`mcopy` / `mkfs.fat` not found** when using `--sd <folder>` — install
-  `mingw-w64-x86_64-mtools` and `dosfstools` (see step 2). A raw `.img` passed
+  `mingw-w64-ucrt-x86_64-mtools` and `dosfstools` (see step 2). A raw `.img` passed
   to `--sd` does not need these.
 - **Edits to `src/` are ignored after a rebuild** — symlinks fell back to
   copies; either re-run `./scripts/integrate.sh`, or enable real symlinks
