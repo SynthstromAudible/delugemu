@@ -293,6 +293,12 @@ bool rza1l_dmac_get_rx_audio_crda(RzA1lDmacState *s, int ch, uint32_t *crda);
 bool rza1l_dmac_peripheral_rx_push(RzA1lDmacState *s, int ch, uint8_t byte);
 
 /*
+ * Whether channel ch's DMARS selects a SCIF's receive request: only then does
+ * the SCIF's receive data go to the DMAC rather than raising RXI.
+ */
+bool rza1l_dmac_selects_scif_rx(RzA1lDmacState *s, int ch);
+
+/*
  * Register the MIDI receive timing-capture channel. timing_ch is slaved to the
  * receive-ring channel rx_ch: each byte pushed into rx_ch's ring also snapshots
  * audio source channel src_ch's current source address (CRSA) into timing_ch's

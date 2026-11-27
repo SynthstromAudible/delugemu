@@ -1008,6 +1008,12 @@ static void rza1l_dmac_timing_capture(RzA1lDmacState *s, int timing_ch,
         ((t->timing_cursor - t->timing_base + 4) % t->timing_size);
 }
 
+bool rza1l_dmac_selects_scif_rx(RzA1lDmacState *s, int ch)
+{
+    return ch >= 0 && ch < RZA1L_DMAC_NUM_CH &&
+           rza1l_dmac_dmars_is_scif_rx(s->ch[ch].dmars);
+}
+
 bool rza1l_dmac_peripheral_rx_push(RzA1lDmacState *s, int ch, uint8_t byte)
 {
     RzA1lDmacChannel *c;
