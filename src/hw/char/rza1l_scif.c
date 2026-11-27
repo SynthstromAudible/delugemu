@@ -10,7 +10,8 @@
  * Receive is interrupt-driven: an incoming byte is latched, the receive-data
  * flags (RDF|DR) are set, and the RXI interrupt is asserted when receive
  * interrupts are enabled (SCSCR.RIE). Reading SCFRDR returns the byte and
- * clears the receive state.
+ * clears the receive state. A channel wired to a receive DMA channel hands its
+ * bytes to the DMAC instead, while that channel's DMARS selects SCIF receive.
  *
  * Register offsets within a channel (verified via offsetof on st_scif):
  *   SCSMR 0x00  SCBRR 0x04  SCSCR 0x08  SCFTDR 0x0C  SCFSR 0x10
@@ -265,11 +266,13 @@ static void rza1l_scif_receive(void *opaque, const uint8_t *buf, int size)
         return;
     }
 
-    if (s->dmac) {
+    if (s->dmac && rza1l_dmac_selects_scif_rx(s->dmac, s->rx_dma_channel)) {
         /*
-         * MIDI input is consumed by the firmware via the receive DMA ring
-         * (it polls the channel's CRDA), so hand the byte straight to the
-         * DMAC rather than latching it into SCFRDR and raising RXI.
+         * The firmware receives through a DMA ring (it polls the channel's
+         * CRDA), so hand the byte straight to the DMAC rather than latching it
+         * into SCFRDR and raising RXI. As on the hardware, the receive request
+         * goes to the DMAC only while the channel's DMARS selects it; a
+         * firmware that leaves DMARS unset receives on RXI instead.
          */
         rza1l_dmac_peripheral_rx_push(s->dmac, s->rx_dma_channel, buf[0]);
         return;
