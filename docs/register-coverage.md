@@ -42,10 +42,11 @@ asserted while `TDFE`, `SCSCR.TE` and `SCSCR.TIE` all hold. A byte written to
 `rza1l-scif strict: transmit FIFO full, byte 0x.. ignored (N dropped so far)`.
 
 SCIF0 (MIDI) additionally has its receive path bound to DMAC channel 13
-(`MIDI_RX_DMA_CHANNEL`): bytes arriving from the host `-serial`/`--midi` chardev
-are pushed straight into the channel's self-linking receive ring (the firmware
-reads MIDI by polling the channel's `CRDA`), mirroring the PIC's DMA receive on
-channel 12. Each received MIDI byte also triggers the receive-timing capture
+(`MIDI_RX_DMA_CHANNEL`): while that channel's `DMARS` selects SCIF receive, as on
+the hardware, bytes arriving from the host `-serial`/`--midi` chardev are pushed
+straight into the channel's self-linking receive ring (the firmware reads MIDI by
+polling the channel's `CRDA`), mirroring the PIC's DMA receive on channel 12. A
+firmware that leaves `DMARS` unset receives each byte on RXI instead. Each received MIDI byte also triggers the receive-timing capture
 path (DMA channel 14, `MIDI_RX_TIMING_DMA_CHANNEL`), which snapshots the SSI
 sample counter into its own self-linking ring so the firmware can timestamp
 incoming MIDI events.
